@@ -39,11 +39,14 @@ mindseye/
     zuna/offline_pipeline.py  — batch ZUNA processing
     zuna/cropper.py           — event-aligned crop extraction
     zuna/montage.py           — channel coordinate handling
-    embeddings/clip_embed.py  — CLIP embedding computation (TODO)
+    embeddings/clip.py        — CLIP embedding computation
     models/eeg_encoder.py     — EEG→embedding encoder (TODO)
     train/train_eeg_clip.py   — contrastive training (TODO)
   scripts/
     download_nod.py           — download NOD-EEG from OpenNeuro
+    run_zuna_batch.py         — real ZUNA batch runner; explicit resample-only baseline mode
+    run_cropper.py            — event-aligned crop CLI
+    generate_clip_embeddings.py — CLIP embedding generation / OpenNeuro image include list
     test_pipeline.py          — end-to-end smoke test
   vendor/ENIGMA/              — reference codebase
 ```

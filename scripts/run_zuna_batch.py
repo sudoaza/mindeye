@@ -1,72 +1,89 @@
+#!/usr/bin/env python3
+"""Run ZUNA on downloaded NOD-EEG continuous FIF runs.
+
+Real ZUNA is the default. Use `--resample-only-baseline` only for local
+plumbing checks when GPU/RAM are unavailable; baseline outputs are clearly
+suffixed and should not be used for modeling results.
 """
-Run the ZUNA batch offline pipeline on downloaded NOD-EEG continuous runs.
-Usage: venv/bin/python scripts/run_zuna_batch.py
-"""
-import os
-import sys
-import shutil
+from __future__ import annotations
+
+import argparse
 import glob
+import os
+from pathlib import Path
+import sys
+
 import mne
 
-mne.set_log_level('ERROR')
+mne.set_log_level("ERROR")
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mindseye.zuna.offline_pipeline import run_zuna_offline
 
-INPUT_DIR = "data/raw/nod/derivatives/preprocessed/raw"
-OUTPUT_DIR = "data/processed/zuna_output"
-TARGET_CHANNELS = None 
 
-def mock_zuna_offline(input_fif_dir, working_dir):
+def resample_only_baseline(input_fif_dir: str | Path, working_dir: str | Path) -> str:
     """
-    Mocks ZUNA locally. It resamples the raw data to 256Hz (like ZUNA does)
-    and saves it to the final output directory so the rest of the pipeline
-    can proceed.
+    Lightweight baseline for local pipeline checks.
+
+    This does not run ZUNA. It only resamples inputs to 256Hz and writes them to
+    `4_fif_output` with a `_resample_only.fif` suffix.
     """
-    print("\n=== [MOCK] ZUNA Offline Pipeline ===")
-    fif_output_dir = os.path.join(working_dir, "4_fif_output")
-    os.makedirs(fif_output_dir, exist_ok=True)
-    
-    fif_files = glob.glob(os.path.join(input_fif_dir, "*.fif"))
+    print("\n=== [BASELINE] Resample-only pipeline; not ZUNA denoising ===")
+    input_fif_dir = Path(input_fif_dir)
+    fif_output_dir = Path(working_dir) / "4_fif_output"
+    fif_output_dir.mkdir(parents=True, exist_ok=True)
+
+    fif_files = sorted(input_fif_dir.glob("*.fif"))
+    if not fif_files:
+        raise FileNotFoundError(f"No .fif files in {input_fif_dir}")
+
     for fif_path in fif_files:
-        print(f"Mocking ZUNA for {os.path.basename(fif_path)}")
+        print(f"Resampling baseline for {fif_path.name}")
         raw = mne.io.read_raw_fif(fif_path, preload=True, verbose=False)
-        
-        # ZUNA operates at 256Hz
-        if raw.info['sfreq'] != 256:
-            print("  Resampling to 256Hz...")
+        if raw.info["sfreq"] != 256:
             raw.resample(256.0)
-            
-        out_name = os.path.basename(fif_path).replace(".fif", "_zuna_mock.fif")
-        out_path = os.path.join(fif_output_dir, out_name)
+        out_path = fif_output_dir / fif_path.name.replace(".fif", "_resample_only.fif")
         raw.save(out_path, overwrite=True, verbose=False)
-        
-    print(f"\n[MOCK] Finished. Output in: {fif_output_dir}")
-    return fif_output_dir
+
+    print(f"\n[BASELINE] Finished. Output in: {fif_output_dir}")
+    return str(fif_output_dir)
 
 
-def main():
-    if not os.path.exists(INPUT_DIR) or not os.listdir(INPUT_DIR):
-        print(f"Error: No continuous runs found in {INPUT_DIR}")
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--input-dir", default="data/raw/nod/derivatives/preprocessed/raw")
+    p.add_argument("--output-dir", default="data/processed/zuna_real")
+    p.add_argument("--gpu-device", default="0", help="GPU id for ZUNA, or empty string for CPU")
+    p.add_argument("--diffusion-steps", type=int, default=15)
+    p.add_argument("--data-norm", type=float, default=10.0)
+    p.add_argument(
+        "--resample-only-baseline",
+        action="store_true",
+        help="Do not run ZUNA; only resample to 256Hz for plumbing checks",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if not os.path.exists(args.input_dir) or not glob.glob(os.path.join(args.input_dir, "*.fif")):
+        print(f"Error: No continuous runs found in {args.input_dir}")
         sys.exit(1)
 
-    print(f"Starting ZUNA batch pipeline on {INPUT_DIR}")
-    
-    # Swapped to MOCK for local laptop development to avoid 35GB RAM OOM
-    out_dir = mock_zuna_offline(
-        input_fif_dir=INPUT_DIR,
-        working_dir=OUTPUT_DIR,
-    )
-    
-    # REAL ZUNA CALL (Uncomment when running on GPU / RunPod)
-    # out_dir = run_zuna_offline(
-    #     input_fif_dir=INPUT_DIR,
-    #     working_dir=OUTPUT_DIR,
-    #     target_channels=TARGET_CHANNELS,
-    #     gpu_device=0,
-    #     diffusion_steps=15
-    # )
-    
+    print(f"Starting batch pipeline on {args.input_dir}")
+    if args.resample_only_baseline:
+        resample_only_baseline(args.input_dir, args.output_dir)
+    else:
+        run_zuna_offline(
+            input_fif_dir=args.input_dir,
+            working_dir=args.output_dir,
+            target_channels=None,
+            gpu_device=args.gpu_device,
+            diffusion_steps=args.diffusion_steps,
+            data_norm=args.data_norm,
+        )
+
+
 if __name__ == "__main__":
     main()

@@ -35,16 +35,17 @@ Build an EEG→semantic→image system using **ZUNA** as the signal normalizatio
 - **Goal**: Download and load NOD-EEG raw continuous `.fif` files.
 - **Current State**: Downloaded `sub-01` epoch file, events CSV, and continuous `.fif` runs. Tested loader and metadata mapping successfully.
 
-### Phase 2: ZUNA Integration (In Progress)
+### Phase 2: ZUNA Integration (Completed for sub-01 runs 01-05)
 - **Goal**: Process continuous `.fif` files through the ZUNA normalization model.
 - **Actions**:
-  - [x] Run `offline_pipeline.py` / `run_zuna_batch.py` to batch process continuous `.fif` files through ZUNA's denoising and inference (currently using local mock).
+  - [x] Run `offline_pipeline.py` / `run_zuna_batch.py` to batch process continuous `.fif` files through ZUNA's denoising and inference.
   - [x] Reconstruct the output into standardized `.fif` files (resampled to 256Hz).
-  - [ ] Use `cropper.py` to crop event-aligned 1.25s windows around stimulus onsets based on the events CSV timings.
+  - [x] Use `cropper.py` to crop event-aligned 1.25s windows around stimulus onsets. Current implementation aligns from original raw FIF `stim_on` annotations because ZUNA output FIFs do not preserve annotations.
 
-### Phase 3: CLIP Embedding Generation
+### Phase 3: CLIP Embedding Generation (In Progress)
 - **Goal**: Generate ground-truth CLIP embeddings for the visual stimuli.
 - **Actions**:
+  - [x] Add CLIP embedding utility/CLI and targeted OpenNeuro include-list generation for cropped metadata.
   - [ ] Download stimulus images from OpenNeuro `stimuli/ImageNet/`.
   - [ ] Process images through a pre-trained CLIP vision encoder to generate `[image_id, embedding]` pairs.
   - [ ] Save as a persistent embedding dictionary (`.pt` or `.zarr`).
