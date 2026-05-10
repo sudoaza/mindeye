@@ -11,19 +11,52 @@ Then download those OpenNeuro paths, and rerun without the include-list flag.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 import sys
 
-import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mindseye.embeddings.clip import (
-    ClipEmbeddingConfig,
-    build_clip_embedding_table,
-    missing_image_includes,
-)
+
+def _read_metadata_rows(metadata_csv: str | Path) -> list[dict[str, str]]:
+    """Read crop metadata with the standard library for lightweight include-list generation."""
+    with Path(metadata_csv).open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    missing = {"class_id", "image_id"} - set(rows[0].keys() if rows else [])
+    if missing:
+        raise ValueError(f"Metadata missing required columns: {sorted(missing)}")
+    return rows
+
+
+def _normalize_image_id(image_id: str) -> str:
+    stem = str(image_id)
+    for suffix in (".JPEG", ".jpeg", ".JPG", ".jpg", ".PNG", ".png"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def _missing_image_includes_from_rows(rows: list[dict[str, str]], stimuli_prefix: str = "stimuli/ImageNet") -> list[str]:
+    includes: list[str] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    seen_includes: set[str] = set()
+    for row in rows:
+        class_id = str(row["class_id"])
+        stem = _normalize_image_id(str(row["image_id"]))
+        pair = (class_id, stem)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        for inc in (
+            f"{stimuli_prefix}/{stem}.JPEG",
+            f"{stimuli_prefix}/{class_id}/{stem}.JPEG",
+        ):
+            if inc not in seen_includes:
+                seen_includes.add(inc)
+                includes.append(inc)
+    return includes
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,15 +89,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    metadata = pd.read_csv(args.metadata)
 
     if args.write_openneuro_include_list:
-        includes = missing_image_includes(metadata)
+        rows = _read_metadata_rows(args.metadata)
+        includes = _missing_image_includes_from_rows(rows)
         out = Path(args.write_openneuro_include_list)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(includes) + "\n")
         print(json.dumps({"include_list": str(out), "paths": len(includes)}, indent=2))
         return
+
+    # Heavy ML/data dependencies are imported only for actual embedding generation,
+    # so --help and include-list prep work in lightweight environments.
+    from mindseye.embeddings.clip import ClipEmbeddingConfig, build_clip_embedding_table
 
     result = build_clip_embedding_table(
         metadata_csv=args.metadata,

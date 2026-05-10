@@ -46,6 +46,7 @@ Build an EEG→semantic→image system using **ZUNA** as the signal normalizatio
 - **Goal**: Generate ground-truth CLIP embeddings for the visual stimuli.
 - **Actions**:
   - [x] Add CLIP embedding utility/CLI and targeted OpenNeuro include-list generation for cropped metadata.
+  - [x] Add targeted `download_nod.py --include-list` support so the CLIP stimulus images can be fetched without grabbing all ImageNet stimuli.
   - [ ] Download stimulus images from OpenNeuro `stimuli/ImageNet/`.
   - [ ] Process images through a pre-trained CLIP vision encoder to generate `[image_id, embedding]` pairs.
   - [ ] Save as a persistent embedding dictionary (`.pt` or `.zarr`).

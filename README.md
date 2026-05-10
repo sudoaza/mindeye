@@ -23,8 +23,16 @@ NOD-EEG continuous .fif
 ## Quick Start
 
 ```bash
-# 1. Download NOD-EEG subset (one subject)
+# 1. Download NOD-EEG subset (one subject, run 01 by default)
 python scripts/download_nod.py
+
+# Download runs 01-05 for the current ZUNA/cropper path
+python scripts/download_nod.py --runs 1-5
+
+# Later, after generating a targeted stimulus include list for CLIP:
+python scripts/download_nod.py \
+  --runs 1-5 \
+  --include-list data/processed/clip_embeddings/openneuro_image_includes_sub01_runs01_05.txt
 
 # 2. Run smoke test
 python scripts/test_pipeline.py
