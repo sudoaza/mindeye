@@ -54,9 +54,10 @@ Build an EEG→semantic→image system using **ZUNA** as the signal normalizatio
 ### Phase 4: EEG→CLIP Encoder Training (Baseline)
 - **Goal**: Train the initial projection model mapping ZUNA-normalized EEG crops to CLIP embeddings.
 - **Actions**:
-  - [ ] Construct dataset pairs: (1.25s ZUNA-cleaned EEG crop, target CLIP embedding).
-  - [ ] Implement a contrastive loss or direct MSE training loop.
-  - [ ] Evaluate retrieval metrics (top-1, top-5 retrieval accuracy on test set).
+  - [x] Add dataset-pair loader for `(1.25s ZUNA-cleaned EEG crop, target CLIP embedding)` tables.
+  - [x] Add a small baseline temporal-conv EEG→CLIP encoder and train/eval CLI with cosine+MSE loss.
+  - [x] Add retrieval metrics scaffold (top-1, top-5 on validation target bank).
+  - [ ] Run baseline training after CLIP embeddings exist.
 
 ### Phase 5: Image Generation Diffusion Loop
 - **Goal**: Hook the predicted semantic embeddings into a stable diffusion pipeline.
