@@ -57,26 +57,54 @@ def resolve_image_path(stimuli_root: str | Path, class_id: str, image_id: str) -
     return None
 
 
-def missing_image_includes(metadata: pd.DataFrame, stimuli_prefix: str = "stimuli/ImageNet") -> list[str]:
+def missing_image_includes(
+    metadata: pd.DataFrame,
+    stimuli_prefix: str = "stimuli/ImageNet",
+    *,
+    layout: str = "flat",
+) -> list[str]:
     """
     Build OpenNeuro include globs for missing NOD images.
 
-    The returned paths are intentionally specific enough for targeted downloads
-    but include both flat and synset-directory variants.
+    The returned paths are intentionally specific enough for targeted downloads.
+
+    OpenNeuro rejects include paths that do not exist, so use the known dataset
+    layout by default.  NOD ds005811 currently stores ImageNet stimuli flat
+    under ``stimuli/ImageNet``.  ``layout="both"`` is available for local
+    diagnostics only when a caller can tolerate invalid alternates.
     """
+    if layout not in {"flat", "synset", "both"}:
+        raise ValueError(f"Unsupported layout {layout!r}; expected flat, synset, or both")
     includes: list[str] = []
     seen: set[str] = set()
     for row in metadata.drop_duplicates(["class_id", "image_id"]).itertuples(index=False):
         class_id = str(getattr(row, "class_id"))
         stem = normalize_image_id(str(getattr(row, "image_id")))
-        for inc in (
-            f"{stimuli_prefix}/{stem}.JPEG",
-            f"{stimuli_prefix}/{class_id}/{stem}.JPEG",
-        ):
+        candidates: list[str] = []
+        if layout in {"flat", "both"}:
+            candidates.append(f"{stimuli_prefix}/{stem}.JPEG")
+        if layout in {"synset", "both"}:
+            candidates.append(f"{stimuli_prefix}/{class_id}/{stem}.JPEG")
+        for inc in candidates:
             if inc not in seen:
                 seen.add(inc)
                 includes.append(inc)
     return includes
+
+
+def _coerce_clip_features(features, model) -> torch.Tensor:
+    """Return image features as a tensor across Transformers versions."""
+    if isinstance(features, torch.Tensor):
+        return features
+    if hasattr(features, "image_embeds") and isinstance(features.image_embeds, torch.Tensor):
+        return features.image_embeds
+    if hasattr(features, "pooler_output") and isinstance(features.pooler_output, torch.Tensor):
+        pooled = features.pooler_output
+        projection = getattr(model, "visual_projection", None)
+        if projection is not None and pooled.shape[-1] == getattr(projection, "in_features", None):
+            return projection(pooled)
+        return pooled
+    raise TypeError(f"Unsupported CLIP image feature output type: {type(features)!r}")
 
 
 def _load_clip(model_name: str, device: str | None):
@@ -106,7 +134,7 @@ def embed_images(
             batch_paths = paths[start : start + config.batch_size]
             images = [Image.open(p).convert("RGB") for p in batch_paths]
             inputs = processor(images=images, return_tensors="pt").to(device)
-            feats = model.get_image_features(**inputs)
+            feats = _coerce_clip_features(model.get_image_features(**inputs), model)
             if config.normalize:
                 feats = torch.nn.functional.normalize(feats, dim=-1)
             outputs.append(feats.cpu())

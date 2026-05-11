@@ -38,7 +38,14 @@ def _normalize_image_id(image_id: str) -> str:
     return stem
 
 
-def _missing_image_includes_from_rows(rows: list[dict[str, str]], stimuli_prefix: str = "stimuli/ImageNet") -> list[str]:
+def _missing_image_includes_from_rows(
+    rows: list[dict[str, str]],
+    stimuli_prefix: str = "stimuli/ImageNet",
+    *,
+    layout: str = "flat",
+) -> list[str]:
+    if layout not in {"flat", "synset", "both"}:
+        raise ValueError(f"Unsupported layout {layout!r}; expected flat, synset, or both")
     includes: list[str] = []
     seen_pairs: set[tuple[str, str]] = set()
     seen_includes: set[str] = set()
@@ -49,10 +56,12 @@ def _missing_image_includes_from_rows(rows: list[dict[str, str]], stimuli_prefix
         if pair in seen_pairs:
             continue
         seen_pairs.add(pair)
-        for inc in (
-            f"{stimuli_prefix}/{stem}.JPEG",
-            f"{stimuli_prefix}/{class_id}/{stem}.JPEG",
-        ):
+        candidates: list[str] = []
+        if layout in {"flat", "both"}:
+            candidates.append(f"{stimuli_prefix}/{stem}.JPEG")
+        if layout in {"synset", "both"}:
+            candidates.append(f"{stimuli_prefix}/{class_id}/{stem}.JPEG")
+        for inc in candidates:
             if inc not in seen_includes:
                 seen_includes.add(inc)
                 includes.append(inc)
@@ -84,6 +93,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Write targeted OpenNeuro image include paths here and exit",
     )
+    p.add_argument(
+        "--openneuro-layout",
+        choices=("flat", "synset", "both"),
+        default="flat",
+        help="Stimulus layout to emit for include-list mode (default: flat for NOD ds005811)",
+    )
     return p.parse_args()
 
 
@@ -92,7 +107,7 @@ def main() -> None:
 
     if args.write_openneuro_include_list:
         rows = _read_metadata_rows(args.metadata)
-        includes = _missing_image_includes_from_rows(rows)
+        includes = _missing_image_includes_from_rows(rows, layout=args.openneuro_layout)
         out = Path(args.write_openneuro_include_list)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(includes) + "\n")
