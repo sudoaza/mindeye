@@ -55,7 +55,12 @@ mindseye/
     run_zuna_batch.py         — real ZUNA batch runner; explicit resample-only baseline mode
     run_cropper.py            — event-aligned crop CLI
     generate_clip_embeddings.py — CLIP embedding generation / OpenNeuro image include list
-    train_eeg_clip.py         — baseline EEG→CLIP training
+    train_eeg_clip.py         — EEG→CLIP training; contrastive default
+    make_retrieval_grid.py    — visual nearest-neighbor EEG→CLIP retrieval grid
     test_pipeline.py          — end-to-end smoke test
   vendor/ENIGMA/              — reference codebase
 ```
+
+## Current Status
+
+The `sub-01` runs 01-05 path has produced ZUNA semantic crops, CLIP embeddings, a 5-epoch cosine+MSE smoke model, and visual retrieval grids. The smoke model showed CLIP hub/collapse behavior, so training now defaults to a CLIP-style symmetric contrastive loss with optional CLIP target centering and run-heldout validation support.

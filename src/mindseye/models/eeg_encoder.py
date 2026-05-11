@@ -67,6 +67,28 @@ def cosine_mse_loss(pred: torch.Tensor, target: torch.Tensor, *, mse_weight: flo
     return cosine + mse_weight * mse
 
 
+def clip_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, *, temperature: float = 0.07) -> torch.Tensor:
+    """Symmetric CLIP-style InfoNCE loss for paired EEG and image embeddings.
+
+    Direct cosine/MSE regression can collapse toward a generic CLIP-space hub: all
+    examples are only pulled toward their own target, with no explicit pressure to
+    separate the other images in the batch.  This loss treats the diagonal as the
+    positive pairs and all off-diagonal items in the batch as negatives, matching
+    the usual CLIP training objective.
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"pred and target must have matching shape, got {pred.shape} and {target.shape}")
+    if pred.shape[0] < 2:
+        raise ValueError("contrastive loss needs at least two items per batch")
+    pred = F.normalize(pred, dim=-1)
+    target = F.normalize(target, dim=-1)
+    logits = pred @ target.T / temperature
+    labels = torch.arange(pred.shape[0], device=pred.device)
+    eeg_to_img = F.cross_entropy(logits, labels)
+    img_to_eeg = F.cross_entropy(logits.T, labels)
+    return 0.5 * (eeg_to_img + img_to_eeg)
+
+
 def retrieval_topk(pred: torch.Tensor, targets: torch.Tensor, *, ks: tuple[int, ...] = (1, 5)) -> dict[str, float]:
     """Compute image-retrieval top-k accuracy against an in-batch/validation target bank."""
     pred = F.normalize(pred, dim=-1)

@@ -23,6 +23,27 @@ Build an EEG→semantic→image system using **ZUNA** as the signal normalizatio
 - **Channels**: The data has 62 channels with a pre-set 3D montage, making it directly compatible with ZUNA.
 - **Rich Metadata**: We have 4,000 trials for `sub-01`, rich with ImageNet synsets, `class`, `super_class` (like 'canine', 'device', 'artifact'), and `face_score`.
 
+
+## Current Status — 2026-05-11
+- Existing RunPod pod `vm7hhvxx1mx40s` is stopped (`desiredStatus=EXITED`); no training is currently running. A restart attempt on 2026-05-11 failed because RunPod reported no free GPUs on that host.
+- Latest baseline evidence: 5-epoch cosine+MSE EEG→CLIP run on `sub-01` runs 01-05 improved loss but retrieval was near chance and visually collapsed toward repeated CLIP hub images.
+- Code now defaults to contrastive EEG↔image training and supports CLIP target centering plus run-level validation split. Next GPU step is to train the improved objective and regenerate the retrieval grid.
+
+Recommended next command once a GPU pod is available:
+
+```bash
+python scripts/train_eeg_clip.py \
+  --device cuda \
+  --epochs 80 \
+  --batch-size 128 \
+  --loss contrastive \
+  --temperature 0.07 \
+  --center-clip \
+  --split-mode run \
+  --val-runs 5 \
+  --output-dir outputs/eeg_clip_contrastive_sub01_runs01_05_ep080_run05
+```
+
 ## Implementation Phases
 
 ### Phase 0: Cleanup & Restructure (Completed)
@@ -42,22 +63,24 @@ Build an EEG→semantic→image system using **ZUNA** as the signal normalizatio
   - [x] Reconstruct the output into standardized `.fif` files (resampled to 256Hz).
   - [x] Use `cropper.py` to crop event-aligned 1.25s windows around stimulus onsets. Current implementation aligns from original raw FIF `stim_on` annotations because ZUNA output FIFs do not preserve annotations.
 
-### Phase 3: CLIP Embedding Generation (In Progress)
+### Phase 3: CLIP Embedding Generation (Completed for sub-01 runs 01-05)
 - **Goal**: Generate ground-truth CLIP embeddings for the visual stimuli.
 - **Actions**:
   - [x] Add CLIP embedding utility/CLI and targeted OpenNeuro include-list generation for cropped metadata.
   - [x] Add targeted `download_nod.py --include-list` support so the CLIP stimulus images can be fetched without grabbing all ImageNet stimuli.
-  - [ ] Download stimulus images from OpenNeuro `stimuli/ImageNet/`.
-  - [ ] Process images through a pre-trained CLIP vision encoder to generate `[image_id, embedding]` pairs.
-  - [ ] Save as a persistent embedding dictionary (`.pt` or `.zarr`).
+  - [x] Download stimulus images from OpenNeuro `stimuli/ImageNet/` for the cropped subset.
+  - [x] Process images through a pre-trained CLIP vision encoder to generate `[image_id, embedding]` pairs.
+  - [x] Save as a persistent embedding dictionary (`.pt`); current sub-01 runs 01-05 table is 618 unique images × 512 dims.
 
-### Phase 4: EEG→CLIP Encoder Training (Baseline)
+### Phase 4: EEG→CLIP Encoder Training (Baseline + Contrastive Upgrade)
 - **Goal**: Train the initial projection model mapping ZUNA-normalized EEG crops to CLIP embeddings.
 - **Actions**:
   - [x] Add dataset-pair loader for `(1.25s ZUNA-cleaned EEG crop, target CLIP embedding)` tables.
-  - [x] Add a small baseline temporal-conv EEG→CLIP encoder and train/eval CLI with cosine+MSE loss.
+  - [x] Add a small baseline temporal-conv EEG→CLIP encoder and train/eval CLI. Initial cosine+MSE smoke run showed hub/collapse behavior.
   - [x] Add retrieval metrics scaffold (top-1, top-5 on validation target bank).
-  - [ ] Run baseline training after CLIP embeddings exist.
+  - [x] Run 5-epoch smoke baseline after CLIP embeddings exist; val loss fell but retrieval stayed near chance and repeated the same hub images.
+  - [x] Add CLIP-style symmetric contrastive / InfoNCE loss, optional train-set CLIP mean-centering, and run-heldout validation support.
+  - [ ] Run improved contrastive training when RunPod capacity is available, e.g. 80 epochs with `--center-clip --split-mode run --val-runs 5`.
 
 ### Phase 5: Image Generation Diffusion Loop
 - **Goal**: Hook the predicted semantic embeddings into a stable diffusion pipeline.

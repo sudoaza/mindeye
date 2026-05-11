@@ -26,11 +26,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stimuli-root", default="data/raw/nod/stimuli/ImageNet")
     p.add_argument("--seed", type=int, default=13, help="Split seed used during training")
     p.add_argument("--val-fraction", type=float, default=0.15)
+    p.add_argument("--split-mode", choices=("random", "run"), default=None, help="Override split mode saved in checkpoint")
+    p.add_argument("--val-runs", default=None, help="Override comma-separated validation runs saved in checkpoint")
     p.add_argument("--device", default=None, help="cuda, cpu, or omitted for auto")
     p.add_argument("--num-examples", type=int, default=12)
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--thumb-size", type=int, default=160)
     return p.parse_args()
+
+
+def _parse_val_runs(value: str) -> set[int]:
+    return {int(x.strip()) for x in value.split(",") if x.strip()}
+
+
+def _split_by_run(dataset, val_runs: set[int]) -> tuple[list[int], list[int]]:
+    if "run" not in dataset.metadata.columns:
+        raise ValueError("run split requires a 'run' column in metadata")
+    train_idx: list[int] = []
+    val_idx: list[int] = []
+    for idx, run in enumerate(dataset.metadata["run"].astype(int).tolist()):
+        (val_idx if run in val_runs else train_idx).append(idx)
+    if not train_idx or not val_idx:
+        raise ValueError(f"Invalid run split: train={len(train_idx)} val={len(val_idx)} for val_runs={sorted(val_runs)}")
+    return train_idx, val_idx
 
 
 def _resolve_image(path_str: str, stimuli_root: Path) -> Path:
@@ -86,15 +104,26 @@ def main() -> None:
             clip_embeddings_pt=args.clip_embeddings,
         )
     )
-    _, val_idx = split_indices(len(dataset), val_fraction=args.val_fraction, seed=args.seed)
-    val_idx = val_idx[: args.num_examples]
-    loader = DataLoader(Subset(dataset, val_idx), batch_size=args.num_examples, shuffle=False)
-
     n_channels, n_times = dataset.eeg_shape
     model = EEGClipEncoder(n_channels=n_channels, n_times=n_times, embedding_dim=dataset.embedding_dim).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
+    setup = checkpoint.get("setup", {})
+    split_mode = args.split_mode or setup.get("split_mode", "random")
+    val_runs = args.val_runs or (",".join(str(x) for x in setup.get("val_runs") or []) if setup.get("val_runs") else None)
+    if split_mode == "run":
+        if not val_runs:
+            raise ValueError("run split requested but no validation runs were supplied or saved in checkpoint")
+        _, val_idx = _split_by_run(dataset, _parse_val_runs(val_runs))
+    else:
+        _, val_idx = split_indices(len(dataset), val_fraction=args.val_fraction, seed=args.seed)
+    val_idx = val_idx[: args.num_examples]
+    loader = DataLoader(Subset(dataset, val_idx), batch_size=args.num_examples, shuffle=False)
+
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
+    target_center = checkpoint.get("target_center")
+    if target_center is not None:
+        target_center = target_center.cpu()
 
     batch = next(iter(loader))
     eeg = batch["eeg"].to(device).float()
@@ -102,7 +131,10 @@ def main() -> None:
         pred = F.normalize(model(eeg), dim=-1).cpu()
 
     table = torch.load(args.clip_embeddings, map_location="cpu")
-    bank = F.normalize(table["embedding"].float(), dim=-1)
+    bank_raw = table["embedding"].float()
+    if target_center is not None:
+        bank_raw = bank_raw - target_center
+    bank = F.normalize(bank_raw, dim=-1)
     sims = pred @ bank.T
     topk = sims.topk(min(args.top_k, bank.shape[0]), dim=-1)
 
