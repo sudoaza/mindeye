@@ -46,9 +46,9 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing resample-only crop NPZ files",
     )
     p.add_argument(
-        "--clip-embeddings",
-        default="data/processed/clip_embeddings/sub01_runs01_05_clip_vit_base_patch32.pt",
-        help="CLIP embedding table from generate_clip_embeddings.py",
+        "--common-embeddings",
+        required=True,
+        help="Fused common embeddings .pt from build_common_embeddings.py",
     )
     p.add_argument(
         "--input-domain",
@@ -60,7 +60,13 @@ def parse_args() -> argparse.Namespace:
         "--target-mode",
         choices=("real", "shuffled", "random", "sameclass"),
         default="real",
-        help="CLIP target mode: real (default), shuffled, random, or sameclass distractors",
+        help="Target mapping mode: real (default), shuffled, random, or sameclass distractors",
+    )
+    p.add_argument(
+        "--target-space",
+        choices=("common", "semantic", "image"),
+        default="common",
+        help="Which embedding space to optimize the loss against",
     )
     p.add_argument("--output-dir", default=None,
                    help="Base output directory. Defaults to outputs/runs/")
@@ -70,12 +76,6 @@ def parse_args() -> argparse.Namespace:
                    help="EEG window duration: crop (1.25s) or full5s (5s) or full5s_backaligned (5s)")
     p.add_argument("--add-event-marker", action="store_true",
                    help="Add event marker bump as an extra channel to EEG inputs")
-    p.add_argument("--semantic-target", choices=("image", "text", "label_text", "image_text", "caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core", "image_caption_core"), default="image",
-                   help="Whether to map to image embeddings, text embeddings, or a combination")
-    p.add_argument("--text-embeddings", default=None,
-                   help="Path to .pt containing text embeddings (required if semantic-target uses text)")
-    p.add_argument("--image-semantic-embeddings", default=None,
-                   help="Path to .pt containing image semantic text embeddings")
     p.add_argument("--model", choices=("cnn", "temporal_attn"), default="cnn",
                    help="Encoder architecture: cnn (default) or temporal_attn")
     p.add_argument("--epochs", type=int, default=30)
@@ -85,8 +85,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss", choices=("contrastive", "cosine_mse"), default="contrastive")
     p.add_argument("--temperature", type=float, default=0.07,
                    help="InfoNCE temperature for --loss contrastive")
-    p.add_argument("--center-clip", action="store_true",
-                   help="Subtract the train-set CLIP mean before target normalization/retrieval")
     p.add_argument("--split-mode", choices=("random", "run"), default="random",
                    help="Random item split or hold-out full stimulus runs for validation")
     p.add_argument("--val-runs", default="5",
@@ -121,28 +119,23 @@ def _split_by_run(dataset, val_runs: set[int]) -> tuple[list[int], list[int]]:
     return train_idx, val_idx
 
 
-def _target_center(dataset, indices: list[int], device) -> "torch.Tensor":
-    clips = torch.stack([dataset[i]["clip"] for i in indices]).float().to(device)
-    return clips.mean(dim=0, keepdim=True)
-
-
 def _batch_to_device(
     batch: dict,
     device,
-    *,
-    target_center: "torch.Tensor | None" = None,
-) -> tuple["torch.Tensor", "torch.Tensor"]:
+) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
     eeg = batch["eeg"].to(device).float()
-    clip = batch["clip"].to(device).float()
-    if target_center is not None:
-        clip = clip - target_center
-    return eeg, clip
+    tc = batch["target_common"].to(device).float()
+    ti = batch["target_image"].to(device).float()
+    ts = batch["target_semantic"].to(device).float()
+    return eeg, tc, ti, ts
 
 
-def _loss_fn(pred, clip, *, loss_name: str, temperature: float):
+def _loss_fn(pred, target, *, loss_name: str, temperature: float):
     if loss_name == "contrastive":
-        return clip_contrastive_loss(pred, clip, temperature=temperature)
-    return cosine_mse_loss(pred, clip)
+        from mindseye.models.eeg_encoder import clip_contrastive_loss
+        return clip_contrastive_loss(pred, target, temperature=temperature)
+    from mindseye.models.eeg_encoder import cosine_mse_loss
+    return cosine_mse_loss(pred, target)
 
 
 # ---------------------------------------------------------------------------
@@ -191,34 +184,57 @@ def _save_env(run_dir: Path, args: argparse.Namespace, setup: dict) -> None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader, device, *, loss_name: str, temperature: float,
-             target_center=None) -> dict[str, float]:
+def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str) -> dict[str, float]:
+    from mindseye.models.eeg_encoder import retrieval_topk
+    import torch
     model.eval()
-    preds, targets_list = [], []
+    preds, tc_list, ti_list, ts_list = [], [], [], []
     with torch.inference_mode():
         for batch in loader:
-            eeg, clip = _batch_to_device(batch, device, target_center=target_center)
+            eeg, tc, ti, ts = _batch_to_device(batch, device)
             pred = model(eeg)
             preds.append(pred.cpu())
-            targets_list.append(clip.cpu())
+            tc_list.append(tc.cpu())
+            ti_list.append(ti.cpu())
+            ts_list.append(ts.cpu())
 
     pred_t = torch.cat(preds)
-    target_t = torch.cat(targets_list)
+    tc_t = torch.cat(tc_list)
+    ti_t = torch.cat(ti_list)
+    ts_t = torch.cat(ts_list)
+    
+    if target_space == "common":
+        primary_target = tc_t
+    elif target_space == "semantic":
+        primary_target = ts_t
+    else:
+        primary_target = ti_t
 
-    metrics = retrieval_topk(pred_t, target_t)
-    metrics["loss"] = float(
-        _loss_fn(pred_t, target_t, loss_name=loss_name, temperature=temperature).item()
-    )
-    metrics["mean_diag_cosine"] = float(
-        (
-            torch.nn.functional.normalize(pred_t, dim=-1)
-            * torch.nn.functional.normalize(target_t, dim=-1)
+    loss = float(_loss_fn(pred_t, primary_target, loss_name=loss_name, temperature=temperature).item())
+    
+    metrics = {"loss": loss, "n": int(pred_t.shape[0])}
+    
+    # evaluate for each space
+    for name, t_t in [("common", tc_t), ("image", ti_t), ("semantic", ts_t)]:
+        m = retrieval_topk(pred_t, t_t)
+        for k, v in m.items():
+            metrics[f"{name}_{k}"] = v
+            
+        metrics[f"{name}_mean_diag_cosine"] = float(
+            (
+                torch.nn.functional.normalize(pred_t, dim=-1)
+                * torch.nn.functional.normalize(t_t, dim=-1)
+            )
+            .sum(dim=-1)
+            .mean()
+            .item()
         )
-        .sum(dim=-1)
-        .mean()
-        .item()
-    )
-    metrics["n"] = int(pred_t.shape[0])
+            
+    # For backward compatibility with simple scripts parsing 'top10'
+    m_primary = retrieval_topk(pred_t, primary_target)
+    for k, v in m_primary.items():
+        metrics[k] = v
+    metrics["mean_diag_cosine"] = metrics[f"{target_space}_mean_diag_cosine"]
 
     # Expected random baselines
     n = metrics["n"]
@@ -237,12 +253,12 @@ def main() -> None:
 
     global torch, DataLoader, Subset
     global SemanticPairConfig, ZunaClipPairDataset, split_indices
-    global EEGClipEncoder, cosine_mse_loss, clip_contrastive_loss, retrieval_topk
+    global EEGClipEncoder
     import torch
     from torch.utils.data import DataLoader, Subset
 
     from mindseye.datasets.semantic_pairs import SemanticPairConfig, ZunaClipPairDataset, split_indices
-    from mindseye.models.eeg_encoder import EEGClipEncoder, clip_contrastive_loss, cosine_mse_loss, retrieval_topk
+    from mindseye.models.eeg_encoder import EEGClipEncoder
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -253,13 +269,11 @@ def main() -> None:
             epochs_dir=args.epochs_dir,
             epochs_dir_raw=args.epochs_dir_raw,
             epochs_dir_resample=args.epochs_dir_resample,
-            clip_embeddings_pt=args.clip_embeddings,
-            text_embeddings_pt=args.text_embeddings,
-            image_semantic_embeddings_pt=args.image_semantic_embeddings,
+            common_embeddings_pt=args.common_embeddings,
             input_domain=args.input_domain,
             target_mode=args.target_mode,
             window_mode=args.window_mode,
-            semantic_target=args.semantic_target,
+            target_space=args.target_space,
             add_event_marker=args.add_event_marker,
         )
     )
@@ -276,15 +290,13 @@ def main() -> None:
         drop_last=args.loss == "contrastive",
     )
     val_loader = DataLoader(Subset(dataset, val_idx), batch_size=args.batch_size, shuffle=False)
-    target_center = _target_center(dataset, train_idx, device) if args.center_clip else None
 
     n_channels, n_times = dataset.eeg_shape
     print(f"\n[Dataset] window_mode: {args.window_mode}")
-    print(f"[Dataset] semantic_target: {args.semantic_target}")
+    print(f"[Dataset] target_space: {args.target_space}")
     print(f"[Dataset] add_event_marker: {args.add_event_marker}")
     print(f"[Dataset] EEG shape: [{n_channels}, {n_times}]")
     print(f"[Dataset] n_samples: {len(dataset)}")
-    print(f"[Dataset] n_channels after marker: {n_channels}")
 
     if args.model == "temporal_attn":
         from mindseye.models.eeg_encoder import TemporalAttnEncoder
@@ -293,16 +305,12 @@ def main() -> None:
         ).to(device)
         model.n_channels = n_channels
         print(f"[Model] model: temporal_attn")
-        print(f"[Model] n_channels: {n_channels}")
-        print(f"[Model] input samples: {n_times}")
     else:
         model = EEGClipEncoder(
             n_channels=n_channels, n_times=n_times, embedding_dim=dataset.embedding_dim
         ).to(device)
         model.n_channels = n_channels
         print(f"[Model] model: cnn")
-        print(f"[Model] n_channels: {n_channels}")
-        print(f"[Model] input samples: {n_times}")
         
     if getattr(model, "n_channels", n_channels) != n_channels:
         raise ValueError(f"model.n_channels != dataset_eeg_channels")
@@ -311,7 +319,7 @@ def main() -> None:
 
     # Quick forward pass to verify shapes
     first_batch = next(iter(train_loader))
-    eeg, clip = _batch_to_device(first_batch, device, target_center=target_center)
+    eeg, tc, ti, ts = _batch_to_device(first_batch, device)
     with torch.inference_mode():
         pred = model(eeg)
 
@@ -325,13 +333,12 @@ def main() -> None:
         "first_forward_shape": list(pred.shape),
         "loss": args.loss,
         "temperature": args.temperature,
-        "center_clip": args.center_clip,
         "split_mode": args.split_mode,
         "val_runs": sorted(_parse_val_runs(args.val_runs)) if args.split_mode == "run" else None,
         "input_domain": args.input_domain,
         "target_mode": args.target_mode,
         "window_mode": args.window_mode,
-        "semantic_target": args.semantic_target,
+        "target_space": args.target_space,
         "model": args.model,
     }
     print(json.dumps({"setup": setup}, indent=2))
@@ -350,9 +357,11 @@ def main() -> None:
 
     import csv
     log_path = run_dir / "train_log.csv"
-    log_fields = ["epoch", "train_loss", "val_loss", "val_top1", "val_top5", "val_top10",
-                  "val_mrr", "val_median_rank", "val_pred_std", "val_collapse_score",
-                  "val_off_diag_cosine", "val_mean_diag_cosine"]
+    log_fields = ["epoch", "train_loss", "val_loss", 
+                  "val_common_top10", "val_common_mrr", "val_common_collapse_score",
+                  "val_semantic_top10", "val_semantic_mrr", "val_semantic_collapse_score",
+                  "val_image_top10", "val_image_mrr", "val_image_collapse_score",
+                  "val_top10", "val_mrr"]
 
     with open(log_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=log_fields).writeheader()
@@ -361,29 +370,47 @@ def main() -> None:
         model.train()
         train_losses: list[float] = []
         for batch in train_loader:
-            eeg, clip = _batch_to_device(batch, device, target_center=target_center)
+            eeg, tc, ti, ts = _batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
             pred = model(eeg)
-            loss = _loss_fn(pred, clip, loss_name=args.loss, temperature=args.temperature)
+            
+            if args.target_space == "common":
+                l_com = _loss_fn(pred, tc, loss_name=args.loss, temperature=args.temperature)
+                l_sem = _loss_fn(pred, ts, loss_name=args.loss, temperature=args.temperature)
+                l_img = _loss_fn(pred, ti, loss_name=args.loss, temperature=args.temperature)
+                loss = l_com + 0.5 * l_sem + 0.1 * l_img
+            elif args.target_space == "semantic":
+                loss = _loss_fn(pred, ts, loss_name=args.loss, temperature=args.temperature)
+            elif args.target_space == "image":
+                loss = _loss_fn(pred, ti, loss_name=args.loss, temperature=args.temperature)
+            else:
+                loss = _loss_fn(pred, tc, loss_name=args.loss, temperature=args.temperature)
+                
             loss.backward()
             optimizer.step()
             train_losses.append(float(loss.item()))
 
         val = evaluate(model, val_loader, device, loss_name=args.loss,
-                       temperature=args.temperature, target_center=target_center)
+                       temperature=args.temperature, target_space=args.target_space)
         row = {
             "epoch": epoch,
             "train_loss": float(sum(train_losses) / max(1, len(train_losses))),
             "val_loss": val["loss"],
-            "val_top1": val["top1"],
-            "val_top5": val["top5"],
+            
+            "val_common_top10": val["common_top10"],
+            "val_common_mrr": val["common_mrr"],
+            "val_common_collapse_score": val["common_collapse_score"],
+            
+            "val_semantic_top10": val["semantic_top10"],
+            "val_semantic_mrr": val["semantic_mrr"],
+            "val_semantic_collapse_score": val["semantic_collapse_score"],
+            
+            "val_image_top10": val["image_top10"],
+            "val_image_mrr": val["image_mrr"],
+            "val_image_collapse_score": val["image_collapse_score"],
+            
             "val_top10": val["top10"],
-            "val_mrr": val["mrr"],
-            "val_median_rank": val["median_rank"],
-            "val_pred_std": val["pred_std"],
-            "val_collapse_score": val["collapse_score"],
-            "val_off_diag_cosine": val["off_diag_cosine"],
-            "val_mean_diag_cosine": val["mean_diag_cosine"],
+            "val_mrr": val["mrr"]
         }
         history.append(row)
         print(json.dumps(row))
@@ -400,7 +427,6 @@ def main() -> None:
                     "setup": setup,
                     "epoch": epoch,
                     "metrics": row,
-                    "target_center": target_center.detach().cpu() if target_center is not None else None,
                 },
                 run_dir / "best.pt",
             )
@@ -409,10 +435,10 @@ def main() -> None:
     (run_dir / "history.json").write_text(json.dumps(history, indent=2))
 
     # Compute final val metrics on best checkpoint
-    ckpt = torch.load(run_dir / "best.pt", map_location=device)
+    ckpt = torch.load(run_dir / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model_state"])
     final_metrics = evaluate(model, val_loader, device, loss_name=args.loss,
-                             temperature=args.temperature, target_center=target_center)
+                             temperature=args.temperature, target_space=args.target_space)
     final_metrics["best_epoch"] = int(ckpt["epoch"])
     final_metrics["input_domain"] = args.input_domain
     final_metrics["target_mode"] = args.target_mode

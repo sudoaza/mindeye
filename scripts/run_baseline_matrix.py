@@ -87,16 +87,14 @@ def run_condition(
         "--output-dir",     str(matrix_dir),
         "--slug",           f"{name}_{args.slug}" if args.slug else name,
         "--window-mode",     args.window_mode,
-        "--semantic-target", args.semantic_target,
+        "--target-space",    args.target_space,
         "--model",           args.model,
         "--seed",            str(getattr(args, "seed", 13)),
     ]
     if getattr(args, "add_event_marker", False):
         cmd.append("--add-event-marker")
-    if args.text_embeddings:
-        cmd.extend(["--text-embeddings", str(args.text_embeddings)])
-    if getattr(args, "image_semantic_embeddings", None):
-        cmd.extend(["--image-semantic-embeddings", str(args.image_semantic_embeddings)])
+    if getattr(args, "common_embeddings", None):
+        cmd.extend(["--common-embeddings", str(args.common_embeddings)])
     # Forward optional raw/resample dirs if provided
     if args.epochs_dir_raw:
         cmd += ["--epochs-dir-raw", args.epochs_dir_raw]
@@ -183,12 +181,10 @@ def main() -> None:
     p.add_argument("--seed",           type=int, default=13)
     p.add_argument("--window-mode",     choices=("crop", "full5s", "full5s_backaligned"), default="crop")
     p.add_argument("--add-event-marker", action="store_true")
-    p.add_argument("--semantic-target", choices=("image", "text", "label_text", "image_text", "caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core", "image_caption_core"), default="image",
-                   help="Whether to map to image embeddings, text embeddings, or a combination")
-    p.add_argument("--text-embeddings", default=None,
-                   help="Path to .pt containing text embeddings (required if semantic-target uses text)")
-    p.add_argument("--image-semantic-embeddings", default=None,
-                   help="Path to .pt containing image semantic text embeddings")
+    p.add_argument("--target-space", choices=("common", "semantic", "image"), default="common",
+                   help="Which embedding space to optimize the loss against")
+    p.add_argument("--common-embeddings", default=None,
+                   help="Path to .pt containing fused common embeddings")
     p.add_argument("--model",           choices=("cnn", "temporal_attn"), default="cnn")
     p.add_argument("--conditions",     nargs="*", default=None,
                    help="Subset of condition names to run (default: all 6)")
@@ -232,7 +228,8 @@ def main() -> None:
 
     # Print a readable table of key metrics
     key_cols = [c for c in
-                ["condition", "top1", "top5", "top10", "mrr", "median_rank",
+                ["condition", "val_common_top10", "val_semantic_top10", "val_image_top10", 
+                 "top1", "top5", "top10", "mrr", "median_rank",
                  "collapse_score", "off_diag_cosine", "pred_std", "status"]
                 if c in df.columns]
     print(df[key_cols].to_markdown(index=False))

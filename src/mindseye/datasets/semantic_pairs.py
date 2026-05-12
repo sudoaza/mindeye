@@ -11,52 +11,23 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
 WindowMode = Literal["crop", "full5s", "full5s_backaligned"]
-SemanticTarget = Literal[
-    "image",
-    "text",
-    "label_text",
-    "image_text",
-    "caption_short",
-    "caption_detailed",
-    "caption_composition",
-    "caption_attributes",
-    "caption_core",
-    "image_caption_core",
-]
+TargetSpace = Literal["image", "semantic", "common"]
 
 
 @dataclass(frozen=True)
 class SemanticPairConfig:
-    """Paths and target-mode needed to construct EEG→CLIP training pairs.
-
-    target_mode controls what CLIP vector is used as the supervision target:
-      - "real"      → paired CLIP embedding for the shown image (default)
-      - "shuffled"  → CLIP embeddings are shuffled across the dataset (fixed seed)
-      - "random"    → a fresh Gaussian vector normalized to the CLIP unit sphere
-      - "sameclass" → a different embedding from the same ImageNet synset (if available)
-
-    input_domain selects which NPZ file to read EEG from:
-      - "zuna"      → standard ZUNA-denoised crops (default)
-      - "raw"       → un-denoised raw crops from a parallel epochs_dir_raw
-      - "resample"  → resample-only crops from epochs_dir_resample
-    """
-
     metadata_csv: str | Path
     epochs_dir: str | Path
-    clip_embeddings_pt: str | Path
-    text_embeddings_pt: str | Path | None = None
-    image_semantic_embeddings_pt: str | Path | None = None
+    common_embeddings_pt: str | Path
     normalize_eeg: bool = True
     preload_npz: bool = True
     target_mode: TargetMode = "real"
     input_domain: InputDomain = "zuna"
     window_mode: WindowMode = "crop"
-    semantic_target: SemanticTarget = "image"
-    # Alternative epoch directories for raw / resample conditions
+    target_space: TargetSpace = "common"
     epochs_dir_raw: str | Path | None = None
     epochs_dir_resample: str | Path | None = None
     shuffle_seed: int = 42
@@ -64,17 +35,10 @@ class SemanticPairConfig:
 
 
 class ZunaClipPairDataset(Dataset):
-    """
-    Pair event-aligned EEG crops with ground-truth (or control) CLIP embeddings.
-
-    Supports 4 target modes and 3 input domains so all 6 baseline-matrix conditions
-    can be exercised from the same dataset class without code duplication.
-    """
-
     def __init__(self, config: SemanticPairConfig):
         self.config = config
         self.metadata_csv = Path(config.metadata_csv)
-        self.clip_embeddings_pt = Path(config.clip_embeddings_pt)
+        self.common_embeddings_pt = Path(config.common_embeddings_pt)
 
         # Select the epoch dir based on input domain
         if config.input_domain == "raw":
@@ -94,54 +58,24 @@ class ZunaClipPairDataset(Dataset):
         if missing:
             raise ValueError(f"Metadata missing required columns: {sorted(missing)}")
 
-        table = torch.load(self.clip_embeddings_pt, map_location="cpu")
-        self.embedding_dim = int(table["embedding"].shape[-1])
-        self.image_to_embedding: dict[str, torch.Tensor] = {
-            str(image_id): table["embedding"][i].float()
-            for i, image_id in enumerate(table["image_id"])
-        }
-        # Filter metadata to only include items that have CLIP embeddings
+        table = torch.load(self.common_embeddings_pt, map_location="cpu")
+        
+        self.image_id_to_common = table["image_id_to_common"]
+        self.image_id_to_image = table["image_id_to_image"]
+        self.image_id_to_semantic = table["image_id_to_semantic"]
+        
+        # Pick the embedding dimension from the first item
+        first_key = next(iter(self.image_id_to_common.keys()))
+        self.embedding_dim = self.image_id_to_common[first_key].shape[-1]
+        
         initial_n = len(self.metadata)
         self.metadata["image_id_str"] = self.metadata["image_id"].astype(str)
-        mask = self.metadata["image_id_str"].isin(self.image_to_embedding.keys())
+        mask = self.metadata["image_id_str"].isin(self.image_id_to_common.keys())
         self.metadata = self.metadata[mask].reset_index(drop=True)
         dropped = initial_n - len(self.metadata)
         if dropped > 0:
             print(f"  [Dataset] Dropped {dropped} samples due to missing CLIP image embeddings "
                   f"({len(self.metadata)} remaining)")
-
-        # Load text embeddings if needed
-        self.class_to_text_embedding: dict[str, torch.Tensor] = {}
-        if config.semantic_target in ("text", "label_text", "image_text", "image_label_caption"):
-            if config.text_embeddings_pt is None:
-                raise ValueError(f"text_embeddings_pt required for semantic_target={config.semantic_target}")
-            text_table = torch.load(config.text_embeddings_pt, map_location="cpu")
-            self.class_to_text_embedding = text_table["class_to_embedding"]
-            # Verify all metadata classes have text embeddings
-            if "class" not in self.metadata.columns:
-                 raise ValueError("Metadata missing 'class' column required for text targets")
-            missing_text = sorted(set(self.metadata["class"].unique()) - set(self.class_to_text_embedding.keys()))
-            if missing_text:
-                raise ValueError(f"Missing text embeddings for {len(missing_text)} classes: {missing_text[:5]}")
-
-        self.image_id_to_semantic_text_embedding: dict[str, torch.Tensor] = {}
-        if config.semantic_target in ("caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core", "image_caption_core"):
-            if config.image_semantic_embeddings_pt is None:
-                raise ValueError("--image-semantic-embeddings data/processed/clip_embeddings/image_semantic_text_embeddings.pt required")
-            sem_table = torch.load(config.image_semantic_embeddings_pt, map_location="cpu")
-            
-            if config.semantic_target == "image_caption_core":
-                target_key = "image_id_to_caption_core"
-            else:
-                target_key = f"image_id_to_{config.semantic_target}"
-                
-            if target_key not in sem_table:
-                raise ValueError(f"Missing {target_key} in {config.image_semantic_embeddings_pt}")
-                
-            self.image_id_to_semantic_text_embedding = sem_table[target_key]
-            missing_sem = sorted(set(self.metadata["image_id_str"].unique()) - set(self.image_id_to_semantic_text_embedding.keys()))
-            if missing_sem:
-                raise ValueError(f"Missing caption embeddings for {len(missing_sem)} images")
 
         self._epoch_offsets = self._add_epoch_offsets(self.metadata)
         self._npz_cache: dict[str, np.ndarray] = {}
@@ -176,28 +110,8 @@ class ZunaClipPairDataset(Dataset):
         elif config.target_mode == "sameclass":
             self._build_sameclass_index(rng)
 
-        # Log target alignment if using multi-modal targets
-        if config.semantic_target == "image_text":
-            self._log_target_alignment()
-
-    def _log_target_alignment(self) -> None:
-        """Log the cosine similarity between paired image and text targets."""
-        cosines = []
-        for idx in range(len(self.metadata)):
-            row = self.metadata.iloc[idx]
-            img_emb = F.normalize(self.image_to_embedding[str(row["image_id"])], dim=-1)
-            txt_emb = F.normalize(self.class_to_text_embedding[str(row["class"])], dim=-1)
-            cos = (img_emb * txt_emb).sum().item()
-            cosines.append(cos)
-        cosines = np.array(cosines)
-        print(f"  [Dataset] Target alignment (image <-> text): "
-              f"mean={cosines.mean():.3f}, std={cosines.std():.3f}")
-
-    # ------------------------------------------------------------------ helpers
-
     @staticmethod
     def _add_epoch_offsets(metadata: pd.DataFrame) -> list[int]:
-        """Return zero-based row offsets within each per-run NPZ file."""
         offsets: list[int] = []
         counts: dict[str, int] = {}
         for npz_file in metadata["npz_file"].astype(str):
@@ -243,11 +157,7 @@ class ZunaClipPairDataset(Dataset):
         return eeg
 
     def _build_sameclass_index(self, rng: np.random.Generator) -> None:
-        """Map each sample to a random *different* sample sharing the same synset.
-
-        Falls back to the real target when the synset has only one sample."""
         if "synset" not in self.metadata.columns:
-            # Try to extract synset from image_id (e.g. "n01440764_1234" → "n01440764")
             self.metadata["synset"] = self.metadata["image_id"].astype(str).str.split("_").str[0]
 
         synset_to_indices: dict[str, list[int]] = {}
@@ -260,68 +170,44 @@ class ZunaClipPairDataset(Dataset):
             pool = [i for i in synset_to_indices[syn] if i != idx]
             self._sameclass_targets.append(int(rng.choice(pool)) if pool else idx)
 
-    # ------------------------------------------------------------------ Dataset API
-
-    def _get_clip(self, idx: int) -> torch.Tensor:
-        """Return the target embedding for sample *idx* based on target_mode and semantic_target."""
+    def _get_targets(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mode = self.config.target_mode
         if mode == "shuffled":
             idx = self._target_perm[idx]
         elif mode == "random":
-            return self._random_targets[idx]
+            rand_t = self._random_targets[idx]
+            return rand_t, rand_t, rand_t
         elif mode == "sameclass":
             idx = self._sameclass_targets[idx]
         
         row = self.metadata.iloc[idx]
-        
         img_id = str(row["image_id"])
-        img_emb = F.normalize(self.image_to_embedding[img_id], dim=-1)
         
-        if self.config.semantic_target == "image":
-            return img_emb
+        t_common = F.normalize(self.image_id_to_common[img_id], dim=-1)
+        t_image = F.normalize(self.image_id_to_image[img_id], dim=-1)
+        t_semantic = F.normalize(self.image_id_to_semantic[img_id], dim=-1)
         
-        label_emb = None
-        if self.config.semantic_target in ("text", "label_text", "image_text"):
-            label = str(row["class"])
-            label_emb = F.normalize(self.class_to_text_embedding[label], dim=-1)
-            
-        caption_emb = None
-        if self.config.semantic_target in ("caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core", "image_caption_core"):
-            caption_emb = F.normalize(self.image_id_to_semantic_text_embedding[img_id], dim=-1)
-            
-        if self.config.semantic_target in ("text", "label_text"):
-            return label_emb
-        elif self.config.semantic_target in ("caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core"):
-            return caption_emb
-        elif self.config.semantic_target == "image_text":
-            return torch.nn.functional.normalize(img_emb + label_emb, dim=-1)
-        elif self.config.semantic_target == "image_caption_core":
-            return torch.nn.functional.normalize(img_emb + caption_emb, dim=-1)
-            
-        return img_emb
+        return t_common, t_image, t_semantic
 
     def __len__(self) -> int:
         return len(self.metadata)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str | int]:
+        t_common, t_image, t_semantic = self._get_targets(idx)
         return {
             "eeg": self._get_eeg(idx),
-            "clip": self._get_clip(idx),
+            "target_common": t_common,
+            "target_image": t_image,
+            "target_semantic": t_semantic,
             "image_id": str(self.metadata.iloc[idx]["image_id"]),
             "index": int(idx),
         }
 
 
 def split_indices(n_items: int, *, val_fraction: float = 0.15, seed: int = 13) -> tuple[list[int], list[int]]:
-    """Deterministically split indices for baseline training."""
     if not 0 < val_fraction < 1:
         raise ValueError("val_fraction must be between 0 and 1")
     gen = torch.Generator().manual_seed(seed)
     perm = torch.randperm(n_items, generator=gen).tolist()
     n_val = max(1, int(round(n_items * val_fraction)))
     return perm[n_val:], perm[:n_val]
-
-
-def gather_clip_targets(dataset: ZunaClipPairDataset, indices: Sequence[int]) -> torch.Tensor:
-    """Stack CLIP targets for retrieval evaluation."""
-    return torch.stack([dataset[i]["clip"] for i in indices]).float()
