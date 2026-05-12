@@ -45,6 +45,7 @@ DEFAULTS = {
     "val_runs": "5",
     "epochs": "30",
     "batch_size": "64",
+    "device": "cuda",
 }
 
 
