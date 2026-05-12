@@ -8,6 +8,7 @@ from typing import Literal, Sequence
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
