@@ -4,20 +4,29 @@ Event-aligned cropper for ZUNA-normalized continuous EEG.
 ZUNA output FIFs currently do not preserve stimulus annotations, so the safest
 alignment path is:
 1. read `stim_on` annotation times from the original raw NOD FIF,
-2. convert those onset times to samples in the corresponding ZUNA FIF, and
-3. crop a short semantic window from the ZUNA signal.
+2. convert those onset times to samples in the corresponding source FIF
+   (ZUNA output, raw, or resample-only), and
+3. crop a short semantic window from that signal.
+
+Three crop modes are supported so all baseline-matrix conditions can be run:
+  - "zuna"     : source FIF = ZUNA output (default)
+  - "raw"      : source FIF = the raw preprocessed FIF at its native sfreq
+  - "resample" : source FIF = the raw FIF resampled to target_sfreq (default 256 Hz)
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 import json
 import warnings
 
 import mne
 import numpy as np
 import pandas as pd
+
+
+CropMode = Literal["zuna", "raw", "resample"]
 
 
 @dataclass(frozen=True)
@@ -28,6 +37,8 @@ class CropConfig:
     tmax: float = 1.0
     expected_sfreq: float = 256.0
     event_name: str = "stim_on"
+    mode: CropMode = "zuna"
+    resample_sfreq: float = 256.0   # target sfreq for "resample" mode
 
 
 @dataclass(frozen=True)
@@ -74,32 +85,65 @@ def events_for_run(
     return events_df.loc[mask].reset_index(drop=True).copy()
 
 
-def build_mne_events_for_zuna(
+def build_mne_events_for_source(
     onset_seconds: np.ndarray,
-    zuna_sfreq: float,
+    source_sfreq: float,
     n_times: int,
     config: CropConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Convert source onset times to MNE event rows in the ZUNA raw sample space.
+    Convert source onset times to MNE event rows in the source raw sample space.
 
     Returns `(events, valid_mask)`, where invalid rows would place the crop
-    outside the ZUNA output duration.
+    outside the source output duration.
     """
     events = np.zeros((len(onset_seconds), 3), dtype=int)
-    events[:, 0] = np.rint(onset_seconds * zuna_sfreq).astype(int)
+    events[:, 0] = np.rint(onset_seconds * source_sfreq).astype(int)
     events[:, 2] = 1
 
-    start = events[:, 0] + int(round(config.tmin * zuna_sfreq))
-    stop = events[:, 0] + int(round(config.tmax * zuna_sfreq))
+    start = events[:, 0] + int(round(config.tmin * source_sfreq))
+    stop = events[:, 0] + int(round(config.tmax * source_sfreq))
     valid = (start >= 0) & (stop < n_times)
     return events, valid
 
 
-def crop_zuna_run_to_epochs(
+def _load_source_raw(
+    raw_fif_path: str | Path,
+    source_fif_path: str | Path | None,
+    config: CropConfig,
+) -> mne.io.BaseRaw:
+    """Load and optionally resample the source FIF depending on crop mode."""
+    if config.mode == "zuna":
+        if source_fif_path is None:
+            raise ValueError("source_fif_path required for mode='zuna'")
+        raw = _read_raw(source_fif_path, preload=True)
+        if abs(raw.info["sfreq"] - config.expected_sfreq) > 1:
+            print(
+                f"  [warn] expected ~{config.expected_sfreq} Hz ZUNA output, "
+                f"got {raw.info['sfreq']} Hz"
+            )
+        return raw
+
+    if config.mode == "raw":
+        return _read_raw(raw_fif_path, preload=True)
+
+    if config.mode == "resample":
+        raw = _read_raw(raw_fif_path, preload=True)
+        if abs(raw.info["sfreq"] - config.resample_sfreq) > 0.5:
+            print(
+                f"  Resampling {Path(raw_fif_path).name} "
+                f"from {raw.info['sfreq']} Hz → {config.resample_sfreq} Hz"
+            )
+            raw = raw.resample(config.resample_sfreq, npad="auto", verbose=False)
+        return raw
+
+    raise ValueError(f"Unknown crop mode: {config.mode!r}")
+
+
+def crop_run_to_epochs(
     *,
     raw_fif_path: str | Path,
-    zuna_fif_path: str | Path,
+    source_fif_path: str | Path | None,
     events_df: pd.DataFrame,
     run: int,
     output_dir: str | Path,
@@ -107,15 +151,17 @@ def crop_zuna_run_to_epochs(
     session: str = "ImageNet01",
     config: CropConfig | None = None,
 ) -> CropResult:
-    """Crop one ZUNA output FIF into event-aligned semantic epochs."""
+    """Crop one source FIF into event-aligned semantic epochs.
+
+    `source_fif_path` is only used in mode='zuna'; for 'raw' and 'resample'
+    the raw_fif_path itself is the signal source.
+    """
     config = config or CropConfig()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    zuna = _read_raw(zuna_fif_path, preload=True)
-    zuna_sfreq = float(zuna.info["sfreq"])
-    if abs(zuna_sfreq - config.expected_sfreq) > 1:
-        print(f"Warning: expected ~{config.expected_sfreq}Hz ZUNA output, got {zuna_sfreq}Hz")
+    source_raw = _load_source_raw(raw_fif_path, source_fif_path, config)
+    source_sfreq = float(source_raw.info["sfreq"])
 
     onset_seconds = stim_onsets_from_raw(raw_fif_path, config.event_name)
     metadata = events_for_run(events_df, session=session, run=run)
@@ -123,14 +169,16 @@ def crop_zuna_run_to_epochs(
     onset_seconds = onset_seconds[:n]
     metadata = metadata.iloc[:n].copy()
     metadata.insert(0, "stim_onset_sec", onset_seconds)
-    metadata.insert(0, "zuna_source_fif", Path(zuna_fif_path).name)
+    metadata.insert(0, "source_mode", config.mode)
 
-    mne_events, valid = build_mne_events_for_zuna(onset_seconds, zuna_sfreq, zuna.n_times, config)
+    mne_events, valid = build_mne_events_for_source(
+        onset_seconds, source_sfreq, source_raw.n_times, config
+    )
     metadata = metadata.loc[valid].reset_index(drop=True)
     mne_events = mne_events[valid]
 
     epochs = mne.Epochs(
-        zuna,
+        source_raw,
         mne_events,
         event_id={config.event_name: 1},
         tmin=config.tmin,
@@ -142,7 +190,8 @@ def crop_zuna_run_to_epochs(
     )
     data = epochs.get_data(copy=True)
 
-    stem = f"{subject}_ses-{session}_run-{run:02d}_zuna_semantic"
+    mode_tag = config.mode
+    stem = f"{subject}_ses-{session}_run-{run:02d}_{mode_tag}_semantic"
     fif_path = output_dir / f"{stem}-epo.fif"
     npz_path = output_dir / f"{stem}.npz"
     metadata_path = output_dir / f"{subject}_ses-{session}_run-{run:02d}_metadata.csv"
@@ -151,7 +200,7 @@ def crop_zuna_run_to_epochs(
     np.savez_compressed(
         npz_path,
         eeg=data,
-        sfreq=zuna_sfreq,
+        sfreq=source_sfreq,
         times=epochs.times,
         ch_names=np.array(epochs.ch_names, dtype=object),
     )
@@ -162,17 +211,53 @@ def crop_zuna_run_to_epochs(
         epochs_saved=int(len(epochs)),
         dropped_out_of_bounds=int((~valid).sum()),
         shape=tuple(int(x) for x in data.shape),
-        sfreq=zuna_sfreq,
+        sfreq=source_sfreq,
         fif_path=fif_path,
         npz_path=npz_path,
         metadata_path=metadata_path,
     )
 
 
-def crop_zuna_runs(
+# ---------------------------------------------------------------------------
+# Legacy alias — kept so existing call-sites using crop_zuna_runs still work
+# ---------------------------------------------------------------------------
+
+def crop_zuna_run_to_epochs(
+    *,
+    raw_fif_path,
+    zuna_fif_path,
+    events_df,
+    run,
+    output_dir,
+    subject="sub-01",
+    session="ImageNet01",
+    config=None,
+) -> CropResult:
+    """Backward-compatible wrapper; delegates to crop_run_to_epochs with mode='zuna'."""
+    cfg = config or CropConfig()
+    if cfg.mode != "zuna":
+        cfg = CropConfig(
+            tmin=cfg.tmin, tmax=cfg.tmax,
+            expected_sfreq=cfg.expected_sfreq,
+            event_name=cfg.event_name,
+            mode="zuna",
+        )
+    return crop_run_to_epochs(
+        raw_fif_path=raw_fif_path,
+        source_fif_path=zuna_fif_path,
+        events_df=events_df,
+        run=run,
+        output_dir=output_dir,
+        subject=subject,
+        session=session,
+        config=cfg,
+    )
+
+
+def crop_runs(
     *,
     raw_dir: str | Path,
-    zuna_dir: str | Path,
+    source_dir: str | Path | None,
     events_csv: str | Path,
     output_dir: str | Path,
     subject: str = "sub-01",
@@ -180,9 +265,13 @@ def crop_zuna_runs(
     runs: Iterable[int] = range(1, 6),
     config: CropConfig | None = None,
 ) -> dict:
-    """Crop a batch of matching raw/ZUNA FIF runs and write a summary JSON."""
+    """Crop a batch of runs and write a summary JSON.
+
+    For mode='zuna', `source_dir` must contain matching ZUNA FIF files.
+    For mode='raw' or 'resample', `source_dir` is ignored (raw_dir is used directly).
+    """
     raw_dir = Path(raw_dir)
-    zuna_dir = Path(zuna_dir)
+    source_dir = Path(source_dir) if source_dir else None
     output_dir = Path(output_dir)
     events_df = pd.read_csv(events_csv)
     config = config or CropConfig()
@@ -191,6 +280,7 @@ def crop_zuna_runs(
     summary = {
         "subject": subject,
         "session": session,
+        "mode": config.mode,
         "tmin": config.tmin,
         "tmax": config.tmax,
         "runs": [],
@@ -198,19 +288,37 @@ def crop_zuna_runs(
 
     for run in runs:
         raw_fif = raw_dir / f"{subject}_ses-{session}_task-ImageNet_run-{run:02d}_eeg_clean.fif"
-        zuna_fif = zuna_dir / f"{subject}_ses-{session}_task-ImageNet_run-{run:02d}_eeg_clean.fif"
-        if not raw_fif.exists() or not zuna_fif.exists():
+
+        # Locate source FIF (only needed for zuna mode)
+        source_fif: Path | None = None
+        if config.mode == "zuna":
+            if source_dir is None:
+                raise ValueError("source_dir required for mode='zuna'")
+            # Accept both naming conventions (real vs mock ZUNA output)
+            candidates = [
+                source_dir / f"{subject}_ses-{session}_task-ImageNet_run-{run:02d}_eeg_clean.fif",
+                source_dir / f"{subject}_ses-{session}_task-ImageNet_run-{run:02d}_eeg_clean_zuna_mock.fif",
+            ]
+            source_fif = next((p for p in candidates if p.exists()), None)
+            if source_fif is None:
+                summary["runs"].append({
+                    "run": int(run),
+                    "status": "missing_zuna_fif",
+                    "raw_exists": raw_fif.exists(),
+                })
+                continue
+
+        if not raw_fif.exists():
             summary["runs"].append({
                 "run": int(run),
-                "status": "missing_input",
-                "raw_exists": raw_fif.exists(),
-                "zuna_exists": zuna_fif.exists(),
+                "status": "missing_raw_fif",
+                "raw_exists": False,
             })
             continue
 
-        result = crop_zuna_run_to_epochs(
+        result = crop_run_to_epochs(
             raw_fif_path=raw_fif,
-            zuna_fif_path=zuna_fif,
+            source_fif_path=source_fif,
             events_df=events_df,
             run=int(run),
             output_dir=output_dir,
@@ -221,6 +329,7 @@ def crop_zuna_runs(
         run_meta = pd.read_csv(result.metadata_path)
         run_meta["epoch_file"] = result.fif_path.name
         run_meta["npz_file"] = result.npz_path.name
+        run_meta["run"] = result.run
         all_metadata.append(run_meta)
         summary["runs"].append({
             "run": result.run,
@@ -235,7 +344,39 @@ def crop_zuna_runs(
         })
 
     if all_metadata:
-        pd.concat(all_metadata, ignore_index=True).to_csv(output_dir / "all_runs_metadata.csv", index=False)
+        pd.concat(all_metadata, ignore_index=True).to_csv(
+            output_dir / "all_runs_metadata.csv", index=False
+        )
     summary["total_epochs"] = int(sum(r.get("epochs_saved", 0) for r in summary["runs"]))
     (output_dir / "crop_summary.json").write_text(json.dumps(summary, indent=2))
     return summary
+
+
+# Backward-compatible alias
+def crop_zuna_runs(
+    *,
+    raw_dir,
+    zuna_dir,
+    events_csv,
+    output_dir,
+    subject="sub-01",
+    session="ImageNet01",
+    runs=range(1, 6),
+    config=None,
+) -> dict:
+    cfg = config or CropConfig()
+    return crop_runs(
+        raw_dir=raw_dir,
+        source_dir=zuna_dir,
+        events_csv=events_csv,
+        output_dir=output_dir,
+        subject=subject,
+        session=session,
+        runs=runs,
+        config=CropConfig(
+            tmin=cfg.tmin, tmax=cfg.tmax,
+            expected_sfreq=cfg.expected_sfreq,
+            event_name=cfg.event_name,
+            mode="zuna",
+        ),
+    )

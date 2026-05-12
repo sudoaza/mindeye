@@ -1,90 +1,111 @@
-# Mind's Eye Technical Plan
+# MindEye Development Plan — ZUNA-first EEG→Semantic→Image Pipeline
 
-## Objective
-Build an EEG→semantic→image system using **ZUNA** as the signal normalization layer. Train on **NOD-EEG** (continuous visual EEG with stimulus images), pivoting away from the Alljoined short-epoch approach.
+## 1. Strategic direction
 
-## Core Architecture
-1. **Dataset**: NOD-EEG (ds005811)
-   - Continuous visual EEG recordings (.fif files) with 62 channels and 3D montages.
-   - Rich metadata with ImageNet synsets and event timings.
-2. **Signal Normalization**: ZUNA
-   - ZUNA takes 5s continuous EEG windows at 256Hz.
-   - It outputs denoised, reconstructed, standardized EEG signals.
-3. **Event Aligned Cropping**:
-   - Extract shorter task-relevant windows (e.g., 1.25s around stimulus) from ZUNA's 5s reconstructed output.
-4. **Semantic Embedding**:
-   - Train an EEG→CLIP semantic encoder mapping the standardized EEG latent space to CLIP embeddings of the visual stimuli.
-5. **Image Generation**:
-   - A frozen diffusion img2img loop conditioned on the predicted CLIP embeddings to reconstruct what the subject is seeing.
+The project must remain **ZUNA-first**. The primary training source is **NOD-EEG** (continuous time series, event timing). Alljoined/ENIGMA will only be used later for robustness/domain-adaptation. ZUNA requires 256Hz, 5-second epochs.
 
-## Key Findings (Latest Pipeline Test)
-- **Data Availability**: `sub-01` tested successfully.
-- **Pre-existing Epochs**: The existing dataset epochs are 0.9s (-0.1s to +0.8s), which are too short for ZUNA. ZUNA strictly requires 5s continuous windows to function.
-- **Channels**: The data has 62 channels with a pre-set 3D montage, making it directly compatible with ZUNA.
-- **Rich Metadata**: We have 4,000 trials for `sub-01`, rich with ImageNet synsets, `class`, `super_class` (like 'canine', 'device', 'artifact'), and `face_score`.
+## 2. Non-negotiable technical principles
 
+1. **Do not add diffusion until EEG→CLIP beats controls** (real > shuffled, real > random, nonzero std, meaningful grid).
+2. **ZUNA output is the training domain** (ZUNA output → crop → CLIP target).
+3. **Timing integrity is critical** (stimulus onset → ZUNA axis → crop).
+4. **Cheap-headset path must be simulated now** (full vs simulated 14-channel vs random vs 32-channel).
 
-## Current Status — 2026-05-11
-- Existing RunPod pod `vm7hhvxx1mx40s` is stopped (`desiredStatus=EXITED`); no training is currently running. A restart attempt on 2026-05-11 failed because RunPod reported no free GPUs on that host.
-- Latest baseline evidence: 5-epoch cosine+MSE EEG→CLIP run on `sub-01` runs 01-05 improved loss but retrieval was near chance and visually collapsed toward repeated CLIP hub images.
-- Code now defaults to contrastive EEG↔image training and supports CLIP target centering plus run-level validation split. Next GPU step is to train the improved objective and regenerate the retrieval grid.
+## 3. Target repository structure
 
-Recommended next command once a GPU pod is available:
+- `configs/` for datasets, zuna, and train yamls.
+- `src/mindseye/` restructured into datasets, zuna, embeddings, models, eval, diffusion, utils.
+- `scripts/` containing clear modular run targets (download, zuna batch, crop, audit, embeddings, train, baselines, simulate, etc).
+- `outputs/` for all run tracking.
 
-```bash
-python scripts/train_eeg_clip.py \
-  --device cuda \
-  --epochs 80 \
-  --batch-size 128 \
-  --loss contrastive \
-  --temperature 0.07 \
-  --center-clip \
-  --split-mode run \
-  --val-runs 5 \
-  --output-dir outputs/eeg_clip_contrastive_sub01_runs01_05_ep080_run05
-```
+## 4. Phase 1 — Make the current pipeline reproducible (Sprint 1)
 
-## Implementation Phases
+**Objective**: Make one exact command sequence reproduce the pipeline via `Makefile` and `configs/`.
+- [x] Add `configs/datasets/nod_sub01_runs01_05.yaml`.
+- [x] Add `configs/zuna/zuna_real_50steps.yaml`.
+- [x] Add `configs/train/eeg_clip_contrastive.yaml`.
+- [x] Add `Makefile`.
 
-### Phase 0: Cleanup & Restructure (Completed)
-- [x] Removed all legacy Alljoined code and configurations.
-- [x] Rebuilt `src/mindseye/` structure for `datasets`, `zuna`, `embeddings`, `models`, `train`, `inference`.
-- [x] Integrated `zuna` and `openneuro-py` dependencies into `pyproject.toml` and `requirements.txt`.
-- [x] Rewrote dataset loader and pipelines for NOD-EEG and ZUNA compatibility.
+## 5. Phase 2 — Timing and data-integrity audit (Sprint 1)
 
-### Phase 1: NOD-EEG Ingestion (Completed)
-- **Goal**: Download and load NOD-EEG raw continuous `.fif` files.
-- **Current State**: Downloaded `sub-01` epoch file, events CSV, and continuous `.fif` runs. Tested loader and metadata mapping successfully.
+**Objective**: Ensure event timing is not corrupted.
+- [x] Add `scripts/audit_zuna_timing.py` to compare raw FIF vs ZUNA FIF vs metadata.
+- [x] ZUNA batch inference running on GPU (RunPod).
+- [x] Outputs must be checked before training (Passed).
+- [x] 80-epoch contrastive EEG->CLIP training (Passed).
+- [x] Generate retrieval grid and verify non-collapsed pred_std.
 
-### Phase 2: ZUNA Integration (Completed for sub-01 runs 01-05)
-- **Goal**: Process continuous `.fif` files through the ZUNA normalization model.
-- **Actions**:
-  - [x] Run `offline_pipeline.py` / `run_zuna_batch.py` to batch process continuous `.fif` files through ZUNA's denoising and inference.
-  - [x] Reconstruct the output into standardized `.fif` files (resampled to 256Hz).
-  - [x] Use `cropper.py` to crop event-aligned 1.25s windows around stimulus onsets. Current implementation aligns from original raw FIF `stim_on` annotations because ZUNA output FIFs do not preserve annotations.
+## 6. Phase 3 — Baseline matrix (Sprint 2)
 
-### Phase 3: CLIP Embedding Generation (Completed for sub-01 runs 01-05)
-- **Goal**: Generate ground-truth CLIP embeddings for the visual stimuli.
-- **Actions**:
-  - [x] Add CLIP embedding utility/CLI and targeted OpenNeuro include-list generation for cropped metadata.
-  - [x] Add targeted `download_nod.py --include-list` support so the CLIP stimulus images can be fetched without grabbing all ImageNet stimuli.
-  - [x] Download stimulus images from OpenNeuro `stimuli/ImageNet/` for the cropped subset.
-  - [x] Process images through a pre-trained CLIP vision encoder to generate `[image_id, embedding]` pairs.
-  - [x] Save as a persistent embedding dictionary (`.pt`); current sub-01 runs 01-05 table is 618 unique images × 512 dims.
+**Objective**: Run controlled matrix comparing raw, resample-only, ZUNA, shuffled labels, and random targets.
+- [x] Finish `scripts/run_baseline_matrix.py` — wired to real training via subprocess.
+- [x] Required conditions: `raw_runheldout`, `resample_only_runheldout`, `zuna_runheldout`, `zuna_shuffled_labels`, `zuna_random_targets`, `zuna_sameclass_distractors`.
+- [x] Required metrics: top1, top5, top10, MRR, median rank, mean diagonal cosine, off-diagonal cosine mean, prediction std, target std, collapse score = pred_std / target_std, random expected top-k.
+- [x] Add `--input-domain` (zuna/raw/resample) and `--target-mode` (real/shuffled/random/sameclass) flags to `train_eeg_clip.py`.
+- [x] Every run outputs structured `outputs/runs/YYYYMMDD_HHMMSS_slug/` with `metrics.json`, `metrics.csv`, `train_log.csv`, `best.pt`, `history.json`, `config.json`, `environment.txt`, `git_commit.txt`.
+- [ ] Run `make matrix` — `zuna_runheldout` must beat all controls.
+- [ ] **Gate**: `zuna_runheldout` must beat shuffled/random controls. `pred_std` must be nonzero and not collapsed. Retrieval grid must not repeat the same images.
 
-### Phase 4: EEG→CLIP Encoder Training (Baseline + Contrastive Upgrade)
-- **Goal**: Train the initial projection model mapping ZUNA-normalized EEG crops to CLIP embeddings.
-- **Actions**:
-  - [x] Add dataset-pair loader for `(1.25s ZUNA-cleaned EEG crop, target CLIP embedding)` tables.
-  - [x] Add a small baseline temporal-conv EEG→CLIP encoder and train/eval CLI. Initial cosine+MSE smoke run showed hub/collapse behavior.
-  - [x] Add retrieval metrics scaffold (top-1, top-5 on validation target bank).
-  - [x] Run 5-epoch smoke baseline after CLIP embeddings exist; val loss fell but retrieval stayed near chance and repeated the same hub images.
-  - [x] Add CLIP-style symmetric contrastive / InfoNCE loss, optional train-set CLIP mean-centering, and run-heldout validation support.
-  - [ ] Run improved contrastive training when RunPod capacity is available, e.g. 80 epochs with `--center-clip --split-mode run --val-runs 5`.
+## 7. Phase 4 — Low-channel / cheap-headset simulation (Sprint 3)
 
-### Phase 5: Image Generation Diffusion Loop
-- **Goal**: Hook the predicted semantic embeddings into a stable diffusion pipeline.
-- **Actions**:
-  - [ ] Use a frozen diffusion model (e.g., Stable Diffusion Image Variations or Versatile Diffusion).
-  - [ ] Feed the predicted CLIP embedding to generate images.
-  - [ ] Evaluate generated images against ground truth stimuli visually and via metrics (SSIM, FID, CLIP similarity).
+**Objective**: Test if ZUNA can rescue EPOC-like 14-channel EEG. This remains mandatory and should not be deferred behind better encoders.
+- [x] `src/mindseye/zuna/channel_simulation.py` and `scripts/simulate_low_channel_zuna.py` exist.
+- [ ] Add `configs/zuna/zuna_epoc14_sim.yaml`.
+- [ ] Simulate paths: full NOD → ZUNA, canonical 32ch → ZUNA, EPOC-like 14ch → ZUNA, random 14ch → ZUNA, raw EPOC-like 14ch without ZUNA.
+- [ ] Use approximate EPOC X channel list.
+- [ ] Report: `zuna_gain = metric(epoc14_zuna) / metric(raw_epoc14_nozuna)` and `retention = metric(epoc14_zuna) / metric(full_zuna)`.
+- [ ] `make simulate` runs FIF masking for all 5 runs; then train baseline matrix on simulated crops.
+
+## 8. Phase 5 — Improve the EEG encoder (Sprint 4)
+
+**Objective**: Upgrade from Conv1D to a Spatial-Temporal Coordinate-Aware Encoder.
+- [ ] Add `src/mindseye/models/spatial_temporal_encoder.py`.
+- [ ] Input API: `eeg: [B, C, T]`, `channel_xyz: [B, C, 3]`, `subject_id` (optional), `run_id` (optional).
+- [ ] Architecture target: temporal convolution / learned filterbank + coordinate embedding MLP + channel attention or transformer + temporal pooling + subject/run adapter + projection to CLIP dimension.
+- [ ] Keep the Conv1D baseline for comparison.
+
+## 9. Phase 6 — Multi-domain semantic front (Sprint 5)
+
+**Objective**: Move from CLIP image embeddings to structured semantic state.
+- [ ] Add structured targets: CLIP image embedding, CLIP text/class embedding, object caption embedding, spatial/composition embedding, color/material embedding, mood/theme embedding, abstract concept embedding, direction/action embedding.
+- [ ] This is core Neural-MCRL / Semantic-Prompts inspiration. Do not jump to diffusion before this has measurable signal.
+
+## 10. Phase 7 — BReAD-style retrieval branch
+
+**Objective**: Use retrieved image/embedding as grounding for img2img.
+- [ ] Add `src/mindseye/embeddings/faiss_index.py`, `scripts/build_retrieval_index.py`, `scripts/retrieve_visual_priors.py`.
+- [ ] Implement after the semantic front beats controls.
+
+## 11. Phase 8 — Frozen diffusion img2img prototype (Sprint 6+)
+
+**Objective**: Hook predicted semantic state to SDXL-Turbo/SD3.
+- [ ] Do not implement now unless retrieval/semantic gates pass.
+- [ ] Required before diffusion: real EEG->CLIP > shuffled, real EEG->semantic heads > shuffled, low-channel simulation has nonzero usable signal, retrieval grids are meaningful.
+- [ ] Pipeline: semantic state + retrieved prior + current image -> SDXL-Turbo or similar img2img.
+- [ ] Do not start with fine-tuning diffusion. Defer EEG2Vision-style VLM boost.
+
+## 12. Phase 9 — Alljoined / ENIGMA comparison
+
+**Objective**: Use Alljoined for domain adaptation / consumer-grade robustness, not as core.
+- [ ] Run comparable baselines against ENIGMA after baseline matrix / low-channel simulation.
+
+## 13. Output and experiment tracking
+
+**Objective**: `outputs/runs/YYYYMMDD_HHMMSS_slug/` structured output tracking with metrics and audits.
+- [x] Every run creates: `config.json`, `git_commit.txt`, `environment.txt`, `metrics.json`, `metrics.csv`, `train_log.csv`, `best.pt`, `history.json`.
+- [ ] Add `retrieval_grid.png` auto-generation at end of each training run.
+- [ ] Add `audit.json` and `notes.md` stubs.
+
+---
+
+## Concrete execution order
+
+1. **Sprint 1 — Reproducibility and audits (CURRENT)**
+2. **Sprint 2 — Baseline matrix**
+3. **Sprint 3 — Low-channel simulation**
+4. **Sprint 4 — Better encoder**
+5. **Sprint 5 — Text/caption semantic layer**
+6. **Sprint 6 — Frozen diffusion prototype**
+7. **Sprint 7 — Alljoined / ENIGMA comparison**
+
+*Do not add diffusion until semantic retrieval beats shuffled baselines.*

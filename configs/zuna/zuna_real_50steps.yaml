@@ -1,0 +1,10 @@
+zuna:
+  enabled: true
+  diffusion_sample_steps: 50
+  data_norm: 10.0
+  tokens_per_batch: 100000
+  target_sfreq: 256
+  epoch_duration_s: 5.0
+  highpass_hz: 0.5
+  average_reference: true
+  mode: real

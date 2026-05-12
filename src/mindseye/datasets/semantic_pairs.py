@@ -1,9 +1,9 @@
 """Dataset utilities for ZUNA semantic EEG crops paired with CLIP image embeddings."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -11,32 +11,63 @@ import torch
 from torch.utils.data import Dataset
 
 
+TargetMode = Literal["real", "shuffled", "random", "sameclass"]
+InputDomain = Literal["zuna", "raw", "resample"]
+
+
 @dataclass(frozen=True)
 class SemanticPairConfig:
-    """Paths needed to construct EEG→CLIP training pairs."""
+    """Paths and target-mode needed to construct EEG→CLIP training pairs.
+
+    target_mode controls what CLIP vector is used as the supervision target:
+      - "real"      → paired CLIP embedding for the shown image (default)
+      - "shuffled"  → CLIP embeddings are shuffled across the dataset (fixed seed)
+      - "random"    → a fresh Gaussian vector normalized to the CLIP unit sphere
+      - "sameclass" → a different embedding from the same ImageNet synset (if available)
+
+    input_domain selects which NPZ file to read EEG from:
+      - "zuna"      → standard ZUNA-denoised crops (default)
+      - "raw"       → un-denoised raw crops from a parallel epochs_dir_raw
+      - "resample"  → resample-only crops from epochs_dir_resample
+    """
 
     metadata_csv: str | Path
     epochs_dir: str | Path
     clip_embeddings_pt: str | Path
     normalize_eeg: bool = True
     preload_npz: bool = True
+    target_mode: TargetMode = "real"
+    input_domain: InputDomain = "zuna"
+    # Alternative epoch directories for raw / resample conditions
+    epochs_dir_raw: str | Path | None = None
+    epochs_dir_resample: str | Path | None = None
+    shuffle_seed: int = 42
 
 
 class ZunaClipPairDataset(Dataset):
     """
-    Pair event-aligned ZUNA EEG crops with ground-truth CLIP image embeddings.
+    Pair event-aligned EEG crops with ground-truth (or control) CLIP embeddings.
 
-    The cropper writes one row per epoch in `all_runs_metadata.csv` and records
-    the per-run compressed NPZ file in `npz_file`. The CLIP embedding table is
-    produced by `scripts/generate_clip_embeddings.py` and contains image IDs plus
-    a tensor shaped `[n_images, embedding_dim]`.
+    Supports 4 target modes and 3 input domains so all 6 baseline-matrix conditions
+    can be exercised from the same dataset class without code duplication.
     """
 
     def __init__(self, config: SemanticPairConfig):
         self.config = config
         self.metadata_csv = Path(config.metadata_csv)
-        self.epochs_dir = Path(config.epochs_dir)
         self.clip_embeddings_pt = Path(config.clip_embeddings_pt)
+
+        # Select the epoch dir based on input domain
+        if config.input_domain == "raw":
+            if config.epochs_dir_raw is None:
+                raise ValueError("epochs_dir_raw must be set when input_domain='raw'")
+            self.epochs_dir = Path(config.epochs_dir_raw)
+        elif config.input_domain == "resample":
+            if config.epochs_dir_resample is None:
+                raise ValueError("epochs_dir_resample must be set when input_domain='resample'")
+            self.epochs_dir = Path(config.epochs_dir_resample)
+        else:
+            self.epochs_dir = Path(config.epochs_dir)
 
         self.metadata = pd.read_csv(self.metadata_csv).reset_index(drop=True)
         required = {"image_id", "npz_file"}
@@ -46,14 +77,19 @@ class ZunaClipPairDataset(Dataset):
 
         table = torch.load(self.clip_embeddings_pt, map_location="cpu")
         self.embedding_dim = int(table["embedding"].shape[-1])
-        self.image_to_embedding = {
+        self.image_to_embedding: dict[str, torch.Tensor] = {
             str(image_id): table["embedding"][i].float()
             for i, image_id in enumerate(table["image_id"])
         }
-        missing_images = sorted(set(self.metadata["image_id"].astype(str)) - set(self.image_to_embedding))
-        if missing_images:
-            examples = ", ".join(missing_images[:5])
-            raise ValueError(f"Missing CLIP embeddings for {len(missing_images)} image IDs. Examples: {examples}")
+        # Filter metadata to only include items that have CLIP embeddings
+        initial_n = len(self.metadata)
+        self.metadata["image_id_str"] = self.metadata["image_id"].astype(str)
+        mask = self.metadata["image_id_str"].isin(self.image_to_embedding.keys())
+        self.metadata = self.metadata[mask].reset_index(drop=True)
+        dropped = initial_n - len(self.metadata)
+        if dropped > 0:
+            print(f"  [Dataset] Dropped {dropped} samples due to missing CLIP embeddings "
+                  f"({len(self.metadata)} remaining)")
 
         self._epoch_offsets = self._add_epoch_offsets(self.metadata)
         self._npz_cache: dict[str, np.ndarray] = {}
@@ -63,6 +99,23 @@ class ZunaClipPairDataset(Dataset):
 
         first = self._get_eeg(0)
         self.eeg_shape = tuple(int(x) for x in first.shape)
+
+        # Build shuffled / random target index once at init time
+        n = len(self.metadata)
+        rng = np.random.default_rng(config.shuffle_seed)
+        if config.target_mode == "shuffled":
+            self._target_perm = rng.permutation(n).tolist()
+        elif config.target_mode == "random":
+            # Sample unit-sphere Gaussian vectors, one per sample
+            vecs = rng.standard_normal((n, self.embedding_dim)).astype("float32")
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+            self._random_targets: list[torch.Tensor] = [
+                torch.from_numpy(vecs[i] / norms[i]).float() for i in range(n)
+            ]
+        elif config.target_mode == "sameclass":
+            self._build_sameclass_index(rng)
+
+    # ------------------------------------------------------------------ helpers
 
     @staticmethod
     def _add_epoch_offsets(metadata: pd.DataFrame) -> list[int]:
@@ -97,16 +150,52 @@ class ZunaClipPairDataset(Dataset):
             eeg = (eeg - mean) / std
         return eeg
 
+    def _build_sameclass_index(self, rng: np.random.Generator) -> None:
+        """Map each sample to a random *different* sample sharing the same synset.
+
+        Falls back to the real target when the synset has only one sample."""
+        if "synset" not in self.metadata.columns:
+            # Try to extract synset from image_id (e.g. "n01440764_1234" → "n01440764")
+            self.metadata["synset"] = self.metadata["image_id"].astype(str).str.split("_").str[0]
+
+        synset_to_indices: dict[str, list[int]] = {}
+        for idx, syn in enumerate(self.metadata["synset"]):
+            synset_to_indices.setdefault(syn, []).append(idx)
+
+        self._sameclass_targets: list[int] = []
+        for idx in range(len(self.metadata)):
+            syn = self.metadata.iloc[idx]["synset"]
+            pool = [i for i in synset_to_indices[syn] if i != idx]
+            self._sameclass_targets.append(int(rng.choice(pool)) if pool else idx)
+
+    # ------------------------------------------------------------------ Dataset API
+
+    def _get_clip(self, idx: int) -> torch.Tensor:
+        """Return the CLIP target for sample *idx* based on target_mode."""
+        mode = self.config.target_mode
+        if mode == "real":
+            image_id = str(self.metadata.iloc[idx]["image_id"])
+            return self.image_to_embedding[image_id]
+        if mode == "shuffled":
+            shuffled_idx = self._target_perm[idx]
+            image_id = str(self.metadata.iloc[shuffled_idx]["image_id"])
+            return self.image_to_embedding[image_id]
+        if mode == "random":
+            return self._random_targets[idx]
+        if mode == "sameclass":
+            alt_idx = self._sameclass_targets[idx]
+            image_id = str(self.metadata.iloc[alt_idx]["image_id"])
+            return self.image_to_embedding[image_id]
+        raise ValueError(f"Unknown target_mode: {mode!r}")
+
     def __len__(self) -> int:
         return len(self.metadata)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str | int]:
-        row = self.metadata.iloc[idx]
-        image_id = str(row["image_id"])
         return {
             "eeg": self._get_eeg(idx),
-            "clip": self.image_to_embedding[image_id],
-            "image_id": image_id,
+            "clip": self._get_clip(idx),
+            "image_id": str(self.metadata.iloc[idx]["image_id"]),
             "index": int(idx),
         }
 

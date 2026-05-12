@@ -29,54 +29,91 @@ def run_zuna_offline(
     """
     from zuna import preprocessing, inference, pt_to_fif
 
-    # Stage dirs
-    fif_filter_dir = os.path.join(working_dir, "1_fif_filter")
-    pt_input_dir = os.path.join(working_dir, "2_pt_input")
-    pt_output_dir = os.path.join(working_dir, "3_pt_output")
     fif_output_dir = os.path.join(working_dir, "4_fif_output")
-
-    for d in [fif_filter_dir, pt_input_dir, pt_output_dir, fif_output_dir]:
-        os.makedirs(d, exist_ok=True)
+    os.makedirs(fif_output_dir, exist_ok=True)
 
     fif_files = glob.glob(os.path.join(input_fif_dir, "*.fif"))
     if not fif_files:
         raise FileNotFoundError(f"No .fif files in {input_fif_dir}")
     print(f"Found {len(fif_files)} .fif files to process")
 
-    # Step 1: Preprocess (resample 256Hz, filter, epoch 5s, normalize)
-    print("\n=== ZUNA Preprocessing ===")
-    preprocess_kwargs = dict(
-        input_dir=input_fif_dir,
-        output_dir=pt_input_dir,
-        apply_notch_filter=False,
-        apply_highpass_filter=True,
-        apply_average_reference=True,
-        preprocessed_fif_dir=fif_filter_dir,
-    )
-    if target_channels:
-        preprocess_kwargs["target_channel_count"] = target_channels
-    if bad_channels:
-        preprocess_kwargs["bad_channels"] = bad_channels
+    import shutil
+    import tempfile
 
-    preprocessing(**preprocess_kwargs)
+    for fif_path in fif_files:
+        base_name = os.path.basename(fif_path)
+        print(f"\n--- Processing {base_name} ---")
+        
+        with tempfile.TemporaryDirectory(dir=working_dir) as tmpdir:
+            tmp_in = os.path.join(tmpdir, "in")
+            tmp_1 = os.path.join(tmpdir, "1")
+            tmp_2 = os.path.join(tmpdir, "2")
+            tmp_3 = os.path.join(tmpdir, "3")
+            tmp_4 = os.path.join(tmpdir, "4")
+            for d in [tmp_in, tmp_1, tmp_2, tmp_3, tmp_4]:
+                os.makedirs(d)
+            
+            shutil.copy(fif_path, tmp_in)
+            
+            preprocess_kwargs = dict(
+                input_dir=tmp_in,
+                output_dir=tmp_2,
+                apply_notch_filter=False,
+                apply_highpass_filter=True,
+                apply_average_reference=True,
+                preprocessed_fif_dir=tmp_1,
+            )
+            if target_channels:
+                preprocess_kwargs["target_channel_count"] = target_channels
+            if bad_channels:
+                preprocess_kwargs["bad_channels"] = bad_channels
 
-    # Step 2: Inference (denoise / reconstruct / upsample)
-    print("\n=== ZUNA Inference ===")
-    inference(
-        input_dir=pt_input_dir,
-        output_dir=pt_output_dir,
-        gpu_device=gpu_device,
-        data_norm=data_norm,
-        diffusion_sample_steps=diffusion_steps,
-    )
+            print("=== Preprocessing ===")
+            preprocessing(**preprocess_kwargs)
 
-    # Step 3: Convert back to .fif
-    print("\n=== ZUNA Reconstruction -> .fif ===")
-    pt_to_fif(
-        input_dir=pt_output_dir,
-        output_dir=fif_output_dir,
-    )
+            print("=== Inference ===")
+            inference(
+                input_dir=tmp_2,
+                output_dir=tmp_3,
+                gpu_device=gpu_device,
+                data_norm=data_norm,
+                diffusion_sample_steps=diffusion_steps,
+            )
+
+            print("=== Reconstruction ===")
+            pt_to_fif(
+                input_dir=tmp_3,
+                output_dir=tmp_4,
+            )
+            
+            # Copy result to final output dir
+            out_files = glob.glob(os.path.join(tmp_4, "*.fif"))
+            for out_f in out_files:
+                shutil.copy(out_f, fif_output_dir)
 
     output_files = glob.glob(os.path.join(fif_output_dir, "*.fif"))
     print(f"\n Done. {len(output_files)} output .fif files in {fif_output_dir}")
     return fif_output_dir
+
+if __name__ == "__main__":
+    import sys
+    import yaml
+    
+    if len(sys.argv) < 2:
+        print("Usage: python offline_pipeline.py <config.yaml>")
+        sys.exit(1)
+        
+    config_path = sys.argv[1]
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+        
+    z_conf = config.get("zuna", {})
+    run_zuna_offline(
+        input_fif_dir=z_conf.get("input_dir", "data/raw/nod/derivatives/preprocessed/raw"),
+        working_dir=z_conf.get("working_dir", "data/processed/zuna_output"),
+        target_channels=z_conf.get("target_channels", None),
+        bad_channels=z_conf.get("bad_channels", None),
+        gpu_device=z_conf.get("gpu_device", 0),
+        diffusion_steps=z_conf.get("diffusion_steps", 50),
+        data_norm=z_conf.get("data_norm", 10.0),
+    )

@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Crop event-aligned semantic windows from real ZUNA outputs.
+"""Crop event-aligned semantic windows from raw, resample-only, or ZUNA output FIFs.
 
-Example:
-  PYTHONPATH=src python scripts/run_cropper.py \
+Examples:
+  # ZUNA crops (default)
+  PYTHONPATH=src python scripts/run_cropper.py --mode zuna \
     --zuna-dir data/processed/zuna_real_sub01_runs01_05/4_fif_output \
     --runs 1 2 3 4 5
+
+  # Raw crops (no ZUNA, crop straight from preprocessed FIF)
+  PYTHONPATH=src python scripts/run_cropper.py --mode raw --runs 1 2 3 4 5
+
+  # Resample-only crops (250Hz → 256Hz, no ZUNA denoising)
+  PYTHONPATH=src python scripts/run_cropper.py --mode resample --runs 1 2 3 4 5
 """
 from __future__ import annotations
 
@@ -15,42 +22,75 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mindseye.zuna.cropper import CropConfig, crop_zuna_runs
+from mindseye.zuna.cropper import CropConfig, crop_runs
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-root", default="data/raw/nod", help="OpenNeuro NOD root")
     p.add_argument("--subject", default="sub-01")
     p.add_argument("--session", default="ImageNet01")
-    p.add_argument("--runs", nargs="+", type=int, default=[1], help="Run numbers to crop")
+    p.add_argument("--runs", nargs="+", type=int, default=[1, 2, 3, 4, 5],
+                   help="Run numbers to crop")
     p.add_argument(
-        "--zuna-dir",
-        default="data/processed/zuna_real_sub01_runs01_05/4_fif_output",
-        help="Directory containing real ZUNA output FIFs",
+        "--mode", choices=("zuna", "raw", "resample"), default="zuna",
+        help=(
+            "zuna: crop from ZUNA-denoised FIF (needs --zuna-dir); "
+            "raw: crop directly from preprocessed FIF at its native sfreq; "
+            "resample: resample raw to --resample-sfreq then crop"
+        ),
     )
     p.add_argument(
-        "--output-dir",
-        default="data/processed/semantic_epochs/zuna_real_sub01_runs01_05",
-        help="Output directory for semantic epoch FIF/NPZ/metadata files",
+        "--zuna-dir",
+        default="data/processed/zuna_output/4_fif_output",
+        help="Directory of ZUNA output FIFs (only used when --mode zuna)",
+    )
+    p.add_argument(
+        "--output-dir", default=None,
+        help="Output directory for NPZ/FIF/metadata (default: data/processed/semantic_epochs/<mode>_sub01_runs01_05)",
     )
     p.add_argument("--tmin", type=float, default=-0.25)
     p.add_argument("--tmax", type=float, default=1.0)
+    p.add_argument("--resample-sfreq", type=float, default=256.0,
+                   help="Target sfreq for --mode resample (default 256 Hz)")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root)
-    summary = crop_zuna_runs(
+
+    # Default output dir encodes the mode so all three can coexist
+    output_dir = Path(args.output_dir) if args.output_dir else (
+        Path("data/processed/semantic_epochs") /
+        f"{args.mode}_{args.subject}_runs{''.join(f'{r:02d}' for r in sorted(args.runs))}"
+    )
+
+    config = CropConfig(
+        tmin=args.tmin,
+        tmax=args.tmax,
+        mode=args.mode,
+        resample_sfreq=args.resample_sfreq,
+    )
+
+    source_dir = Path(args.zuna_dir) if args.mode == "zuna" else None
+
+    print(f"Mode        : {args.mode}")
+    print(f"Runs        : {args.runs}")
+    print(f"Output dir  : {output_dir}")
+    if source_dir:
+        print(f"Source dir  : {source_dir}")
+
+    summary = crop_runs(
         raw_dir=data_root / "derivatives/preprocessed/raw",
-        zuna_dir=Path(args.zuna_dir),
+        source_dir=source_dir,
         events_csv=data_root / "derivatives/detailed_events" / f"{args.subject}_events.csv",
-        output_dir=Path(args.output_dir),
+        output_dir=output_dir,
         subject=args.subject,
         session=args.session,
         runs=args.runs,
-        config=CropConfig(tmin=args.tmin, tmax=args.tmax),
+        config=config,
     )
     print(json.dumps(summary, indent=2))
 

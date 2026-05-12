@@ -1,66 +1,58 @@
-# Mind's Eye — ZUNA-first EEG→Semantic→Image
+# MindEye — ZUNA-first EEG→Semantic→Image
 
-EEG-driven image generation using ZUNA as the signal normalization layer.
+## Project thesis
+EEG-driven image generation using ZUNA as the signal normalization layer. The core objective is to map real continuous EEG, cleaned by ZUNA, into the visual latent space (CLIP) to reconstruct what a subject is seeing.
 
-## Setup
+## Current status
+**MindEye v0.1-dev**: We are currently in the baseline generation and testing phase. We have established the pipeline for downloading NOD-EEG, processing via ZUNA, extracting semantic crops, and generating ground-truth CLIP targets. We are strictly requiring that our ZUNA-cleaned EEG crops retrieve the correct visual/semantic targets above shuffled controls before introducing diffusion.
 
+*Note: The EEG-to-image system is NOT complete. We are currently building the ZUNA-aligned EEG→CLIP retrieval scaffold.*
+
+## Installation
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+make setup
 ```
 
-## Pipeline
+## Data requirements
+This pipeline uses the NOD-EEG dataset (ds005811) from OpenNeuro, which contains continuous visual EEG recordings.
 
-```
-NOD-EEG continuous .fif
-→ ZUNA denoise/reconstruct (5s windows @ 256Hz)
-→ event-aligned crop (1.25s around stimulus)
-→ EEG→CLIP semantic encoder
-→ frozen diffusion img2img loop
-```
-
-## Quick Start
-
+## Reproduce the current NOD-ZUNA baseline
 ```bash
-# 1. Download NOD-EEG subset (one subject, run 01 by default)
-python scripts/download_nod.py
-
-# Download runs 01-05 for the current ZUNA/cropper path
-python scripts/download_nod.py --runs 1-5
-
-# Later, after generating a targeted stimulus include list for CLIP:
-python scripts/download_nod.py \
-  --runs 1-5 \
-  --include-list data/processed/clip_embeddings/openneuro_image_includes_sub01_runs01_05.txt
-
-# 2. Run smoke test
-python scripts/test_pipeline.py
+make nod
+make zuna
+make crop
+make clip
 ```
 
-## Project Structure
-
-```
-mindseye/
-  src/mindseye/
-    datasets/nod.py          — NOD-EEG loader (.fif + events + images)
-    zuna/offline_pipeline.py  — batch ZUNA processing
-    zuna/cropper.py           — event-aligned crop extraction
-    zuna/montage.py           — channel coordinate handling
-    embeddings/clip.py        — CLIP embedding computation
-    datasets/semantic_pairs.py — ZUNA crop + CLIP embedding pairs
-    models/eeg_encoder.py     — baseline EEG→CLIP encoder
-  scripts/
-    download_nod.py           — download NOD-EEG from OpenNeuro
-    run_zuna_batch.py         — real ZUNA batch runner; explicit resample-only baseline mode
-    run_cropper.py            — event-aligned crop CLI
-    generate_clip_embeddings.py — CLIP embedding generation / OpenNeuro image include list
-    train_eeg_clip.py         — EEG→CLIP training; contrastive default
-    make_retrieval_grid.py    — visual nearest-neighbor EEG→CLIP retrieval grid
-    test_pipeline.py          — end-to-end smoke test
-  vendor/ENIGMA/              — reference codebase
+## Run timing audit
+*Before any training runs, you must ensure event timing has not been corrupted.*
+```bash
+make audit
 ```
 
-## Current Status
+## Train EEG→CLIP baseline
+```bash
+make train
+```
 
-The `sub-01` runs 01-05 path has produced ZUNA semantic crops, CLIP embeddings, a 5-epoch cosine+MSE smoke model, and visual retrieval grids. The smoke model showed CLIP hub/collapse behavior, so training now defaults to a CLIP-style symmetric contrastive loss with optional CLIP target centering and run-heldout validation support.
+## Run baseline matrix
+(Pending Matrix Script Implementation)
+
+## Generate retrieval grids
+```bash
+make grid
+```
+
+## Planned architecture
+- **NOD-EEG continuous .fif**
+- **ZUNA** 5s denoise/reconstruct @ 256Hz
+- **Event-aligned crop** 1.25s around stimulus
+- **EEG→CLIP semantic encoder** mapping EEG latent space to CLIP embeddings
+- **Frozen diffusion img2img loop**
+
+## Known limitations
+- Diffusion is not yet integrated.
+- Only testing on `sub-01` currently.
+
+## Paper/model comparison
+This project draws inspiration from **ZUNA** (EEG foundation model) and **ENIGMA** (EEG-to-Image decoding). MindEye's focus is on establishing strict timing-aligned continuous processing pipelines before evaluating performance against these benchmarks.

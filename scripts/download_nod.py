@@ -95,17 +95,26 @@ def download_patterns(dataset: str, target_dir: str | Path, patterns: Iterable[s
 
     import openneuro  # Imported lazily so --dry-run works without project deps installed.
 
-    for pattern in patterns:
-        print(f"\n=== Downloading: {pattern} ===")
-        try:
-            openneuro.download(
-                dataset=dataset,
-                target_dir=str(target),
-                include=[pattern],
-            )
-        except Exception as exc:  # OpenNeuro partial availability can vary; keep going.
-            print(f"  Warning: {exc}")
-            print("  Continuing with next pattern...")
+    try:
+        print(f"\n=== Downloading {len(patterns)} patterns in batch ===")
+        openneuro.download(
+            dataset=dataset,
+            target_dir=str(target),
+            include=patterns,
+        )
+    except Exception as exc:
+        print(f"  Batch failed: {exc}. Falling back to individual downloads...")
+        for pattern in patterns:
+            print(f"\n=== Downloading: {pattern} ===")
+            try:
+                openneuro.download(
+                    dataset=dataset,
+                    target_dir=str(target),
+                    include=[pattern],
+                )
+            except Exception as exc:  # OpenNeuro partial availability can vary; keep going.
+                print(f"  Warning: {exc}")
+                print("  Continuing with next pattern...")
 
     print(f"\nDone! NOD-EEG files downloaded to {target}/")
 

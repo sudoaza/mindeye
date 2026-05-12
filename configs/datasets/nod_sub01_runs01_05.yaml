@@ -1,0 +1,20 @@
+dataset: nod
+subject: "sub-01"
+runs: [1, 2, 3, 4, 5]
+
+paths:
+  raw_root: data/raw/nod
+  processed_root: data/processed
+  zuna_root: data/processed/zuna_real_sub01_runs01_05
+  semantic_epochs_root: data/processed/semantic_epochs/zuna_real_sub01_runs01_05
+  clip_root: data/processed/clip_embeddings
+  outputs_root: outputs
+
+stimulus:
+  crop_start_s: 0.0
+  crop_duration_s: 1.25
+  target_samples: 320
+
+sampling:
+  zuna_sfreq: 256
+  crop_sfreq: 256

@@ -1,0 +1,18 @@
+model:
+  name: eeg_clip_baseline
+  input_channels: auto
+  input_samples: 320
+  projection_dim: 512
+  dropout: 0.1
+
+train:
+  epochs: 30
+  batch_size: 64
+  lr: 0.0003
+  weight_decay: 0.0001
+  loss: contrastive
+  temperature: 0.07
+  center_clip: true
+  split_mode: run
+  val_runs: [5]
+  seed: 13
