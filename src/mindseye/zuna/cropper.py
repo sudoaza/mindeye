@@ -170,6 +170,21 @@ def crop_run_to_epochs(
     metadata = events_for_run(events_df, session=session, run=run)
     n = min(len(onset_seconds), len(metadata))
     onset_seconds = onset_seconds[:n]
+    
+    # Count other stimuli in window for diagnostic logging
+    other_counts = []
+    for onset in onset_seconds:
+        window_start = onset + config.tmin
+        window_end = onset + config.tmax
+        # count onsets in (window_start, window_end) excluding the anchor itself
+        others = ((onset_seconds > window_start) & (onset_seconds < window_end)).sum() - 1
+        other_counts.append(max(0, others))
+    
+    avg_others = np.mean(other_counts)
+    print(f"  [Cropper] Label noise diagnostic: avg {avg_others:.2f} other stimuli in window")
+    if avg_others > 1.0:
+        print(f"  [WARN] High label noise! windows contain multiple stimuli on average.")
+
     metadata = metadata.iloc[:n].copy()
     metadata.insert(0, "stim_onset_sec", onset_seconds)
     metadata.insert(0, "source_mode", config.mode)

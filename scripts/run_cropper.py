@@ -48,12 +48,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--output-dir", default=None,
-        help="Output directory for NPZ/FIF/metadata (default: data/processed/semantic_epochs/<mode>_sub01_runs01_05)",
+        help="Output directory for NPZ/FIF/metadata",
     )
     p.add_argument("--tmin", type=float, default=-0.25)
     p.add_argument("--tmax", type=float, default=1.0)
-    p.add_argument("--resample-sfreq", type=float, default=256.0,
-                   help="Target sfreq for --mode resample (default 256 Hz)")
+    p.add_argument("--full5s", action="store_true",
+                   help="Shortcut for --tmin -1.0 --tmax 4.0 (5s window)")
+    p.add_argument("--expected-sfreq", type=float, default=256.0)
+    p.add_argument("--resample-sfreq", type=float, default=256.0)
+    p.add_argument("--event-name", default="stim_on")
     return p.parse_args()
 
 
@@ -61,18 +64,22 @@ def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root)
 
-    # Default output dir encodes the mode so all three can coexist
-    output_dir = Path(args.output_dir) if args.output_dir else (
-        Path("data/processed/semantic_epochs") /
-        f"{args.mode}_{args.subject}_runs{''.join(f'{r:02d}' for r in sorted(args.runs))}"
-    )
+    if args.full5s:
+        tmin, tmax = -1.0, 4.0
+    else:
+        tmin, tmax = args.tmin, args.tmax
 
     config = CropConfig(
-        tmin=args.tmin,
-        tmax=args.tmax,
-        mode=args.mode,
+        tmin=tmin,
+        tmax=tmax,
+        expected_sfreq=args.expected_sfreq,
         resample_sfreq=args.resample_sfreq,
+        event_name=args.event_name,
+        mode=args.mode,
     )
+
+    window_tag = "full5s" if args.full5s else f"crop_{tmin}_{tmax}"
+    output_dir = Path(args.output_dir or f"data/processed/semantic_epochs/{args.mode}_{window_tag}_{args.subject}_runs01_05")
 
     source_dir = Path(args.zuna_dir) if args.mode == "zuna" else None
 

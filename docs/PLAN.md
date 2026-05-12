@@ -98,14 +98,30 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 
 ---
 
-## Concrete execution order
+## Current Status: Phase 3.5 (Recovery) 🚧
 
-1. **Sprint 1 — Reproducibility and audits (CURRENT)**
-2. **Sprint 2 — Baseline matrix**
-3. **Sprint 3 — Low-channel simulation**
-4. **Sprint 4 — Better encoder**
-5. **Sprint 5 — Text/caption semantic layer**
-6. **Sprint 6 — Frozen diffusion prototype**
-7. **Sprint 7 — Alljoined / ENIGMA comparison**
+- ✅ **Sprint 1 complete** — ZUNA inference, timing audit, retrieval grid.
+- ❌ **Sprint 2 failed** — 1.25s crops did not beat controls.
+- 🚀 **Phase 3.5 active** — Full-window ZUNA semantic baseline (5s windows).
+
+---
+
+## 🗺️ Roadmap
+
+### Phase 1 & 2: Baseline & Signal Validation (Complete)
+- ✅ Process continuous NOD data through ZUNA foundation.
+- ✅ Audit event timing and signal integrity.
+
+### Phase 3: Baseline Matrix (Failed/Retrying)
+- ❌ Sprint 2: 1.25s Crop Matrix (No signal found).
+- 🚀 **Phase 3.5: Full-window ZUNA Recovery** (Active)
+  - [ ] Generate 5s ZUNA windows for sub-01 runs 01–10.
+  - [ ] Implement `temporal_attn` encoder for [C, 1280] input.
+  - [ ] supervision: Image CLIP + Text CLIP (from class labels).
+  - [ ] Result: Beat shuffled/random controls with 5s windows.
+
+### Phase 4: Low-Channel Simulation (Next)
+- [ ] Sprint 3: EPOC-14 channel subset masking.
+- [ ] Validate retrieval robustness to channel loss.
 
 *Do not add diffusion until semantic retrieval beats shuffled baselines.*

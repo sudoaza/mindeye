@@ -83,9 +83,13 @@ def run_condition(
         "--loss",           "contrastive",
         "--center-clip",
         "--output-dir",     str(matrix_dir),
-        "--slug",           name,
+        "--slug",           f"{name}_{args.slug}" if args.slug else name,
+        "--window-mode",     args.window_mode,
+        "--semantic-target", args.semantic_target,
+        "--model",           args.model,
     ]
-
+    if args.text_embeddings:
+        cmd += ["--text-embeddings", args.text_embeddings]
     # Forward optional raw/resample dirs if provided
     if args.epochs_dir_raw:
         cmd += ["--epochs-dir-raw", args.epochs_dir_raw]
@@ -166,6 +170,12 @@ def main() -> None:
     p.add_argument("--batch-size",     type=int, default=int(DEFAULTS["batch_size"]))
     p.add_argument("--out-dir",        default="outputs/baseline_matrix",
                    help="Parent directory for all matrix runs")
+    p.add_argument("--slug",           default=None)
+    p.add_argument("--device",         default=DEFAULTS["device"])
+    p.add_argument("--window-mode",     choices=("crop", "full5s"), default="crop")
+    p.add_argument("--semantic-target", choices=("image", "text", "image_text"), default="image")
+    p.add_argument("--text-embeddings", default=None)
+    p.add_argument("--model",           choices=("cnn", "temporal_attn"), default="cnn")
     p.add_argument("--conditions",     nargs="*", default=None,
                    help="Subset of condition names to run (default: all 6)")
     p.add_argument("--dry-run", action="store_true",
