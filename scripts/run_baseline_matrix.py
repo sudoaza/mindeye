@@ -18,6 +18,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -107,7 +108,7 @@ def run_condition(
         return {"condition": name, "status": "failed", "error": result.stdout[-500:]}
 
     # Locate the newest metrics.json written to matrix_dir
-    candidates = sorted(matrix_dir.glob(f"*_{name}/metrics.json"), key=lambda p: p.stat().st_mtime)
+    candidates = sorted(matrix_dir.glob(f"*{name}*/metrics.json"), key=lambda p: p.stat().st_mtime)
     if not candidates:
         print(f"[WARN] No metrics.json found for {name}")
         return {"condition": name, "status": "no_metrics"}
@@ -125,8 +126,8 @@ def gate_check(df: pd.DataFrame) -> None:
     print("=" * 60)
 
     zuna = df[df["condition"] == "zuna_runheldout"]
-    if zuna.empty:
-        print("[SKIP] zuna_runheldout not found in results.")
+    if zuna.empty or "top10" not in zuna.columns:
+        print("[SKIP] zuna_runheldout metrics not found in results.")
         return
 
     zuna_top10 = float(zuna["top10"].iloc[0])
@@ -137,8 +138,11 @@ def gate_check(df: pd.DataFrame) -> None:
     all_passed = True
     for ctrl in controls:
         row = df[df["condition"] == ctrl]
-        if row.empty:
+        if row.empty or pd.isna(row.get("top10", pd.Series([np.nan])).iloc[0]):
+            print(f"  ❌  zuna_runheldout vs {ctrl}: {ctrl} missing metrics")
+            all_passed = False
             continue
+            
         ctrl_top10 = float(row["top10"].iloc[0])
         ctrl_mrr   = float(row["mrr"].iloc[0])
         passes = zuna_top10 > ctrl_top10 and zuna_mrr > ctrl_mrr
