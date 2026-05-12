@@ -42,6 +42,11 @@ def run_zuna_offline(
 
     for fif_path in fif_files:
         base_name = os.path.basename(fif_path)
+        expected_out = os.path.join(fif_output_dir, base_name)
+        if os.path.exists(expected_out):
+            print(f"\n--- Skipping {base_name} (already processed) ---")
+            continue
+            
         print(f"\n--- Processing {base_name} ---")
         
         with tempfile.TemporaryDirectory(dir=working_dir) as tmpdir:

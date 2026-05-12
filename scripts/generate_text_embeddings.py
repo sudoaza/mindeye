@@ -64,6 +64,13 @@ def main() -> None:
             prompts = [t.format(label=label) for t in TEMPLATES]
             inputs = processor(text=prompts, padding=True, return_tensors="pt").to(device)
             text_features = model.get_text_features(**inputs)
+            if not isinstance(text_features, torch.Tensor):
+                if hasattr(text_features, "text_embeds"):
+                    text_features = text_features.text_embeds
+                elif hasattr(text_features, "pooler_output"):
+                    text_features = text_features.pooler_output
+                else:
+                    text_features = text_features[0]
             # Normalize and average
             text_features = torch.nn.functional.normalize(text_features, dim=-1)
             mean_embedding = text_features.mean(dim=0)
