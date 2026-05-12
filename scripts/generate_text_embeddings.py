@@ -109,7 +109,7 @@ def main() -> None:
                     "caption_detailed": row.get("short_caption", "") + " " + row.get("detailed_caption", ""),
                     "caption_composition": row.get("composition_caption", ""),
                     "caption_attributes": row.get("attribute_caption", ""),
-                    "caption_core": row.get("embedding_text", ""), # Assuming embedding_text is generated as core
+                    "caption_core": f"{row.get('short_caption', '')} {row.get('detailed_caption', '')} Composition: {row.get('composition_caption', '')} Attributes: {row.get('attribute_caption', '')}.",
                 }
                 
                 for target_name, text in texts.items():
