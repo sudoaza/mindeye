@@ -122,12 +122,13 @@ class ZunaClipPairDataset(Dataset):
         self.eeg_shape = tuple(int(x) for x in first.shape)
 
         if config.window_mode == "full5s_backaligned":
-            if self.eeg_shape[-1] != 1280:
-                raise ValueError(f"full5s_backaligned requires sample length 1280, got {self.eeg_shape[-1]}")
+            if self.eeg_shape[-1] not in (1280, 1281):
+                raise ValueError(f"full5s_backaligned requires sample length 1280 or 1281, got {self.eeg_shape[-1]}")
             if "event_offset_s" not in self.metadata.columns:
                 raise ValueError("event_offset_s missing from metadata")
             if "anchor_sample" not in self.metadata.columns:
                 raise ValueError("anchor_sample missing from metadata")
+            self.eeg_shape = (self.eeg_shape[0], 1280)
 
         # Build shuffled / random target index once at init time
         n = len(self.metadata)
@@ -190,6 +191,9 @@ class ZunaClipPairDataset(Dataset):
         npz_file = str(row["npz_file"])
         epoch_idx = self._epoch_offsets[idx]
         eeg = torch.from_numpy(self._get_npz(npz_file)[epoch_idx]).float()
+        
+        if self.config.window_mode == "full5s_backaligned":
+            eeg = eeg[:, :1280]
         
         if self.config.normalize_eeg:
             mean = eeg.mean(dim=-1, keepdim=True)
