@@ -50,6 +50,17 @@ matrix:
 		--epochs-dir-raw data/processed/semantic_epochs/raw_sub-01_runs0102030405 \
 		--epochs-dir-resample data/processed/semantic_epochs/resample_sub-01_runs0102030405
 
+matrix-full5s:
+	. venv/bin/activate && python scripts/run_baseline_matrix.py \
+		--window-mode full5s \
+		--semantic-target image_text \
+		--text-embeddings data/processed/clip_embeddings/imagenet_text_embeddings.pt \
+		--model temporal_attn \
+		--runs 1 2 3 4 5 6 7 8 9 10 \
+		--val-runs 10 \
+		--epochs 50 \
+		--slug full5s_recovery
+
 # Sprint 3: simulate EPOC-14 low-channel conditions for all runs
 simulate:
 	. venv/bin/activate && \
