@@ -70,10 +70,12 @@ def parse_args() -> argparse.Namespace:
                    help="EEG window duration: crop (1.25s) or full5s (5s) or full5s_backaligned (5s)")
     p.add_argument("--add-event-marker", action="store_true",
                    help="Add event marker bump as an extra channel to EEG inputs")
-    p.add_argument("--semantic-target", choices=("image", "text", "image_text"), default="image",
-                   help="CLIP target: image, text (class/label), or both (image_text)")
+    p.add_argument("--semantic-target", choices=("image", "text", "label_text", "image_text", "caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core", "image_caption_core"), default="image",
+                   help="Whether to map to image embeddings, text embeddings, or a combination")
     p.add_argument("--text-embeddings", default=None,
-                   help="Path to .pt text embedding table")
+                   help="Path to .pt containing text embeddings (required if semantic-target uses text)")
+    p.add_argument("--image-semantic-embeddings", default=None,
+                   help="Path to .pt containing image semantic text embeddings")
     p.add_argument("--model", choices=("cnn", "temporal_attn"), default="cnn",
                    help="Encoder architecture: cnn (default) or temporal_attn")
     p.add_argument("--epochs", type=int, default=30)
@@ -253,6 +255,7 @@ def main() -> None:
             epochs_dir_resample=args.epochs_dir_resample,
             clip_embeddings_pt=args.clip_embeddings,
             text_embeddings_pt=args.text_embeddings,
+            image_semantic_embeddings_pt=args.image_semantic_embeddings,
             input_domain=args.input_domain,
             target_mode=args.target_mode,
             window_mode=args.window_mode,

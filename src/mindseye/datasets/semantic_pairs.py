@@ -15,7 +15,18 @@ from torch.utils.data import Dataset
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
 WindowMode = Literal["crop", "full5s", "full5s_backaligned"]
-SemanticTarget = Literal["image", "text", "image_text"]
+SemanticTarget = Literal[
+    "image",
+    "text",
+    "label_text",
+    "image_text",
+    "caption_short",
+    "caption_detailed",
+    "caption_composition",
+    "caption_attributes",
+    "caption_core",
+    "image_caption_core",
+]
 
 
 @dataclass(frozen=True)
@@ -38,6 +49,7 @@ class SemanticPairConfig:
     epochs_dir: str | Path
     clip_embeddings_pt: str | Path
     text_embeddings_pt: str | Path | None = None
+    image_semantic_embeddings_pt: str | Path | None = None
     normalize_eeg: bool = True
     preload_npz: bool = True
     target_mode: TargetMode = "real"
@@ -100,9 +112,9 @@ class ZunaClipPairDataset(Dataset):
 
         # Load text embeddings if needed
         self.class_to_text_embedding: dict[str, torch.Tensor] = {}
-        if config.semantic_target in ("text", "image_text"):
+        if config.semantic_target in ("text", "label_text", "image_text", "image_label_caption"):
             if config.text_embeddings_pt is None:
-                raise ValueError("text_embeddings_pt required for semantic_target='text' or 'image_text'")
+                raise ValueError(f"text_embeddings_pt required for semantic_target={config.semantic_target}")
             text_table = torch.load(config.text_embeddings_pt, map_location="cpu")
             self.class_to_text_embedding = text_table["class_to_embedding"]
             # Verify all metadata classes have text embeddings
@@ -111,6 +123,25 @@ class ZunaClipPairDataset(Dataset):
             missing_text = sorted(set(self.metadata["class"].unique()) - set(self.class_to_text_embedding.keys()))
             if missing_text:
                 raise ValueError(f"Missing text embeddings for {len(missing_text)} classes: {missing_text[:5]}")
+
+        self.image_id_to_semantic_text_embedding: dict[str, torch.Tensor] = {}
+        if config.semantic_target in ("caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core", "image_caption_core"):
+            if config.image_semantic_embeddings_pt is None:
+                raise ValueError("--image-semantic-embeddings data/processed/clip_embeddings/image_semantic_text_embeddings.pt required")
+            sem_table = torch.load(config.image_semantic_embeddings_pt, map_location="cpu")
+            
+            if config.semantic_target == "image_caption_core":
+                target_key = "image_id_to_caption_core"
+            else:
+                target_key = f"image_id_to_{config.semantic_target}"
+                
+            if target_key not in sem_table:
+                raise ValueError(f"Missing {target_key} in {config.image_semantic_embeddings_pt}")
+                
+            self.image_id_to_semantic_text_embedding = sem_table[target_key]
+            missing_sem = sorted(set(self.metadata["image_id_str"].unique()) - set(self.image_id_to_semantic_text_embedding.keys()))
+            if missing_sem:
+                raise ValueError(f"Missing caption embeddings for {len(missing_sem)} images")
 
         self._epoch_offsets = self._add_epoch_offsets(self.metadata)
         self._npz_cache: dict[str, np.ndarray] = {}
@@ -249,15 +280,25 @@ class ZunaClipPairDataset(Dataset):
         if self.config.semantic_target == "image":
             return img_emb
         
-        label = str(row["class"])
-        txt_emb = F.normalize(self.class_to_text_embedding[label], dim=-1)
-        
-        if self.config.semantic_target == "text":
-            return txt_emb
-        
-        # Combined image_text: normalize(normalize(image) + normalize(text))
-        combined = torch.nn.functional.normalize(img_emb + txt_emb, dim=-1)
-        return combined
+        label_emb = None
+        if self.config.semantic_target in ("text", "label_text", "image_text"):
+            label = str(row["class"])
+            label_emb = F.normalize(self.class_to_text_embedding[label], dim=-1)
+            
+        caption_emb = None
+        if self.config.semantic_target in ("caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core", "image_caption_core"):
+            caption_emb = F.normalize(self.image_id_to_semantic_text_embedding[img_id], dim=-1)
+            
+        if self.config.semantic_target in ("text", "label_text"):
+            return label_emb
+        elif self.config.semantic_target in ("caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core"):
+            return caption_emb
+        elif self.config.semantic_target == "image_text":
+            return torch.nn.functional.normalize(img_emb + label_emb, dim=-1)
+        elif self.config.semantic_target == "image_caption_core":
+            return torch.nn.functional.normalize(img_emb + caption_emb, dim=-1)
+            
+        return img_emb
 
     def __len__(self) -> int:
         return len(self.metadata)

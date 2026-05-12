@@ -102,7 +102,7 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 
 - ✅ **Sprint 1 complete** — ZUNA inference, timing audit, retrieval grid.
 - ❌ **Sprint 2 failed** — 1.25s crops did not beat controls.
-- 🚀 **Phase 3.5 active** — Full-window ZUNA semantic baseline (5s windows).
+- 🚀 **Phase 3.5 active** — Phase 3.5 produced the first weak positive result: back-aligned 5s ZUNA windows with event marker and text-only supervision avoided collapse and beat shuffled/random controls on Top-10, but did not beat controls consistently across Top-1, Top-5, or MRR. This is not a pass. Next step is replication across seeds/validation runs and replacement of label-template text with image-derived VLM caption targets.
 
 ---
 

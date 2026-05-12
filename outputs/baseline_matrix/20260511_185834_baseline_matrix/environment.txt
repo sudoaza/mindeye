@@ -1,0 +1,5 @@
+Hostname: ubuntu
+Python: 3.14.2 (main, Jan  2 2026, 14:27:39) [GCC 15.2.1 20251112]
+PyTorch: 2.11.0+cu130
+CUDA Available: False
+Command: scripts/run_baseline_matrix.py

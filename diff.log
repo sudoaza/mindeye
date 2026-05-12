@@ -1,0 +1,258 @@
+diff --git a/Makefile b/Makefile
+index cc38412..a3879d9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -50,6 +50,17 @@ matrix:
+ 		--epochs-dir-raw data/processed/semantic_epochs/raw_sub-01_runs0102030405 \
+ 		--epochs-dir-resample data/processed/semantic_epochs/resample_sub-01_runs0102030405
+ 
++matrix-full5s:
++	. venv/bin/activate && python scripts/run_baseline_matrix.py \
++		--window-mode full5s \
++		--semantic-target image_text \
++		--text-embeddings data/processed/clip_embeddings/imagenet_text_embeddings.pt \
++		--model temporal_attn \
++		--runs 1 2 3 4 5 6 7 8 9 10 \
++		--val-runs 10 \
++		--epochs 50 \
++		--slug full5s_recovery
++
+ # Sprint 3: simulate EPOC-14 low-channel conditions for all runs
+ simulate:
+ 	. venv/bin/activate && \
+diff --git a/docs/PLAN.md b/docs/PLAN.md
+index caecf04..6fd982f 100644
+--- a/docs/PLAN.md
++++ b/docs/PLAN.md
+@@ -98,14 +98,30 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
+ 
+ ---
+ 
+-## Concrete execution order
+-
+-1. **Sprint 1 — Reproducibility and audits (CURRENT)**
+-2. **Sprint 2 — Baseline matrix**
+-3. **Sprint 3 — Low-channel simulation**
+-4. **Sprint 4 — Better encoder**
+-5. **Sprint 5 — Text/caption semantic layer**
+-6. **Sprint 6 — Frozen diffusion prototype**
+-7. **Sprint 7 — Alljoined / ENIGMA comparison**
++## Current Status: Phase 3.5 (Recovery) 🚧
++
++- ✅ **Sprint 1 complete** — ZUNA inference, timing audit, retrieval grid.
++- ❌ **Sprint 2 failed** — 1.25s crops did not beat controls.
++- 🚀 **Phase 3.5 active** — Full-window ZUNA semantic baseline (5s windows).
++
++---
++
++## 🗺️ Roadmap
++
++### Phase 1 & 2: Baseline & Signal Validation (Complete)
++- ✅ Process continuous NOD data through ZUNA foundation.
++- ✅ Audit event timing and signal integrity.
++
++### Phase 3: Baseline Matrix (Failed/Retrying)
++- ❌ Sprint 2: 1.25s Crop Matrix (No signal found).
++- 🚀 **Phase 3.5: Full-window ZUNA Recovery** (Active)
++  - [ ] Generate 5s ZUNA windows for sub-01 runs 01–10.
++  - [ ] Implement `temporal_attn` encoder for [C, 1280] input.
++  - [ ] supervision: Image CLIP + Text CLIP (from class labels).
++  - [ ] Result: Beat shuffled/random controls with 5s windows.
++
++### Phase 4: Low-Channel Simulation (Next)
++- [ ] Sprint 3: EPOC-14 channel subset masking.
++- [ ] Validate retrieval robustness to channel loss.
+ 
+ *Do not add diffusion until semantic retrieval beats shuffled baselines.*
+diff --git a/src/mindseye/datasets/semantic_pairs.py b/src/mindseye/datasets/semantic_pairs.py
+index 2c1a0dc..b8f1be1 100644
+--- a/src/mindseye/datasets/semantic_pairs.py
++++ b/src/mindseye/datasets/semantic_pairs.py
+@@ -13,6 +13,8 @@ from torch.utils.data import Dataset
+ 
+ TargetMode = Literal["real", "shuffled", "random", "sameclass"]
+ InputDomain = Literal["zuna", "raw", "resample"]
++WindowMode = Literal["crop", "full5s"]
++SemanticTarget = Literal["image", "text", "image_text"]
+ 
+ 
+ @dataclass(frozen=True)
+@@ -34,10 +36,13 @@ class SemanticPairConfig:
+     metadata_csv: str | Path
+     epochs_dir: str | Path
+     clip_embeddings_pt: str | Path
++    text_embeddings_pt: str | Path | None = None
+     normalize_eeg: bool = True
+     preload_npz: bool = True
+     target_mode: TargetMode = "real"
+     input_domain: InputDomain = "zuna"
++    window_mode: WindowMode = "crop"
++    semantic_target: SemanticTarget = "image"
+     # Alternative epoch directories for raw / resample conditions
+     epochs_dir_raw: str | Path | None = None
+     epochs_dir_resample: str | Path | None = None
+@@ -88,9 +93,23 @@ class ZunaClipPairDataset(Dataset):
+         self.metadata = self.metadata[mask].reset_index(drop=True)
+         dropped = initial_n - len(self.metadata)
+         if dropped > 0:
+-            print(f"  [Dataset] Dropped {dropped} samples due to missing CLIP embeddings "
++            print(f"  [Dataset] Dropped {dropped} samples due to missing CLIP image embeddings "
+                   f"({len(self.metadata)} remaining)")
+ 
++        # Load text embeddings if needed
++        self.class_to_text_embedding: dict[str, torch.Tensor] = {}
++        if config.semantic_target in ("text", "image_text"):
++            if config.text_embeddings_pt is None:
++                raise ValueError("text_embeddings_pt required for semantic_target='text' or 'image_text'")
++            text_table = torch.load(config.text_embeddings_pt, map_location="cpu")
++            self.class_to_text_embedding = text_table["class_to_embedding"]
++            # Verify all metadata classes have text embeddings
++            if "class" not in self.metadata.columns:
++                 raise ValueError("Metadata missing 'class' column required for text targets")
++            missing_text = sorted(set(self.metadata["class"].unique()) - set(self.class_to_text_embedding.keys()))
++            if missing_text:
++                raise ValueError(f"Missing text embeddings for {len(missing_text)} classes: {missing_text[:5]}")
++
+         self._epoch_offsets = self._add_epoch_offsets(self.metadata)
+         self._npz_cache: dict[str, np.ndarray] = {}
+         if config.preload_npz:
+@@ -171,22 +190,32 @@ class ZunaClipPairDataset(Dataset):
+     # ------------------------------------------------------------------ Dataset API
+ 
+     def _get_clip(self, idx: int) -> torch.Tensor:
+-        """Return the CLIP target for sample *idx* based on target_mode."""
++        """Return the target embedding for sample *idx* based on target_mode and semantic_target."""
+         mode = self.config.target_mode
+-        if mode == "real":
+-            image_id = str(self.metadata.iloc[idx]["image_id"])
+-            return self.image_to_embedding[image_id]
+         if mode == "shuffled":
+-            shuffled_idx = self._target_perm[idx]
+-            image_id = str(self.metadata.iloc[shuffled_idx]["image_id"])
+-            return self.image_to_embedding[image_id]
+-        if mode == "random":
++            idx = self._target_perm[idx]
++        elif mode == "random":
+             return self._random_targets[idx]
+-        if mode == "sameclass":
+-            alt_idx = self._sameclass_targets[idx]
+-            image_id = str(self.metadata.iloc[alt_idx]["image_id"])
+-            return self.image_to_embedding[image_id]
+-        raise ValueError(f"Unknown target_mode: {mode!r}")
++        elif mode == "sameclass":
++            idx = self._sameclass_targets[idx]
++        
++        row = self.metadata.iloc[idx]
++        
++        img_id = str(row["image_id"])
++        img_emb = self.image_to_embedding[img_id]
++        
++        if self.config.semantic_target == "image":
++            return img_emb
++        
++        label = str(row["class"])
++        txt_emb = self.class_to_text_embedding[label]
++        
++        if self.config.semantic_target == "text":
++            return txt_emb
++        
++        # Combined image_text: normalize(image + text)
++        combined = torch.nn.functional.normalize(img_emb + txt_emb, dim=-1)
++        return combined
+ 
+     def __len__(self) -> int:
+         return len(self.metadata)
+diff --git a/src/mindseye/models/eeg_encoder.py b/src/mindseye/models/eeg_encoder.py
+index 05a3dc9..7435cf6 100644
+--- a/src/mindseye/models/eeg_encoder.py
++++ b/src/mindseye/models/eeg_encoder.py
+@@ -4,15 +4,12 @@ from __future__ import annotations
+ import torch
+ from torch import nn
+ import torch.nn.functional as F
++import math
+ 
+ 
+ class EEGClipEncoder(nn.Module):
+     """
+-    Small temporal-convolution EEG encoder.
+-
+-    Input shape is `[batch, channels, time]`; output is a CLIP-sized vector.
+-    This is intentionally modest so it can serve as a Phase 4 baseline before
+-    trying larger subject-aware or transformer architectures.
++    Standard temporal-convolution EEG encoder.
+     """
+ 
+     def __init__(
+@@ -58,6 +55,71 @@ class EEGClipEncoder(nn.Module):
+         return x
+ 
+ 
++class AttentionPooler(nn.Module):
++    def __init__(self, dim: int, heads: int = 8):
++        super().__init__()
++        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
++        self.query = nn.Parameter(torch.randn(1, 1, dim))
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        # x: [B, T, D]
++        b = x.shape[0]
++        q = self.query.expand(b, -1, -1)
++        out, _ = self.attn(q, x, x)
++        return out.squeeze(1)
++
++
++class TemporalAttnEncoder(nn.Module):
++    """
++    Lightweight Transformer-based encoder for longer EEG windows (e.g. 5s).
++    """
++
++    def __init__(
++        self,
++        *,
++        n_channels: int = 62,
++        embedding_dim: int = 512,
++        hidden_dim: int = 256,
++        n_layers: int = 4,
++        n_heads: int = 8,
++        dropout: float = 0.2,
++        normalize_output: bool = True,
++    ):
++        super().__init__()
++        self.normalize_output = normalize_output
++        self.stem = nn.Sequential(
++            nn.Conv1d(n_channels, 128, kernel_size=7, stride=4, padding=3),
++            nn.BatchNorm1d(128),
++            nn.GELU(),
++            nn.Conv1d(128, hidden_dim, kernel_size=5, stride=2, padding=2),
++            nn.BatchNorm1d(hidden_dim),
++            nn.GELU(),
++        )
++        
++        encoder_layer = nn.TransformerEncoderLayer(
++            d_model=hidden_dim,
++            nhead=n_heads,
++            dim_feedforward=hidden_dim * 4,
++            dropout=dropout,
++            activation="gelu",
++            batch_first=True,
++        )
++        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
++        self.pooler = AttentionPooler(hidden_dim, heads=n_heads)
++        self.head = nn.Linear(hidden_dim, embedding_dim)
++
++    def forward(self, eeg: torch.Tensor) -> torch.Tensor:
++        # eeg: [B, C, T]
++        x = self.stem(eeg)  # [B, D, T']
++        x = x.transpose(1, 2)  # [B, T', D]
++        x = self.transformer(x)
++        x = self.pooler(x)
++        x = self.head(x)
++        if self.normalize_output:
++            x = F.normalize(x, dim=-1)
++        return x
++
++
+ def cosine_mse_loss(pred: torch.Tensor, target: torch.Tensor, *, mse_weight: float = 0.25) -> torch.Tensor:
+     """Blend cosine embedding loss with a small MSE term for stable baseline training."""
+     pred = F.normalize(pred, dim=-1)

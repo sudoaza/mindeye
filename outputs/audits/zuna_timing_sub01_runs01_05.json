@@ -1,0 +1,42 @@
+[
+  {
+    "subject": "sub-01",
+    "run": 1,
+    "status": "fail",
+    "failures": [
+      "fname does not exist: \"/home/user/code/mindeye/data/processed/zuna_real_sub01_runs01_05/sub-01_run-01_zuna.fif\""
+    ]
+  },
+  {
+    "subject": "sub-01",
+    "run": 2,
+    "status": "fail",
+    "failures": [
+      "fname does not exist: \"/home/user/code/mindeye/data/processed/zuna_real_sub01_runs01_05/sub-01_run-02_zuna.fif\""
+    ]
+  },
+  {
+    "subject": "sub-01",
+    "run": 3,
+    "status": "fail",
+    "failures": [
+      "fname does not exist: \"/home/user/code/mindeye/data/processed/zuna_real_sub01_runs01_05/sub-01_run-03_zuna.fif\""
+    ]
+  },
+  {
+    "subject": "sub-01",
+    "run": 4,
+    "status": "fail",
+    "failures": [
+      "fname does not exist: \"/home/user/code/mindeye/data/processed/zuna_real_sub01_runs01_05/sub-01_run-04_zuna.fif\""
+    ]
+  },
+  {
+    "subject": "sub-01",
+    "run": 5,
+    "status": "fail",
+    "failures": [
+      "fname does not exist: \"/home/user/code/mindeye/data/processed/zuna_real_sub01_runs01_05/sub-01_run-05_zuna.fif\""
+    ]
+  }
+]

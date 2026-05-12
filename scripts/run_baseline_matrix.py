@@ -89,11 +89,14 @@ def run_condition(
         "--window-mode",     args.window_mode,
         "--semantic-target", args.semantic_target,
         "--model",           args.model,
+        "--seed",            str(getattr(args, "seed", 13)),
     ]
     if getattr(args, "add_event_marker", False):
         cmd.append("--add-event-marker")
     if args.text_embeddings:
-        cmd += ["--text-embeddings", args.text_embeddings]
+        cmd.extend(["--text-embeddings", str(args.text_embeddings)])
+    if getattr(args, "image_semantic_embeddings", None):
+        cmd.extend(["--image-semantic-embeddings", str(args.image_semantic_embeddings)])
     # Forward optional raw/resample dirs if provided
     if args.epochs_dir_raw:
         cmd += ["--epochs-dir-raw", args.epochs_dir_raw]
@@ -101,9 +104,7 @@ def run_condition(
         cmd += ["--epochs-dir-resample", args.epochs_dir_resample]
 
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
-    result = subprocess.run(cmd, env=env, check=False, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    print(result.stdout)
+    result = subprocess.run(cmd, env=env, check=False)
 
     if result.returncode != 0:
         print(f"[WARN] Condition {name} exited with code {result.returncode}")
@@ -179,10 +180,15 @@ def main() -> None:
                    help="Parent directory for all matrix runs")
     p.add_argument("--slug",           default=None)
     p.add_argument("--device",         default=DEFAULTS["device"])
+    p.add_argument("--seed",           type=int, default=13)
     p.add_argument("--window-mode",     choices=("crop", "full5s", "full5s_backaligned"), default="crop")
     p.add_argument("--add-event-marker", action="store_true")
-    p.add_argument("--semantic-target", choices=("image", "text", "image_text"), default="image")
-    p.add_argument("--text-embeddings", default=None)
+    p.add_argument("--semantic-target", choices=("image", "text", "label_text", "image_text", "caption_short", "caption_detailed", "caption_composition", "caption_attributes", "caption_core", "image_caption_core"), default="image",
+                   help="Whether to map to image embeddings, text embeddings, or a combination")
+    p.add_argument("--text-embeddings", default=None,
+                   help="Path to .pt containing text embeddings (required if semantic-target uses text)")
+    p.add_argument("--image-semantic-embeddings", default=None,
+                   help="Path to .pt containing image semantic text embeddings")
     p.add_argument("--model",           choices=("cnn", "temporal_attn"), default="cnn")
     p.add_argument("--conditions",     nargs="*", default=None,
                    help="Subset of condition names to run (default: all 6)")
