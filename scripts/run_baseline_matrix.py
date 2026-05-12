@@ -42,7 +42,7 @@ CONDITIONS = [
 DEFAULTS = {
     "metadata": "data/processed/semantic_epochs/zuna_real_sub01_runs01_05/all_runs_metadata.csv",
     "epochs_dir": "data/processed/semantic_epochs/zuna_real_sub01_runs01_05",
-    "clip_embeddings": "data/processed/clip_embeddings/sub01_runs01_05_clip_vit_base_patch32.pt",
+    "common_embeddings": "data/processed/clip_embeddings/common_embeddings.pt",
     "val_runs": "5",
     "epochs": "30",
     "batch_size": "64",
@@ -75,7 +75,6 @@ def run_condition(
         str(Path(__file__).parent / "train_eeg_clip.py"),
         "--metadata",       metadata_path,
         "--epochs-dir",     args.epochs_dir,
-        "--clip-embeddings",args.clip_embeddings,
         "--input-domain",   input_domain,
         "--target-mode",    target_mode,
         "--split-mode",     split,
@@ -83,7 +82,6 @@ def run_condition(
         "--epochs",         str(args.epochs),
         "--batch-size",     str(args.batch_size),
         "--loss",           "contrastive",
-        "--center-clip",
         "--output-dir",     str(matrix_dir),
         "--slug",           f"{name}_{args.slug}" if args.slug else name,
         "--window-mode",     args.window_mode,
@@ -106,7 +104,7 @@ def run_condition(
 
     if result.returncode != 0:
         print(f"[WARN] Condition {name} exited with code {result.returncode}")
-        return {"condition": name, "status": "failed", "error": result.stdout[-500:]}
+        return {"condition": name, "status": "failed"}
 
     # Locate the newest metrics.json written to matrix_dir
     candidates = sorted(matrix_dir.glob(f"*{name}*/metrics.json"), key=lambda p: p.stat().st_mtime)
@@ -170,7 +168,8 @@ def main() -> None:
                    help="NPZ dir for raw (un-denoised) crops.  Required for raw_runheldout.")
     p.add_argument("--epochs-dir-resample", default=None,
                    help="NPZ dir for resample-only crops.  Required for resample_runheldout.")
-    p.add_argument("--clip-embeddings",default=DEFAULTS["clip_embeddings"])
+    p.add_argument("--common-embeddings", default=DEFAULTS["common_embeddings"],
+                   help="Path to .pt containing fused common embeddings")
     p.add_argument("--val-runs",       default=DEFAULTS["val_runs"])
     p.add_argument("--epochs",         type=int, default=int(DEFAULTS["epochs"]))
     p.add_argument("--batch-size",     type=int, default=int(DEFAULTS["batch_size"]))
@@ -183,8 +182,6 @@ def main() -> None:
     p.add_argument("--add-event-marker", action="store_true")
     p.add_argument("--target-space", choices=("common", "semantic", "image"), default="common",
                    help="Which embedding space to optimize the loss against")
-    p.add_argument("--common-embeddings", default=None,
-                   help="Path to .pt containing fused common embeddings")
     p.add_argument("--model",           choices=("cnn", "temporal_attn"), default="cnn")
     p.add_argument("--conditions",     nargs="*", default=None,
                    help="Subset of condition names to run (default: all 6)")
