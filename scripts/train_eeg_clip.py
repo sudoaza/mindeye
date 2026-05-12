@@ -66,8 +66,10 @@ def parse_args() -> argparse.Namespace:
                    help="Base output directory. Defaults to outputs/runs/")
     p.add_argument("--slug", default=None,
                    help="Optional slug appended to the run directory name")
-    p.add_argument("--window-mode", choices=("crop", "full5s"), default="crop",
-                   help="EEG window duration: crop (1.25s) or full5s (5s)")
+    p.add_argument("--window-mode", choices=("crop", "full5s", "full5s_backaligned"), default="crop",
+                   help="EEG window duration: crop (1.25s) or full5s (5s) or full5s_backaligned (5s)")
+    p.add_argument("--add-event-marker", action="store_true",
+                   help="Add event marker bump as an extra channel to EEG inputs")
     p.add_argument("--semantic-target", choices=("image", "text", "image_text"), default="image",
                    help="CLIP target: image, text (class/label), or both (image_text)")
     p.add_argument("--text-embeddings", default=None,
@@ -255,6 +257,7 @@ def main() -> None:
             target_mode=args.target_mode,
             window_mode=args.window_mode,
             semantic_target=args.semantic_target,
+            add_event_marker=args.add_event_marker,
         )
     )
 
@@ -273,22 +276,33 @@ def main() -> None:
     target_center = _target_center(dataset, train_idx, device) if args.center_clip else None
 
     n_channels, n_times = dataset.eeg_shape
-    print(f"\n[Dataset] eeg shape: [{n_channels}, {n_times}]")
-    print(f"[Window] mode: {args.window_mode}")
-    print(f"[Target] semantic_target: {args.semantic_target}")
-    print(f"[Target] target_mode: {args.target_mode}")
+    print(f"\n[Dataset] window_mode: {args.window_mode}")
+    print(f"[Dataset] semantic_target: {args.semantic_target}")
+    print(f"[Dataset] add_event_marker: {args.add_event_marker}")
+    print(f"[Dataset] EEG shape: [{n_channels}, {n_times}]")
+    print(f"[Dataset] n_samples: {len(dataset)}")
+    print(f"[Dataset] n_channels after marker: {n_channels}")
 
     if args.model == "temporal_attn":
         from mindseye.models.eeg_encoder import TemporalAttnEncoder
         model = TemporalAttnEncoder(
             n_channels=n_channels, embedding_dim=dataset.embedding_dim
         ).to(device)
-        print(f"[Model] architecture: temporal_attn (n_channels={n_channels})")
+        model.n_channels = n_channels
+        print(f"[Model] model: temporal_attn")
+        print(f"[Model] n_channels: {n_channels}")
+        print(f"[Model] input samples: {n_times}")
     else:
         model = EEGClipEncoder(
             n_channels=n_channels, n_times=n_times, embedding_dim=dataset.embedding_dim
         ).to(device)
-        print(f"[Model] architecture: cnn (n_channels={n_channels})")
+        model.n_channels = n_channels
+        print(f"[Model] model: cnn")
+        print(f"[Model] n_channels: {n_channels}")
+        print(f"[Model] input samples: {n_times}")
+        
+    if getattr(model, "n_channels", n_channels) != n_channels:
+        raise ValueError(f"model.n_channels != dataset_eeg_channels")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 

@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
-WindowMode = Literal["crop", "full5s"]
+WindowMode = Literal["crop", "full5s", "full5s_backaligned"]
 SemanticTarget = Literal["image", "text", "image_text"]
 
 
@@ -48,6 +48,7 @@ class SemanticPairConfig:
     epochs_dir_raw: str | Path | None = None
     epochs_dir_resample: str | Path | None = None
     shuffle_seed: int = 42
+    add_event_marker: bool = False
 
 
 class ZunaClipPairDataset(Dataset):
@@ -120,6 +121,14 @@ class ZunaClipPairDataset(Dataset):
         first = self._get_eeg(0)
         self.eeg_shape = tuple(int(x) for x in first.shape)
 
+        if config.window_mode == "full5s_backaligned":
+            if self.eeg_shape[-1] != 1280:
+                raise ValueError(f"full5s_backaligned requires sample length 1280, got {self.eeg_shape[-1]}")
+            if "event_offset_s" not in self.metadata.columns:
+                raise ValueError("event_offset_s missing from metadata")
+            if "anchor_sample" not in self.metadata.columns:
+                raise ValueError("anchor_sample missing from metadata")
+
         # Build shuffled / random target index once at init time
         n = len(self.metadata)
         rng = np.random.default_rng(config.shuffle_seed)
@@ -181,10 +190,21 @@ class ZunaClipPairDataset(Dataset):
         npz_file = str(row["npz_file"])
         epoch_idx = self._epoch_offsets[idx]
         eeg = torch.from_numpy(self._get_npz(npz_file)[epoch_idx]).float()
+        
         if self.config.normalize_eeg:
             mean = eeg.mean(dim=-1, keepdim=True)
             std = eeg.std(dim=-1, keepdim=True).clamp_min(1e-6)
             eeg = (eeg - mean) / std
+            
+        if getattr(self.config, "add_event_marker", False):
+            if "anchor_sample" not in row:
+                raise ValueError("anchor_sample missing from metadata")
+            anchor = float(row["anchor_sample"])
+            t = torch.arange(eeg.shape[1], dtype=torch.float32)
+            sigma_samples = 16.0
+            marker = torch.exp(-0.5 * ((t - anchor) / sigma_samples) ** 2).unsqueeze(0)
+            eeg = torch.cat([eeg, marker], dim=0)
+
         return eeg
 
     def _build_sameclass_index(self, rng: np.random.Generator) -> None:

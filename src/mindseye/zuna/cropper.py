@@ -39,6 +39,8 @@ class CropConfig:
     event_name: str = "stim_on"
     mode: CropMode = "zuna"
     resample_sfreq: float = 256.0   # target sfreq for "resample" mode
+    window_mode: str = "crop"
+    has_event_marker: bool = False
 
 
 @dataclass(frozen=True)
@@ -165,27 +167,52 @@ def crop_run_to_epochs(
 
     onset_seconds = stim_onsets_from_raw(raw_fif_path, config.event_name)
     event_offset_s = abs(config.tmin)
-    print(f"  [Cropper] Anchoring {config.event_name} at +{event_offset_s:.2f}s into {config.tmax - config.tmin:.2f}s window")
+    anchor_sample = int(round(event_offset_s * source_sfreq))
     
     metadata = events_for_run(events_df, session=session, run=run)
     n = min(len(onset_seconds), len(metadata))
     onset_seconds = onset_seconds[:n]
     
-    # Count other stimuli in window for diagnostic logging
+    previous_counts = []
+    future_counts = []
     other_counts = []
+    
     for onset in onset_seconds:
         window_start = onset + config.tmin
         window_end = onset + config.tmax
-        # count onsets in (window_start, window_end) excluding the anchor itself
-        others = ((onset_seconds > window_start) & (onset_seconds < window_end)).sum() - 1
-        other_counts.append(max(0, others))
+        # previous: onset in [tmin, 0)
+        prev = ((onset_seconds >= window_start) & (onset_seconds < onset)).sum()
+        # future: onset in (0, tmax]
+        fut = ((onset_seconds > onset) & (onset_seconds <= window_end)).sum()
+        
+        previous_counts.append(prev)
+        future_counts.append(fut)
+        other_counts.append(prev + fut)
     
-    avg_others = np.mean(other_counts)
-    print(f"  [Cropper] Label noise diagnostic: avg {avg_others:.2f} other stimuli in window")
+    avg_prev = np.mean(previous_counts) if previous_counts else 0.0
+    avg_fut = np.mean(future_counts) if future_counts else 0.0
+    avg_others = np.mean(other_counts) if other_counts else 0.0
+    
+    print(f"  [Cropper] Window mode: {config.window_mode}")
+    print(f"  [Cropper] Window: {config.tmin:.1f}s to +{config.tmax:.1f}s")
+    print(f"  [Cropper] Event offset: {event_offset_s:.1f}s / sample {anchor_sample}")
+    print(f"  [Cropper] Avg previous stimuli: {avg_prev:.2f}")
+    print(f"  [Cropper] Avg future stimuli: {avg_fut:.2f}")
+    print(f"  [Cropper] Avg total other stimuli: {avg_others:.2f}")
+    
     if avg_others > 1.0:
         print(f"  [WARN] High label noise! windows contain multiple stimuli on average.")
 
     metadata = metadata.iloc[:n].copy()
+    metadata.insert(0, "has_event_marker", config.has_event_marker)
+    metadata.insert(0, "window_mode", config.window_mode)
+    metadata.insert(0, "window_tmax", config.tmax)
+    metadata.insert(0, "window_tmin", config.tmin)
+    metadata.insert(0, "n_other_stimuli", other_counts)
+    metadata.insert(0, "n_future_stimuli", future_counts)
+    metadata.insert(0, "n_previous_stimuli", previous_counts)
+    metadata.insert(0, "anchor_sample", anchor_sample)
+    metadata.insert(0, "event_offset_s", event_offset_s)
     metadata.insert(0, "stim_onset_sec", onset_seconds)
     metadata.insert(0, "source_mode", config.mode)
 

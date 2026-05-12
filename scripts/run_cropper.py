@@ -53,7 +53,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tmin", type=float, default=-0.25)
     p.add_argument("--tmax", type=float, default=1.0)
     p.add_argument("--full5s", action="store_true",
-                   help="Shortcut for --tmin -1.0 --tmax 4.0 (5s window)")
+                   help="Shortcut for --tmin -1.0 --tmax 4.0 (5s window) - Deprecated/Noisy")
+    p.add_argument("--full5s-backaligned", action="store_true",
+                   help="Shortcut for --tmin -3.0 --tmax 2.0 (5s window)")
+    p.add_argument("--add-event-marker", action="store_true",
+                   help="If set, records has_event_marker=True in metadata")
     p.add_argument("--expected-sfreq", type=float, default=256.0)
     p.add_argument("--resample-sfreq", type=float, default=256.0)
     p.add_argument("--event-name", default="stim_on")
@@ -64,10 +68,18 @@ def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root)
 
-    if args.full5s:
+    if args.full5s_backaligned:
+        tmin, tmax = -3.0, 2.0
+        window_mode = "full5s_backaligned"
+        window_tag = "full5s_backaligned"
+    elif args.full5s:
         tmin, tmax = -1.0, 4.0
+        window_mode = "full5s"
+        window_tag = "full5s"
     else:
         tmin, tmax = args.tmin, args.tmax
+        window_mode = "crop"
+        window_tag = f"crop_{tmin}_{tmax}"
 
     config = CropConfig(
         tmin=tmin,
@@ -76,10 +88,12 @@ def main() -> None:
         resample_sfreq=args.resample_sfreq,
         event_name=args.event_name,
         mode=args.mode,
+        window_mode=window_mode,
+        has_event_marker=args.add_event_marker,
     )
 
-    window_tag = "full5s" if args.full5s else f"crop_{tmin}_{tmax}"
-    output_dir = Path(args.output_dir or f"data/processed/semantic_epochs/{args.mode}_{window_tag}_{args.subject}_runs01_05")
+    run_str = "".join(f"{r:02d}" for r in sorted(args.runs))
+    output_dir = Path(args.output_dir or f"data/processed/semantic_epochs/{args.mode}_{window_tag}_{args.subject}_runs{run_str}")
 
     source_dir = Path(args.zuna_dir) if args.mode == "zuna" else None
 

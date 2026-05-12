@@ -61,6 +61,19 @@ matrix-full5s:
 		--epochs 50 \
 		--slug full5s_recovery
 
+matrix-full5s-back:
+	. venv/bin/activate && python scripts/run_baseline_matrix.py \
+		--window-mode full5s_backaligned \
+		--add-event-marker \
+		--semantic-target image_text \
+		--text-embeddings data/processed/clip_embeddings/imagenet_text_embeddings.pt \
+		--model temporal_attn \
+		--val-runs 8 \
+		--epochs 50 \
+		--batch-size 64 \
+		--device cuda \
+		--slug full5s_backaligned_recovery
+
 # Sprint 3: simulate EPOC-14 low-channel conditions for all runs
 simulate:
 	. venv/bin/activate && \

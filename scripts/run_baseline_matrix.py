@@ -29,9 +29,9 @@ CONDITIONS = [
     # name               input_domain   target_mode  split
     ("raw_runheldout",         "raw",     "real",      "run"),
     ("resample_runheldout",    "resample","real",      "run"),
-    ("zuna_runheldout",        "zuna",    "real",      "run"),
-    ("zuna_shuffled_labels",   "zuna",    "shuffled",  "run"),
-    ("zuna_random_targets",    "zuna",    "random",    "run"),
+    ("zuna_real",              "zuna",    "real",      "run"),
+    ("zuna_shuffled",          "zuna",    "shuffled",  "run"),
+    ("zuna_random",            "zuna",    "random",    "run"),
     ("zuna_sameclass",         "zuna",    "sameclass", "run"),
 ]
 
@@ -90,6 +90,8 @@ def run_condition(
         "--semantic-target", args.semantic_target,
         "--model",           args.model,
     ]
+    if getattr(args, "add_event_marker", False):
+        cmd.append("--add-event-marker")
     if args.text_embeddings:
         cmd += ["--text-embeddings", args.text_embeddings]
     # Forward optional raw/resample dirs if provided
@@ -125,21 +127,21 @@ def gate_check(df: pd.DataFrame) -> None:
     print("  SPRINT 2 GATE CHECK")
     print("=" * 60)
 
-    zuna = df[df["condition"] == "zuna_runheldout"]
+    zuna = df[df["condition"] == "zuna_real"]
     if zuna.empty or "top10" not in zuna.columns:
-        print("[SKIP] zuna_runheldout metrics not found in results.")
+        print("[SKIP] zuna_real metrics not found in results.")
         return
 
     zuna_top10 = float(zuna["top10"].iloc[0])
     zuna_mrr   = float(zuna["mrr"].iloc[0])
     zuna_cs    = float(zuna["collapse_score"].iloc[0])
 
-    controls = [c for c in df["condition"].tolist() if c != "zuna_runheldout"]
+    controls = [c for c in df["condition"].tolist() if c != "zuna_real"]
     all_passed = True
     for ctrl in controls:
         row = df[df["condition"] == ctrl]
         if row.empty or pd.isna(row.get("top10", pd.Series([np.nan])).iloc[0]):
-            print(f"  ❌  zuna_runheldout vs {ctrl}: {ctrl} missing metrics")
+            print(f"  ❌  zuna_real vs {ctrl}: {ctrl} missing metrics")
             all_passed = False
             continue
             
@@ -148,7 +150,7 @@ def gate_check(df: pd.DataFrame) -> None:
         passes = zuna_top10 > ctrl_top10 and zuna_mrr > ctrl_mrr
         symbol = "✅" if passes else "❌"
         all_passed = all_passed and passes
-        print(f"  {symbol}  zuna_runheldout vs {ctrl}: "
+        print(f"  {symbol}  zuna_real vs {ctrl}: "
               f"top10 {zuna_top10:.3f} vs {ctrl_top10:.3f}, "
               f"MRR {zuna_mrr:.3f} vs {ctrl_mrr:.3f}")
 
@@ -177,7 +179,8 @@ def main() -> None:
                    help="Parent directory for all matrix runs")
     p.add_argument("--slug",           default=None)
     p.add_argument("--device",         default=DEFAULTS["device"])
-    p.add_argument("--window-mode",     choices=("crop", "full5s"), default="crop")
+    p.add_argument("--window-mode",     choices=("crop", "full5s", "full5s_backaligned"), default="crop")
+    p.add_argument("--add-event-marker", action="store_true")
     p.add_argument("--semantic-target", choices=("image", "text", "image_text"), default="image")
     p.add_argument("--text-embeddings", default=None)
     p.add_argument("--model",           choices=("cnn", "temporal_attn"), default="cnn")
