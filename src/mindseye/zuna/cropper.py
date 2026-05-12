@@ -164,6 +164,9 @@ def crop_run_to_epochs(
     source_sfreq = float(source_raw.info["sfreq"])
 
     onset_seconds = stim_onsets_from_raw(raw_fif_path, config.event_name)
+    event_offset_s = abs(config.tmin)
+    print(f"  [Cropper] Anchoring {config.event_name} at +{event_offset_s:.2f}s into {config.tmax - config.tmin:.2f}s window")
+    
     metadata = events_for_run(events_df, session=session, run=run)
     n = min(len(onset_seconds), len(metadata))
     onset_seconds = onset_seconds[:n]

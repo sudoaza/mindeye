@@ -4,15 +4,12 @@ from __future__ import annotations
 import torch
 from torch import nn
 import torch.nn.functional as F
+import math
 
 
 class EEGClipEncoder(nn.Module):
     """
-    Small temporal-convolution EEG encoder.
-
-    Input shape is `[batch, channels, time]`; output is a CLIP-sized vector.
-    This is intentionally modest so it can serve as a Phase 4 baseline before
-    trying larger subject-aware or transformer architectures.
+    Standard temporal-convolution EEG encoder.
     """
 
     def __init__(
@@ -52,6 +49,81 @@ class EEGClipEncoder(nn.Module):
 
     def forward(self, eeg: torch.Tensor) -> torch.Tensor:
         x = self.net(eeg)
+        x = self.head(x)
+        if self.normalize_output:
+            x = F.normalize(x, dim=-1)
+        return x
+
+
+class AttentionPooler(nn.Module):
+    def __init__(self, dim: int, heads: int = 8):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.query = nn.Parameter(torch.randn(1, 1, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D]
+        b = x.shape[0]
+        q = self.query.expand(b, -1, -1)
+        out, _ = self.attn(q, x, x)
+        return out.squeeze(1)
+
+
+class TemporalAttnEncoder(nn.Module):
+    """
+    Lightweight Transformer-based encoder for longer EEG windows (e.g. 5s).
+    """
+
+    def __init__(
+        self,
+        *,
+        n_channels: int = 62,
+        embedding_dim: int = 512,
+        hidden_dim: int = 256,
+        n_layers: int = 4,
+        n_heads: int = 8,
+        dropout: float = 0.2,
+        normalize_output: bool = True,
+    ):
+        super().__init__()
+        self.normalize_output = normalize_output
+        self.stem = nn.Sequential(
+            nn.Conv1d(n_channels, 128, kernel_size=7, stride=4, padding=3),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Conv1d(128, hidden_dim, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+        )
+        
+        self.max_tokens = 256
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_tokens, hidden_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.pooler = AttentionPooler(hidden_dim, heads=n_heads)
+        self.head = nn.Linear(hidden_dim, embedding_dim)
+
+    def forward(self, eeg: torch.Tensor) -> torch.Tensor:
+        # eeg: [B, C, T]
+        x = self.stem(eeg)  # [B, D, T']
+        x = x.transpose(1, 2)  # [B, T', D]
+        
+        t = x.shape[1]
+        if t > self.max_tokens:
+            raise ValueError(f"Token length {t} exceeds max_tokens={self.max_tokens}")
+        x = x + self.pos_embed[:, :t, :]
+
+        x = self.transformer(x)
+        x = self.pooler(x)
         x = self.head(x)
         if self.normalize_output:
             x = F.normalize(x, dim=-1)

@@ -13,6 +13,8 @@ from torch.utils.data import Dataset
 
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
+WindowMode = Literal["crop", "full5s"]
+SemanticTarget = Literal["image", "text", "image_text"]
 
 
 @dataclass(frozen=True)
@@ -34,10 +36,13 @@ class SemanticPairConfig:
     metadata_csv: str | Path
     epochs_dir: str | Path
     clip_embeddings_pt: str | Path
+    text_embeddings_pt: str | Path | None = None
     normalize_eeg: bool = True
     preload_npz: bool = True
     target_mode: TargetMode = "real"
     input_domain: InputDomain = "zuna"
+    window_mode: WindowMode = "crop"
+    semantic_target: SemanticTarget = "image"
     # Alternative epoch directories for raw / resample conditions
     epochs_dir_raw: str | Path | None = None
     epochs_dir_resample: str | Path | None = None
@@ -88,8 +93,22 @@ class ZunaClipPairDataset(Dataset):
         self.metadata = self.metadata[mask].reset_index(drop=True)
         dropped = initial_n - len(self.metadata)
         if dropped > 0:
-            print(f"  [Dataset] Dropped {dropped} samples due to missing CLIP embeddings "
+            print(f"  [Dataset] Dropped {dropped} samples due to missing CLIP image embeddings "
                   f"({len(self.metadata)} remaining)")
+
+        # Load text embeddings if needed
+        self.class_to_text_embedding: dict[str, torch.Tensor] = {}
+        if config.semantic_target in ("text", "image_text"):
+            if config.text_embeddings_pt is None:
+                raise ValueError("text_embeddings_pt required for semantic_target='text' or 'image_text'")
+            text_table = torch.load(config.text_embeddings_pt, map_location="cpu")
+            self.class_to_text_embedding = text_table["class_to_embedding"]
+            # Verify all metadata classes have text embeddings
+            if "class" not in self.metadata.columns:
+                 raise ValueError("Metadata missing 'class' column required for text targets")
+            missing_text = sorted(set(self.metadata["class"].unique()) - set(self.class_to_text_embedding.keys()))
+            if missing_text:
+                raise ValueError(f"Missing text embeddings for {len(missing_text)} classes: {missing_text[:5]}")
 
         self._epoch_offsets = self._add_epoch_offsets(self.metadata)
         self._npz_cache: dict[str, np.ndarray] = {}
@@ -114,6 +133,23 @@ class ZunaClipPairDataset(Dataset):
             ]
         elif config.target_mode == "sameclass":
             self._build_sameclass_index(rng)
+
+        # Log target alignment if using multi-modal targets
+        if config.semantic_target == "image_text":
+            self._log_target_alignment()
+
+    def _log_target_alignment(self) -> None:
+        """Log the cosine similarity between paired image and text targets."""
+        cosines = []
+        for idx in range(len(self.metadata)):
+            row = self.metadata.iloc[idx]
+            img_emb = F.normalize(self.image_to_embedding[str(row["image_id"])], dim=-1)
+            txt_emb = F.normalize(self.class_to_text_embedding[str(row["class"])], dim=-1)
+            cos = (img_emb * txt_emb).sum().item()
+            cosines.append(cos)
+        cosines = np.array(cosines)
+        print(f"  [Dataset] Target alignment (image <-> text): "
+              f"mean={cosines.mean():.3f}, std={cosines.std():.3f}")
 
     # ------------------------------------------------------------------ helpers
 
@@ -171,22 +207,32 @@ class ZunaClipPairDataset(Dataset):
     # ------------------------------------------------------------------ Dataset API
 
     def _get_clip(self, idx: int) -> torch.Tensor:
-        """Return the CLIP target for sample *idx* based on target_mode."""
+        """Return the target embedding for sample *idx* based on target_mode and semantic_target."""
         mode = self.config.target_mode
-        if mode == "real":
-            image_id = str(self.metadata.iloc[idx]["image_id"])
-            return self.image_to_embedding[image_id]
         if mode == "shuffled":
-            shuffled_idx = self._target_perm[idx]
-            image_id = str(self.metadata.iloc[shuffled_idx]["image_id"])
-            return self.image_to_embedding[image_id]
-        if mode == "random":
+            idx = self._target_perm[idx]
+        elif mode == "random":
             return self._random_targets[idx]
-        if mode == "sameclass":
-            alt_idx = self._sameclass_targets[idx]
-            image_id = str(self.metadata.iloc[alt_idx]["image_id"])
-            return self.image_to_embedding[image_id]
-        raise ValueError(f"Unknown target_mode: {mode!r}")
+        elif mode == "sameclass":
+            idx = self._sameclass_targets[idx]
+        
+        row = self.metadata.iloc[idx]
+        
+        img_id = str(row["image_id"])
+        img_emb = F.normalize(self.image_to_embedding[img_id], dim=-1)
+        
+        if self.config.semantic_target == "image":
+            return img_emb
+        
+        label = str(row["class"])
+        txt_emb = F.normalize(self.class_to_text_embedding[label], dim=-1)
+        
+        if self.config.semantic_target == "text":
+            return txt_emb
+        
+        # Combined image_text: normalize(normalize(image) + normalize(text))
+        combined = torch.nn.functional.normalize(img_emb + txt_emb, dim=-1)
+        return combined
 
     def __len__(self) -> int:
         return len(self.metadata)
