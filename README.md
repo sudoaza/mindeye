@@ -1,58 +1,41 @@
 # MindEye — ZUNA-first EEG→Semantic→Image
 
-## Project thesis
-EEG-driven image generation using ZUNA as the signal normalization layer. The core objective is to map real continuous EEG, cleaned by ZUNA, into the visual latent space (CLIP) to reconstruct what a subject is seeing.
+## Project Thesis
+EEG-driven image generation using ZUNA as the signal normalization layer. The core objective is to map real continuous EEG, cleaned by ZUNA, into the multimodal latent space (`z_common`) to reconstruct what a subject is seeing.
 
-## Current status
-**MindEye v0.1-dev**: We are currently in the baseline generation and testing phase. We have established the pipeline for downloading NOD-EEG, processing via ZUNA, extracting semantic crops, and generating ground-truth CLIP targets. We are strictly requiring that our ZUNA-cleaned EEG crops retrieve the correct visual/semantic targets above shuffled controls before introducing diffusion.
+## Current Status: Phase 3 (Baseline Matrix & Multimodal Fusion) 🚧
+**MindEye v0.2-dev**: We are currently in the baseline generation and testing phase. We have established the pipeline for downloading NOD-EEG, processing via ZUNA, extracting back-aligned semantic epochs, and fusing CLIP image/text embeddings into a common target space. We strictly require that our ZUNA-cleaned EEG epochs retrieve the correct visual/semantic targets above shuffled controls before introducing frozen diffusion.
 
-*Note: The EEG-to-image system is NOT complete. We are currently building the ZUNA-aligned EEG→CLIP retrieval scaffold.*
+*Note: The EEG-to-image system is NOT complete. We are currently hardening the ZUNA-aligned EEG→Common Space retrieval scaffold.*
+
+## Project Structure
+* `configs/`: Configuration files for datasets, ZUNA pipeline, and training.
+* `data/`: Local storage for `raw/` NOD-EEG data and `processed/` features, crops, and embeddings. (Not tracked in git)
+* `docs/`: Project documentation, including the comprehensive [`docs/PLAN.md`](docs/PLAN.md) detailing the phased roadmap.
+* `outputs/`: Timestamped tracking for all baseline matrix runs, training logs, and checkpoints.
+* `scripts/`: Modular orchestration scripts. See [`scripts/README.md`](scripts/README.md) for the detailed canonical execution order.
+* `src/mindseye/`: Core library code (models, data loaders, evaluation, ZUNA offline wrappers).
 
 ## Installation
 ```bash
 make setup
+# OR manually:
+# python3 -m venv venv
+# source venv/bin/activate
+# pip install -r requirements.txt
 ```
 
-## Data requirements
-This pipeline uses the NOD-EEG dataset (ds005811) from OpenNeuro, which contains continuous visual EEG recordings.
+## Reproducing the Canonical Pipeline
+The end-to-end pipeline is fully automated via orchestration scripts. For detailed explanations of each step, refer to [`scripts/README.md`](scripts/README.md).
 
-## Reproduce the current NOD-ZUNA baseline
+To run the full recovery pipeline (Downloads → ZUNA Denoising → Cropping → Common Embeddings → Matrix Training):
 ```bash
-make nod
-make zuna
-make crop
-make clip
+make pipeline
+# OR manually:
+# bash scripts/execute_recovery_v2.sh
 ```
 
-## Run timing audit
-*Before any training runs, you must ensure event timing has not been corrupted.*
-```bash
-make audit
-```
-
-## Train EEG→CLIP baseline
-```bash
-make train
-```
-
-## Run baseline matrix
-(Pending Matrix Script Implementation)
-
-## Generate retrieval grids
-```bash
-make grid
-```
-
-## Planned architecture
-- **NOD-EEG continuous .fif**
-- **ZUNA** 5s denoise/reconstruct @ 256Hz
-- **Event-aligned crop** 1.25s around stimulus
-- **EEG→CLIP semantic encoder** mapping EEG latent space to CLIP embeddings
-- **Frozen diffusion img2img loop**
-
-## Known limitations
-- Diffusion is not yet integrated.
-- Only testing on `sub-01` currently.
-
-## Paper/model comparison
-This project draws inspiration from **ZUNA** (EEG foundation model) and **ENIGMA** (EEG-to-Image decoding). MindEye's focus is on establishing strict timing-aligned continuous processing pipelines before evaluating performance against these benchmarks.
+## Methodology & Non-Negotiable Principles
+1. **ZUNA-First**: All models are trained on continuous EEG data that has passed through ZUNA.
+2. **Strict Controls**: We never evaluate "absolute" performance. Every run includes strict baseline controls (`zuna_shuffled`, `zuna_random`) to guard against dimensional collapse and dataset biases.
+3. **No Premature Diffusion**: Diffusion image generation is locked until the semantic retrieval branch consistently beats shuffled/random baselines.
