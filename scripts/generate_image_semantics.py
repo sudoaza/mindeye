@@ -14,7 +14,7 @@ def parse_args():
     p.add_argument("--metadata", required=True)
     p.add_argument("--image-root", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
+    p.add_argument("--model", default="Qwen/Qwen2-VL-7B-Instruct")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--device", default="cuda")
     return p.parse_args()
