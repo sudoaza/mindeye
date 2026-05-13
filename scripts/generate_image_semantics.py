@@ -11,10 +11,9 @@ from tqdm import tqdm
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--metadata-csv", required=True)
+    p.add_argument("--metadata", required=True)
     p.add_argument("--image-root", required=True)
-    p.add_argument("--out-jsonl", required=True)
-    p.add_argument("--out-parquet", required=True)
+    p.add_argument("--output", required=True)
     p.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--device", default="cuda")
@@ -48,7 +47,7 @@ def extract_json(text: str) -> dict:
 def main():
     args = parse_args()
     
-    df = pd.read_csv(args.metadata_csv)
+    df = pd.read_csv(args.metadata)
     
     unique_images = df[["image_id", "class"]].drop_duplicates().reset_index(drop=True)
     if args.limit:
@@ -66,26 +65,45 @@ def main():
         device_map=args.device,
     )
     
-    prompt_text = """You are generating visual-semantic training targets for an EEG-to-image decoding model.
+    prompt_text = """You are generating structured visual-semantic labels for an EEG-to-image decoding model.
 
-Please analyze the image and answer the following 15 attributes. Return valid JSON only with exactly these keys. For binary/categorical choices, pick the most accurate option.
+Describe only visible content. Return JSON only. Use "unclear" when uncertain.
 
 {
-  "is_alive": "alive | not alive",
-  "category": "human | animal | object | scene",
-  "face_present": "face present | absent",
-  "object_count": "one main object | many objects",
-  "setting": "indoor | outdoor",
-  "dominant_colors": ["string"],
-  "horizontal_position": "left | center | right",
-  "vertical_position": "top | middle | bottom",
-  "movement": "motion | static",
-  "framing": "close-up | wide scene",
-  "shape_type": "geometric | organic",
-  "origin": "natural | man-made",
-  "tone_or_theme": "string",
-  "action_category": "string",
-  "object_category_family": "string"
+  "is_animate": "true | false | unclear",
+  "is_living": "true | false | unclear",
+  "human_visible": "true | false | unclear",
+  "face_visible": "true | false | unclear",
+  "animal_visible": "true | false | unclear",
+  "body_visible": "true | false | unclear",
+  "real_world_size": "tiny | small | medium | large | huge | unclear",
+  "scene_dominance": "isolated_object | object_with_background | full_scene | unclear",
+  "indoor_outdoor": "indoor | outdoor | mixed | unclear",
+  "natural_artificial": "natural | artificial | mixed | unclear",
+  "dominant_colors": ["red", "orange", "yellow", "green", "blue", "purple", "pink", "brown", "black", "white", "gray"],
+  "main_subject_position_x": "left | center | right | full_frame | unclear",
+  "main_subject_position_y": "top | middle | bottom | full_frame | unclear",
+  "subject_scale": "close_up | medium_shot | wide_shot | unclear",
+  "multiple_objects": "true | false | unclear",
+  "background_type": "plain | natural | urban | indoor_room | water | sky | vegetation | mixed | unclear",
+  "soft_texture": "true | false | unclear",
+  "hard_surface": "true | false | unclear",
+  "spiky_or_pointed": "true | false | unclear",
+  "round_or_curved": "true | false | unclear",
+  "angular_or_geometric": "true | false | unclear",
+  "furry": "true | false | unclear",
+  "smooth": "true | false | unclear",
+  "rough": "true | false | unclear",
+  "glossy": "true | false | unclear",
+  "metallic": "true | false | unclear",
+  "manipulable": "true | false | unclear",
+  "tool_like": "true | false | unclear",
+  "vehicle_like": "true | false | unclear",
+  "food_like": "true | false | unclear",
+  "calm": "true | false | unclear",
+  "threatening": "true | false | unclear",
+  "short_semantic_text": "one concise sentence summarizing the visible semantic content",
+  "structured_embedding_text": "compact text listing the most important labels for CLIP embedding"
 }
 
 Rules:
@@ -96,10 +114,9 @@ Rules:
 - Avoid abstract interpretation unless directly visible.
 - If the image is unclear, say "unclear" in relevant fields."""
 
-    Path(args.out_jsonl).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out_parquet).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     
-    out_f = open(args.out_jsonl, "w")
+    out_f = open(args.output, "w")
     results = []
     
     for _, row in tqdm(unique_images.iterrows(), total=len(unique_images)):
@@ -219,9 +236,9 @@ Rules:
         
     out_f.close()
     
-    res_df = pd.DataFrame(results)
-    res_df.to_parquet(args.out_parquet, index=False)
-    print(f"Saved {len(results)} image semantics to {args.out_parquet}")
+    df_res = pd.DataFrame(results)
+    
+    print(f"Saved {len(results)} rows to {args.output}")
 
 if __name__ == "__main__":
     main()

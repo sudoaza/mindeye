@@ -98,17 +98,9 @@ def main() -> None:
                 row = json.loads(line)
                 image_id = row["image_id"]
                 
-                # Canonical semantic representation from the 15 attributes
-                attrs = [
-                    str(row.get(k, "")) for k in [
-                        "is_alive", "category", "face_present", "object_count",
-                        "setting", "dominant_colors", "horizontal_position",
-                        "vertical_position", "movement", "framing", "shape_type",
-                        "origin", "tone_or_theme", "action_category", "object_category_family"
-                    ]
-                ]
-                text = ". ".join([a for a in attrs if a]) + "."
-                if not text.strip() or text == ".":
+                # Canonical semantic representation from the structured text
+                text = str(row.get("structured_embedding_text", "empty"))
+                if not text.strip():
                     text = "empty"
                     
                 inputs = processor(text=[text], padding=True, return_tensors="pt", truncation=True, max_length=77).to(device)
