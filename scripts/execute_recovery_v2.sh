@@ -42,7 +42,7 @@ python scripts/generate_text_embeddings.py \
   --output data/processed/clip_embeddings/image_semantic_text_embeddings.pt
 
 python scripts/generate_text_embeddings.py \
-  --source labels \
+  --source templates \
   --metadata data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08/all_runs_metadata.csv \
   --output data/processed/clip_embeddings/imagenet_text_embeddings.pt
 
