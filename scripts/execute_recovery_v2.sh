@@ -51,7 +51,7 @@ python scripts/build_common_embeddings.py \
   --semantic-embeddings data/processed/clip_embeddings/image_semantic_text_embeddings.pt \
   --label-embeddings data/processed/clip_embeddings/imagenet_text_embeddings.pt \
   --metadata data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08/all_runs_metadata.csv \
-  --w-img 0.25 --w-sem 0.65 --w-lbl 0.10 \
+  --w-img 0.25 --w-sem 0.75 \
   --output data/processed/clip_embeddings/common_embeddings.pt
 
 echo "=== [6/7] Smoke Test (2 epochs) ==="

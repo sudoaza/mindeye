@@ -451,10 +451,13 @@ def main() -> None:
                 # true_label: [B, D]
                 # distractor_labels: [B, 15, D]
                 
+                # Normalize pred to get true cosine similarities
+                pred_norm = F.normalize(pred, dim=-1)
+                
                 # Similarity to true label [B, 1]
-                true_sim = (pred * batch_data["true_label"]).sum(dim=-1, keepdim=True)
+                true_sim = (pred_norm * batch_data["true_label"]).sum(dim=-1, keepdim=True)
                 # Similarity to distractors [B, 15]
-                dist_sim = torch.bmm(batch_data["distractor_labels"], pred.unsqueeze(2)).squeeze(2)
+                dist_sim = torch.bmm(batch_data["distractor_labels"], pred_norm.unsqueeze(2)).squeeze(2)
                 
                 # Combine [B, 16]
                 logits = torch.cat([true_sim, dist_sim], dim=1)
