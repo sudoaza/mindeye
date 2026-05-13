@@ -32,6 +32,12 @@ class SemanticPairConfig:
     epochs_dir_resample: str | Path | None = None
     shuffle_seed: int = 42
     add_event_marker: bool = False
+    augment_eeg: bool = False
+    aug_channel_dropout: float = 0.10
+    aug_noise_std: float = 0.03
+    aug_amp_scale: float = 0.10
+    aug_time_mask: int = 24
+    aug_time_jitter: int = 8
 
 
 class ZunaClipPairDataset(Dataset):
@@ -154,7 +160,84 @@ class ZunaClipPairDataset(Dataset):
             marker = torch.exp(-0.5 * ((t - anchor) / sigma_samples) ** 2).unsqueeze(0)
             eeg = torch.cat([eeg, marker], dim=0)
 
+        if self.config.augment_eeg:
+            eeg = self._augment_eeg(eeg)
+
         return eeg
+
+    def _non_marker_view(self, eeg: torch.Tensor) -> torch.Tensor:
+        """Return channels that may be augmented; never augment appended marker."""
+        if getattr(self.config, "add_event_marker", False):
+            return eeg[:-1]
+        return eeg
+
+    def _augment_eeg(self, eeg: torch.Tensor) -> torch.Tensor:
+        """Lightweight stochastic EEG augmentations for train-time robustness.
+
+        The optional event marker channel is intentionally excluded from all
+        transforms so its timing/amplitude remains an absolute reference.
+        """
+        x = eeg.clone()
+        data = self._non_marker_view(x)
+        if data.numel() == 0:
+            return x
+
+        # Channel dropout: zero a small random subset of EEG channels.
+        p_drop = float(self.config.aug_channel_dropout)
+        if p_drop > 0:
+            keep = torch.rand(data.shape[0], device=data.device) >= p_drop
+            if not bool(keep.any()):
+                keep[torch.randint(0, data.shape[0], (1,), device=data.device)] = True
+            data *= keep[:, None].to(data.dtype)
+
+        # Per-crop amplitude scaling.
+        amp = float(self.config.aug_amp_scale)
+        if amp > 0:
+            scale = 1.0 + (torch.rand((), device=data.device, dtype=data.dtype) * 2.0 - 1.0) * amp
+            data *= scale
+
+        # Additive Gaussian sensor noise.
+        noise = float(self.config.aug_noise_std)
+        if noise > 0:
+            data += torch.randn_like(data) * noise
+
+        # Time masking over EEG channels only.
+        mask_width = int(self.config.aug_time_mask)
+        if mask_width > 0 and data.shape[-1] > 1:
+            width = min(mask_width, data.shape[-1])
+            start = int(torch.randint(0, data.shape[-1] - width + 1, (1,)).item())
+            data[:, start:start + width] = 0
+
+        # Small temporal jitter over EEG channels only; marker remains fixed.
+        jitter = int(self.config.aug_time_jitter)
+        if jitter > 0:
+            shift = int(torch.randint(-jitter, jitter + 1, (1,)).item())
+            if shift:
+                data[:] = torch.roll(data, shifts=shift, dims=-1)
+
+        return x
+
+    def audit_target_banks(self) -> dict[str, float]:
+        """Summarize whether common/image/semantic target banks are distinct."""
+        image_ids = sorted(set(self.metadata["image_id"].astype(str).tolist()))
+        common = torch.stack([F.normalize(self.image_id_to_common[i].float(), dim=-1) for i in image_ids])
+        image = torch.stack([F.normalize(self.image_id_to_image[i].float(), dim=-1) for i in image_ids])
+        semantic = torch.stack([F.normalize(self.image_id_to_semantic[i].float(), dim=-1) for i in image_ids])
+
+        def stats(a: torch.Tensor, b: torch.Tensor, prefix: str) -> dict[str, float]:
+            cos = (a * b).sum(dim=-1)
+            return {
+                f"{prefix}_mean": float(cos.mean().item()),
+                f"{prefix}_std": float(cos.std(unbiased=False).item()),
+                f"{prefix}_min": float(cos.min().item()),
+                f"{prefix}_max": float(cos.max().item()),
+            }
+
+        out: dict[str, float] = {"target_bank_n": float(len(image_ids))}
+        out.update(stats(common, semantic, "cos_common_semantic"))
+        out.update(stats(common, image, "cos_common_image"))
+        out.update(stats(semantic, image, "cos_semantic_image"))
+        return out
 
     def _build_sameclass_index(self, rng: np.random.Generator) -> None:
         if "synset" not in self.metadata.columns:

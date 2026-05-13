@@ -7,6 +7,14 @@ import torch.nn.functional as F
 import math
 
 
+def _group_norm(num_channels: int, preferred_groups: int = 8) -> nn.GroupNorm:
+    """GroupNorm helper that gracefully handles small/non-divisible widths."""
+    groups = min(preferred_groups, num_channels)
+    while num_channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, num_channels)
+
+
 class EEGClipEncoder(nn.Module):
     """
     Standard temporal-convolution EEG encoder.
@@ -20,22 +28,26 @@ class EEGClipEncoder(nn.Module):
         embedding_dim: int = 512,
         hidden_dim: int = 256,
         dropout: float = 0.2,
+        stem_dropout1d: float = 0.15,
         normalize_output: bool = True,
     ):
         super().__init__()
         self.normalize_output = normalize_output
         self.net = nn.Sequential(
             nn.Conv1d(n_channels, 128, kernel_size=7, padding=3),
-            nn.BatchNorm1d(128),
+            _group_norm(128),
             nn.GELU(),
+            nn.Dropout1d(stem_dropout1d),
             nn.MaxPool1d(2),
             nn.Conv1d(128, hidden_dim, kernel_size=5, padding=2),
-            nn.BatchNorm1d(hidden_dim),
+            _group_norm(hidden_dim),
             nn.GELU(),
+            nn.Dropout1d(stem_dropout1d),
             nn.MaxPool1d(2),
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim),
+            _group_norm(hidden_dim),
             nn.GELU(),
+            nn.Dropout1d(stem_dropout1d),
             nn.AdaptiveAvgPool1d(1),
         )
         self.head = nn.Sequential(
@@ -83,17 +95,20 @@ class TemporalAttnEncoder(nn.Module):
         n_layers: int = 4,
         n_heads: int = 8,
         dropout: float = 0.2,
+        stem_dropout1d: float = 0.15,
         normalize_output: bool = True,
     ):
         super().__init__()
         self.normalize_output = normalize_output
         self.stem = nn.Sequential(
             nn.Conv1d(n_channels, 128, kernel_size=7, stride=4, padding=3),
-            nn.BatchNorm1d(128),
+            _group_norm(128),
             nn.GELU(),
+            nn.Dropout1d(stem_dropout1d),
             nn.Conv1d(128, hidden_dim, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(hidden_dim),
+            _group_norm(hidden_dim),
             nn.GELU(),
+            nn.Dropout1d(stem_dropout1d),
         )
         
         self.max_tokens = 256

@@ -1,4 +1,4 @@
-#!/usr/ensure/env python3
+#!/usr/bin/env python3
 """Build a common multimodal embedding space by fusing image, text, and label embeddings.
 """
 from __future__ import annotations

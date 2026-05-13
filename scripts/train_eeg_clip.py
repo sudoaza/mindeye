@@ -76,8 +76,25 @@ def parse_args() -> argparse.Namespace:
                    help="EEG window duration: crop (1.25s) or full5s (5s) or full5s_backaligned (5s)")
     p.add_argument("--add-event-marker", action="store_true",
                    help="Add event marker bump as an extra channel to EEG inputs")
-    p.add_argument("--model", choices=("cnn", "temporal_attn"), default="cnn",
-                   help="Encoder architecture: cnn (default) or temporal_attn")
+    p.add_argument("--model", choices=("cnn", "temporal_attn", "temporal_attn_small"), default="cnn",
+                   help="Encoder architecture: cnn (default), temporal_attn, or temporal_attn_small")
+    p.add_argument("--hidden-dim", type=int, default=None,
+                   help="Override encoder hidden width")
+    p.add_argument("--n-layers", type=int, default=None,
+                   help="Override TemporalAttn transformer layer count")
+    p.add_argument("--n-heads", type=int, default=None,
+                   help="Override TemporalAttn attention head count")
+    p.add_argument("--dropout", type=float, default=None,
+                   help="Override encoder/head dropout")
+    p.add_argument("--stem-dropout1d", type=float, default=0.15,
+                   help="Dropout1d probability in convolutional EEG stem")
+    p.add_argument("--augment-eeg", action="store_true",
+                   help="Apply train-time EEG augmentations (marker channel is never augmented)")
+    p.add_argument("--aug-channel-dropout", type=float, default=0.10)
+    p.add_argument("--aug-noise-std", type=float, default=0.03)
+    p.add_argument("--aug-amp-scale", type=float, default=0.10)
+    p.add_argument("--aug-time-mask", type=int, default=24)
+    p.add_argument("--aug-time-jitter", type=int, default=8)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -94,7 +111,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None, help="cuda, cpu, or omitted for auto")
     p.add_argument("--dry-run", action="store_true",
                    help="Load data/model and run one forward pass only")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.model == "temporal_attn_small" and args.weight_decay == 1e-4:
+        args.weight_decay = 1e-2
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +283,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    dataset = ZunaClipPairDataset(
-        SemanticPairConfig(
+    dataset_config = SemanticPairConfig(
             metadata_csv=args.metadata,
             epochs_dir=args.epochs_dir,
             epochs_dir_raw=args.epochs_dir_raw,
@@ -275,8 +294,25 @@ def main() -> None:
             window_mode=args.window_mode,
             target_space=args.target_space,
             add_event_marker=args.add_event_marker,
+            augment_eeg=False,
         )
-    )
+    dataset = ZunaClipPairDataset(dataset_config)
+    target_bank_audit = dataset.audit_target_banks()
+    print("[TargetBankAudit] " + json.dumps(target_bank_audit, sort_keys=True))
+
+    train_dataset = dataset
+    if args.augment_eeg:
+        train_dataset = ZunaClipPairDataset(
+            SemanticPairConfig(
+                **{**dataset_config.__dict__,
+                   "augment_eeg": True,
+                   "aug_channel_dropout": args.aug_channel_dropout,
+                   "aug_noise_std": args.aug_noise_std,
+                   "aug_amp_scale": args.aug_amp_scale,
+                   "aug_time_mask": args.aug_time_mask,
+                   "aug_time_jitter": args.aug_time_jitter}
+            )
+        )
 
     if args.split_mode == "run":
         train_idx, val_idx = _split_by_run(dataset, _parse_val_runs(args.val_runs))
@@ -284,7 +320,7 @@ def main() -> None:
         train_idx, val_idx = split_indices(len(dataset), val_fraction=args.val_fraction, seed=args.seed)
 
     train_loader = DataLoader(
-        Subset(dataset, train_idx),
+        Subset(train_dataset, train_idx),
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=args.loss == "contrastive",
@@ -298,19 +334,44 @@ def main() -> None:
     print(f"[Dataset] EEG shape: [{n_channels}, {n_times}]")
     print(f"[Dataset] n_samples: {len(dataset)}")
 
-    if args.model == "temporal_attn":
+    if args.model in {"temporal_attn", "temporal_attn_small"}:
         from mindseye.models.eeg_encoder import TemporalAttnEncoder
+        if args.model == "temporal_attn_small":
+            hidden_dim = args.hidden_dim or 128
+            n_layers = args.n_layers or 2
+            n_heads = args.n_heads or 4
+            dropout = args.dropout if args.dropout is not None else 0.35
+        else:
+            hidden_dim = args.hidden_dim or 256
+            n_layers = args.n_layers or 4
+            n_heads = args.n_heads or 8
+            dropout = args.dropout if args.dropout is not None else 0.2
         model = TemporalAttnEncoder(
-            n_channels=n_channels, embedding_dim=dataset.embedding_dim
+            n_channels=n_channels,
+            embedding_dim=dataset.embedding_dim,
+            hidden_dim=hidden_dim,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dropout=dropout,
+            stem_dropout1d=args.stem_dropout1d,
         ).to(device)
         model.n_channels = n_channels
-        print(f"[Model] model: temporal_attn")
+        print(f"[Model] model: {args.model} hidden_dim={hidden_dim} n_layers={n_layers} n_heads={n_heads} dropout={dropout}")
     else:
+        hidden_dim = args.hidden_dim or 256
+        dropout = args.dropout if args.dropout is not None else 0.2
+        n_layers = None
+        n_heads = None
         model = EEGClipEncoder(
-            n_channels=n_channels, n_times=n_times, embedding_dim=dataset.embedding_dim
+            n_channels=n_channels,
+            n_times=n_times,
+            embedding_dim=dataset.embedding_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            stem_dropout1d=args.stem_dropout1d,
         ).to(device)
         model.n_channels = n_channels
-        print(f"[Model] model: cnn")
+        print(f"[Model] model: cnn hidden_dim={hidden_dim} dropout={dropout}")
         
     if getattr(model, "n_channels", n_channels) != n_channels:
         raise ValueError(f"model.n_channels != dataset_eeg_channels")
@@ -340,6 +401,20 @@ def main() -> None:
         "window_mode": args.window_mode,
         "target_space": args.target_space,
         "model": args.model,
+        "hidden_dim": hidden_dim,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "dropout": dropout,
+        "stem_dropout1d": args.stem_dropout1d,
+        "augment_eeg": args.augment_eeg,
+        "augment_params": {
+            "channel_dropout": args.aug_channel_dropout,
+            "noise_std": args.aug_noise_std,
+            "amp_scale": args.aug_amp_scale,
+            "time_mask": args.aug_time_mask,
+            "time_jitter": args.aug_time_jitter,
+        },
+        "target_bank_audit": target_bank_audit,
     }
     print(json.dumps({"setup": setup}, indent=2))
 
@@ -352,12 +427,16 @@ def main() -> None:
     _save_env(run_dir, args, setup)
 
     # Training loop
-    best_loss = float("inf")
+    best_score = float("-inf")
+    best_epoch = None
+    best_mrr = None
+    best_top10 = None
+    best_collapse_score = None
     history: list[dict] = []
 
     import csv
     log_path = run_dir / "train_log.csv"
-    log_fields = ["epoch", "train_loss", "val_loss", 
+    log_fields = ["epoch", "train_loss", "val_loss", "val_score",
                   "val_common_top10", "val_common_mrr", "val_common_collapse_score",
                   "val_semantic_top10", "val_semantic_mrr", "val_semantic_collapse_score",
                   "val_image_top10", "val_image_mrr", "val_image_collapse_score",
@@ -392,10 +471,14 @@ def main() -> None:
 
         val = evaluate(model, val_loader, device, loss_name=args.loss,
                        temperature=args.temperature, target_space=args.target_space)
+        score = float(val["mrr"] + 0.25 * val["top10"])
+        if val["collapse_score"] < 0.1:
+            score = -1.0
         row = {
             "epoch": epoch,
             "train_loss": float(sum(train_losses) / max(1, len(train_losses))),
             "val_loss": val["loss"],
+            "val_score": score,
             
             "val_common_top10": val["common_top10"],
             "val_common_mrr": val["common_mrr"],
@@ -419,14 +502,24 @@ def main() -> None:
         with open(log_path, "a", newline="") as f:
             csv.DictWriter(f, fieldnames=log_fields).writerow(row)
 
-        if val["loss"] < best_loss:
-            best_loss = val["loss"]
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch
+            best_mrr = float(val["mrr"])
+            best_top10 = float(val["top10"])
+            best_collapse_score = float(val["collapse_score"])
             torch.save(
                 {
                     "model_state": model.state_dict(),
                     "setup": setup,
                     "epoch": epoch,
                     "metrics": row,
+                    "best_selection": {
+                        "score": best_score,
+                        "mrr": best_mrr,
+                        "top10": best_top10,
+                        "collapse_score": best_collapse_score,
+                    },
                 },
                 run_dir / "best.pt",
             )
@@ -440,6 +533,12 @@ def main() -> None:
     final_metrics = evaluate(model, val_loader, device, loss_name=args.loss,
                              temperature=args.temperature, target_space=args.target_space)
     final_metrics["best_epoch"] = int(ckpt["epoch"])
+    final_metrics["best_score"] = float(best_score)
+    final_metrics["best_mrr"] = float(best_mrr) if best_mrr is not None else None
+    final_metrics["best_top10"] = float(best_top10) if best_top10 is not None else None
+    final_metrics["best_collapse_score"] = float(best_collapse_score) if best_collapse_score is not None else None
+    final_metrics["target_bank_audit"] = target_bank_audit
+    final_metrics.update(target_bank_audit)
     final_metrics["input_domain"] = args.input_domain
     final_metrics["target_mode"] = args.target_mode
     final_metrics["split_mode"] = args.split_mode
@@ -456,7 +555,7 @@ def main() -> None:
         w.writeheader()
         w.writerow(final_metrics)
 
-    print(json.dumps({"best_loss": best_loss, "run_dir": str(run_dir),
+    print(json.dumps({"best_score": best_score, "best_epoch": best_epoch, "run_dir": str(run_dir),
                       "metrics": final_metrics}, indent=2))
 
 

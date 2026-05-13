@@ -81,6 +81,7 @@ def run_condition(
         "--val-runs",       args.val_runs,
         "--epochs",         str(args.epochs),
         "--batch-size",     str(args.batch_size),
+        "--weight-decay",   str(args.weight_decay),
         "--loss",           "contrastive",
         "--output-dir",     str(matrix_dir),
         "--slug",           f"{name}_{args.slug}" if args.slug else name,
@@ -91,6 +92,23 @@ def run_condition(
     ]
     if getattr(args, "add_event_marker", False):
         cmd.append("--add-event-marker")
+    if getattr(args, "augment_eeg", False):
+        cmd.append("--augment-eeg")
+    for arg_name, cli_name in [
+        ("hidden_dim", "--hidden-dim"),
+        ("n_layers", "--n-layers"),
+        ("n_heads", "--n-heads"),
+        ("dropout", "--dropout"),
+        ("stem_dropout1d", "--stem-dropout1d"),
+        ("aug_channel_dropout", "--aug-channel-dropout"),
+        ("aug_noise_std", "--aug-noise-std"),
+        ("aug_amp_scale", "--aug-amp-scale"),
+        ("aug_time_mask", "--aug-time-mask"),
+        ("aug_time_jitter", "--aug-time-jitter"),
+    ]:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            cmd.extend([cli_name, str(value)])
     if getattr(args, "common_embeddings", None):
         cmd.extend(["--common-embeddings", str(args.common_embeddings)])
     # Forward optional raw/resample dirs if provided
@@ -173,6 +191,7 @@ def main() -> None:
     p.add_argument("--val-runs",       default=DEFAULTS["val_runs"])
     p.add_argument("--epochs",         type=int, default=int(DEFAULTS["epochs"]))
     p.add_argument("--batch-size",     type=int, default=int(DEFAULTS["batch_size"]))
+    p.add_argument("--weight-decay",   type=float, default=1e-4)
     p.add_argument("--out-dir",        default="outputs/baseline_matrix",
                    help="Parent directory for all matrix runs")
     p.add_argument("--slug",           default=None)
@@ -182,12 +201,25 @@ def main() -> None:
     p.add_argument("--add-event-marker", action="store_true")
     p.add_argument("--target-space", choices=("common", "semantic", "image"), default="common",
                    help="Which embedding space to optimize the loss against")
-    p.add_argument("--model",           choices=("cnn", "temporal_attn"), default="cnn")
+    p.add_argument("--model",           choices=("cnn", "temporal_attn", "temporal_attn_small"), default="cnn")
+    p.add_argument("--hidden-dim",      type=int, default=None)
+    p.add_argument("--n-layers",        type=int, default=None)
+    p.add_argument("--n-heads",         type=int, default=None)
+    p.add_argument("--dropout",         type=float, default=None)
+    p.add_argument("--stem-dropout1d",  type=float, default=0.15)
+    p.add_argument("--augment-eeg",     action="store_true")
+    p.add_argument("--aug-channel-dropout", type=float, default=0.10)
+    p.add_argument("--aug-noise-std", type=float, default=0.03)
+    p.add_argument("--aug-amp-scale", type=float, default=0.10)
+    p.add_argument("--aug-time-mask", type=int, default=24)
+    p.add_argument("--aug-time-jitter", type=int, default=8)
     p.add_argument("--conditions",     nargs="*", default=None,
                    help="Subset of condition names to run (default: all 6)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print planned conditions and exit without training")
     args = p.parse_args()
+    if args.model == "temporal_attn_small" and args.weight_decay == 1e-4:
+        args.weight_decay = 1e-2
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     matrix_dir = Path(args.out_dir) / f"{ts}_matrix"
