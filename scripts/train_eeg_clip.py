@@ -64,9 +64,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--target-space",
-        choices=("common", "semantic", "image"),
+        choices=("common", "semantic", "image", "label"),
         default="common",
         help="Which embedding space to optimize the loss against",
+    )
+    p.add_argument(
+        "--w-label",
+        type=float,
+        default=0.2,
+        help="Weight for the auxiliary multiple-choice label classification loss",
     )
     p.add_argument("--output-dir", default=None,
                    help="Base output directory. Defaults to outputs/runs/")
@@ -142,12 +148,15 @@ def _split_by_run(dataset, val_runs: set[int]) -> tuple[list[int], list[int]]:
 def _batch_to_device(
     batch: dict,
     device,
-) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-    eeg = batch["eeg"].to(device).float()
-    tc = batch["target_common"].to(device).float()
-    ti = batch["target_image"].to(device).float()
-    ts = batch["target_semantic"].to(device).float()
-    return eeg, tc, ti, ts
+) -> dict:
+    ret = {
+        "eeg": batch["eeg"].to(device).float(),
+        "target": batch["target"].to(device).float()
+    }
+    if "true_label" in batch:
+        ret["true_label"] = batch["true_label"].to(device).float()
+        ret["distractor_labels"] = batch["distractor_labels"].to(device).float()
+    return ret
 
 
 def _loss_fn(pred, target, *, loss_name: str, temperature: float):
@@ -208,53 +217,35 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
     from mindseye.models.eeg_encoder import retrieval_topk
     import torch
     model.eval()
-    preds, tc_list, ti_list, ts_list = [], [], [], []
+    preds, targets = [], []
     with torch.inference_mode():
         for batch in loader:
-            eeg, tc, ti, ts = _batch_to_device(batch, device)
-            pred = model(eeg)
+            batch_data = _batch_to_device(batch, device)
+            pred = model(batch_data["eeg"])
             preds.append(pred.cpu())
-            tc_list.append(tc.cpu())
-            ti_list.append(ti.cpu())
-            ts_list.append(ts.cpu())
+            targets.append(batch_data["target"].cpu())
 
     pred_t = torch.cat(preds)
-    tc_t = torch.cat(tc_list)
-    ti_t = torch.cat(ti_list)
-    ts_t = torch.cat(ts_list)
+    target_t = torch.cat(targets)
     
-    if target_space == "common":
-        primary_target = tc_t
-    elif target_space == "semantic":
-        primary_target = ts_t
-    else:
-        primary_target = ti_t
-
-    loss = float(_loss_fn(pred_t, primary_target, loss_name=loss_name, temperature=temperature).item())
+    loss = float(_loss_fn(pred_t, target_t, loss_name=loss_name, temperature=temperature).item())
     
     metrics = {"loss": loss, "n": int(pred_t.shape[0])}
     
-    # evaluate for each space
-    for name, t_t in [("common", tc_t), ("image", ti_t), ("semantic", ts_t)]:
-        m = retrieval_topk(pred_t, t_t)
-        for k, v in m.items():
-            metrics[f"{name}_{k}"] = v
-            
-        metrics[f"{name}_mean_diag_cosine"] = float(
-            (
-                torch.nn.functional.normalize(pred_t, dim=-1)
-                * torch.nn.functional.normalize(t_t, dim=-1)
-            )
-            .sum(dim=-1)
-            .mean()
-            .item()
-        )
-            
-    # For backward compatibility with simple scripts parsing 'top10'
-    m_primary = retrieval_topk(pred_t, primary_target)
-    for k, v in m_primary.items():
+    # evaluate top-k
+    m = retrieval_topk(pred_t, target_t)
+    for k, v in m.items():
         metrics[k] = v
-    metrics["mean_diag_cosine"] = metrics[f"{target_space}_mean_diag_cosine"]
+        
+    metrics["mean_diag_cosine"] = float(
+        (
+            torch.nn.functional.normalize(pred_t, dim=-1)
+            * torch.nn.functional.normalize(target_t, dim=-1)
+        )
+        .sum(dim=-1)
+        .mean()
+        .item()
+    )
 
     # Expected random baselines
     n = metrics["n"]
@@ -380,9 +371,9 @@ def main() -> None:
 
     # Quick forward pass to verify shapes
     first_batch = next(iter(train_loader))
-    eeg, tc, ti, ts = _batch_to_device(first_batch, device)
+    batch_data = _batch_to_device(first_batch, device)
     with torch.inference_mode():
-        pred = model(eeg)
+        pred = model(batch_data["eeg"])
 
     setup = {
         "items": len(dataset),
@@ -437,10 +428,7 @@ def main() -> None:
     import csv
     log_path = run_dir / "train_log.csv"
     log_fields = ["epoch", "train_loss", "val_loss", "val_score",
-                  "val_common_top10", "val_common_mrr", "val_common_collapse_score",
-                  "val_semantic_top10", "val_semantic_mrr", "val_semantic_collapse_score",
-                  "val_image_top10", "val_image_mrr", "val_image_collapse_score",
-                  "val_top10", "val_mrr"]
+                  "top1", "top5", "top10", "mrr", "median_rank", "mean_diag_cosine", "collapse_score"]
 
     with open(log_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=log_fields).writeheader()
@@ -449,21 +437,33 @@ def main() -> None:
         model.train()
         train_losses: list[float] = []
         for batch in train_loader:
-            eeg, tc, ti, ts = _batch_to_device(batch, device)
+            batch_data = _batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
-            pred = model(eeg)
+            pred = model(batch_data["eeg"])
             
-            if args.target_space == "common":
-                l_com = _loss_fn(pred, tc, loss_name=args.loss, temperature=args.temperature)
-                l_sem = _loss_fn(pred, ts, loss_name=args.loss, temperature=args.temperature)
-                l_img = _loss_fn(pred, ti, loss_name=args.loss, temperature=args.temperature)
-                loss = l_com + 0.5 * l_sem + 0.1 * l_img
-            elif args.target_space == "semantic":
-                loss = _loss_fn(pred, ts, loss_name=args.loss, temperature=args.temperature)
-            elif args.target_space == "image":
-                loss = _loss_fn(pred, ti, loss_name=args.loss, temperature=args.temperature)
-            else:
-                loss = _loss_fn(pred, tc, loss_name=args.loss, temperature=args.temperature)
+            # Primary contrastive loss
+            loss = _loss_fn(pred, batch_data["target"], loss_name=args.loss, temperature=args.temperature)
+            
+            # Auxiliary multi-choice classification loss
+            if "true_label" in batch_data and args.w_label > 0:
+                import torch.nn.functional as F
+                # pred: [B, D]
+                # true_label: [B, D]
+                # distractor_labels: [B, 15, D]
+                
+                # Similarity to true label [B, 1]
+                true_sim = (pred * batch_data["true_label"]).sum(dim=-1, keepdim=True)
+                # Similarity to distractors [B, 15]
+                dist_sim = torch.bmm(batch_data["distractor_labels"], pred.unsqueeze(2)).squeeze(2)
+                
+                # Combine [B, 16]
+                logits = torch.cat([true_sim, dist_sim], dim=1)
+                
+                # True label is always at index 0
+                label_idx = torch.zeros(pred.shape[0], dtype=torch.long, device=device)
+                loss_ce = F.cross_entropy(logits / args.temperature, label_idx)
+                
+                loss = loss + args.w_label * loss_ce
                 
             loss.backward()
             optimizer.step()
@@ -479,21 +479,13 @@ def main() -> None:
             "train_loss": float(sum(train_losses) / max(1, len(train_losses))),
             "val_loss": val["loss"],
             "val_score": score,
-            
-            "val_common_top10": val["common_top10"],
-            "val_common_mrr": val["common_mrr"],
-            "val_common_collapse_score": val["common_collapse_score"],
-            
-            "val_semantic_top10": val["semantic_top10"],
-            "val_semantic_mrr": val["semantic_mrr"],
-            "val_semantic_collapse_score": val["semantic_collapse_score"],
-            
-            "val_image_top10": val["image_top10"],
-            "val_image_mrr": val["image_mrr"],
-            "val_image_collapse_score": val["image_collapse_score"],
-            
-            "val_top10": val["top10"],
-            "val_mrr": val["mrr"]
+            "top1": val["top1"],
+            "top5": val["top5"],
+            "top10": val["top10"],
+            "mrr": val["mrr"],
+            "median_rank": val["median_rank"],
+            "mean_diag_cosine": val["mean_diag_cosine"],
+            "collapse_score": val["collapse_score"]
         }
         history.append(row)
         print(json.dumps(row))

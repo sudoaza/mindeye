@@ -85,13 +85,7 @@ def main() -> None:
         }
     else:
         # source == image_semantics
-        target_dicts = {
-            "caption_short": {},
-            "caption_detailed": {},
-            "caption_composition": {},
-            "caption_attributes": {},
-            "caption_core": {},
-        }
+        image_id_to_semantic = {}
         image_id_to_caption_fields = {}
         
         with open(args.semantics_jsonl, "r") as f:
@@ -104,44 +98,41 @@ def main() -> None:
                 row = json.loads(line)
                 image_id = row["image_id"]
                 
-                texts = {
-                    "caption_short": row.get("short_caption", ""),
-                    "caption_detailed": row.get("short_caption", "") + " " + row.get("detailed_caption", ""),
-                    "caption_composition": row.get("composition_caption", ""),
-                    "caption_attributes": row.get("attribute_caption", ""),
-                    "caption_core": f"{row.get('short_caption', '')} {row.get('detailed_caption', '')} Composition: {row.get('composition_caption', '')} Attributes: {row.get('attribute_caption', '')}.",
-                }
-                
-                for target_name, text in texts.items():
-                    if not text.strip():
-                        text = "empty"
-                        
-                    inputs = processor(text=[text], padding=True, return_tensors="pt", truncation=True, max_length=77).to(device)
-                    text_features = model.get_text_features(**inputs)
-                    if not isinstance(text_features, torch.Tensor):
-                        if hasattr(text_features, "text_embeds"):
-                            text_features = text_features.text_embeds
-                        elif hasattr(text_features, "pooler_output"):
-                            text_features = text_features.pooler_output
-                        else:
-                            text_features = text_features[0]
-                    text_features = torch.nn.functional.normalize(text_features, dim=-1)[0]
+                # Canonical semantic representation from the 15 attributes
+                attrs = [
+                    str(row.get(k, "")) for k in [
+                        "is_alive", "category", "face_present", "object_count",
+                        "setting", "dominant_colors", "horizontal_position",
+                        "vertical_position", "movement", "framing", "shape_type",
+                        "origin", "tone_or_theme", "action_category", "object_category_family"
+                    ]
+                ]
+                text = ". ".join([a for a in attrs if a]) + "."
+                if not text.strip() or text == ".":
+                    text = "empty"
                     
-                    target_dicts[target_name][image_id] = text_features.cpu()
+                inputs = processor(text=[text], padding=True, return_tensors="pt", truncation=True, max_length=77).to(device)
+                text_features = model.get_text_features(**inputs)
+                if not isinstance(text_features, torch.Tensor):
+                    if hasattr(text_features, "text_embeds"):
+                        text_features = text_features.text_embeds
+                    elif hasattr(text_features, "pooler_output"):
+                        text_features = text_features.pooler_output
+                    else:
+                        text_features = text_features[0]
+                text_features = torch.nn.functional.normalize(text_features, dim=-1)[0]
                 
-                caption_fields = {k: v for k, v in row.items() if k.endswith("_caption") or k in ["objects", "scene", "setting", "spatial_layout", "dominant_colors", "materials_textures", "lighting", "viewpoint", "action_or_state", "mood", "uncertainties"]}
+                image_id_to_semantic[image_id] = text_features.cpu()
+                
+                caption_fields = {k: v for k, v in row.items() if k != "image_id"}
                 image_id_to_caption_fields[image_id] = caption_fields
                 
         table = {
             "model": args.model_name,
             "source": "image_semantics",
+            "image_id_to_semantic": image_id_to_semantic,
             "image_id_to_caption_fields": image_id_to_caption_fields,
         }
-        for k, v in target_dicts.items():
-            table[f"image_id_to_{k}"] = v
-            # Backwards compatibility for scripts expecting image_id_to_text_embedding
-            if k == "caption_core":
-                table["image_id_to_text_embedding"] = v
     
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     torch.save(table, args.output)

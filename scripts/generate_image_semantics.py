@@ -68,86 +68,29 @@ def main():
     
     prompt_text = """You are generating visual-semantic training targets for an EEG-to-image decoding model.
 
-Describe only visible content. Do not infer hidden context, identity, brand, location, story, intention, politics, emotion of people, or events outside the frame. Do not say "image", "photo", "picture", or "visual stimulus" inside the captions.
-
-Return valid JSON only with exactly these keys:
+Please analyze the image and answer the following 15 attributes. Return valid JSON only with exactly these keys. For binary/categorical choices, pick the most accurate option.
 
 {
-  "short_caption": "string",
-  "detailed_caption": "string",
-  "composition_caption": "string",
-  "attribute_caption": "string",
-  "objects": ["string"],
-  "scene": "string",
-  "setting": "string",
-  "spatial_layout": "string",
+  "is_alive": "alive | not alive",
+  "category": "human | animal | object | scene",
+  "face_present": "face present | absent",
+  "object_count": "one main object | many objects",
+  "setting": "indoor | outdoor",
   "dominant_colors": ["string"],
-  "materials_textures": ["string"],
-  "lighting": "string",
-  "viewpoint": "string",
-  "action_or_state": "string",
-  "mood": "string",
-  "uncertainties": ["string"]
+  "horizontal_position": "left | center | right",
+  "vertical_position": "top | middle | bottom",
+  "movement": "motion | static",
+  "framing": "close-up | wide scene",
+  "shape_type": "geometric | organic",
+  "origin": "natural | man-made",
+  "tone_or_theme": "string",
+  "action_category": "string",
+  "object_category_family": "string"
 }
 
-Field requirements:
-
-short_caption:
-- One sentence.
-- Name the main visible subject and broad setting.
-- Example style: "A brown dog standing on green grass outdoors."
-
-detailed_caption:
-- Two sentences maximum.
-- Mention main subject, secondary visible objects, background, colors, pose/state, and scene context.
-- Keep it concrete and visual.
-
-composition_caption:
-- One sentence.
-- Describe spatial layout: center/left/right, foreground/background, scale, framing, viewpoint, and object relations.
-- Example: "The main subject is centered in the foreground with a grassy background filling most of the frame."
-
-attribute_caption:
-- One compact comma-separated phrase list.
-- Include object type, color, material/texture, setting, lighting, viewpoint, and action/state.
-- Example: "dog, brown fur, green grass, outdoor daylight, centered subject, side view, standing"
-
-objects:
-- List visible object categories only.
-- Use generic nouns, not proper names.
-
-scene:
-- Broad scene type, e.g. animal scene, indoor room, outdoor field, street, forest, water scene, food scene, vehicle scene, person scene, close-up object, abstract/unclear.
-
-setting:
-- Concrete environment or background, e.g. grassy field, kitchen table, urban street, forest floor, plain background.
-
-spatial_layout:
-- Short phrase describing layout and object placement.
-
-dominant_colors:
-- 3 to 6 visible dominant colors.
-
-materials_textures:
-- Visible materials/textures such as fur, grass, metal, wood, glass, fabric, skin, water, stone, plastic.
-
-lighting:
-- Use concrete visible lighting such as daylight, indoor light, dim light, bright light, backlit, shadowed, unclear.
-
-viewpoint:
-- close-up, wide shot, frontal view, side view, top-down, low angle, overhead, unclear.
-
-action_or_state:
-- Visible state only: standing, sitting, flying, parked, resting, open, closed, arranged, unclear.
-
-mood:
-- Visual atmosphere only: neutral, calm, bright, cluttered, dramatic, natural, playful, unclear.
-
-uncertainties:
-- List visible ambiguities. Use [] if none.
-
 Rules:
-- Be concise.
+- Be concise. Output only the requested JSON format.
+- Do not infer hidden context, keep it purely visual.
 - Prefer nouns and visual adjectives.
 - Avoid poetic language.
 - Avoid abstract interpretation unless directly visible.

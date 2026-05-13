@@ -14,15 +14,12 @@ def parse_args() -> argparse.Namespace:
                    help="Path to .pt containing CLIP image embeddings")
     p.add_argument("--semantic-embeddings", required=True,
                    help="Path to .pt containing VLM semantic text embeddings")
-    p.add_argument("--semantic-key", default="image_id_to_caption_core",
-                   help="Key inside the semantic embeddings dictionary to use")
     p.add_argument("--label-embeddings", default=None,
                    help="Optional path to .pt containing label text embeddings")
     p.add_argument("--metadata", required=True,
                    help="Path to metadata CSV to map classes to labels if using label-embeddings")
     p.add_argument("--w-img", type=float, default=0.25, help="Weight for image embedding")
-    p.add_argument("--w-sem", type=float, default=0.65, help="Weight for semantic text embedding")
-    p.add_argument("--w-lbl", type=float, default=0.10, help="Weight for label text embedding")
+    p.add_argument("--w-sem", type=float, default=0.75, help="Weight for semantic text embedding")
     p.add_argument("--output", required=True, help="Output .pt path")
     return p.parse_args()
 
@@ -44,12 +41,12 @@ def main():
         
     print(f"Loading semantic embeddings from {args.semantic_embeddings}...")
     sem_table = torch.load(args.semantic_embeddings, map_location="cpu")
-    if args.semantic_key not in sem_table:
-        raise KeyError(f"Key {args.semantic_key} not found in semantic embeddings file.")
+    if "image_id_to_semantic" not in sem_table:
+        raise KeyError("Key 'image_id_to_semantic' not found in semantic embeddings file.")
     
     image_id_to_semantic = {
         str(k): F.normalize(v.float(), dim=-1) 
-        for k, v in sem_table[args.semantic_key].items()
+        for k, v in sem_table["image_id_to_semantic"].items()
     }
     
     image_id_to_label = {}
@@ -82,8 +79,6 @@ def main():
         sem_emb = image_id_to_semantic[k]
         
         fused = args.w_img * img_emb + args.w_sem * sem_emb
-        if args.label_embeddings:
-            fused += args.w_lbl * image_id_to_label[k]
             
         image_id_to_common[k] = F.normalize(fused, dim=-1)
         
@@ -93,7 +88,6 @@ def main():
         "weights": {
             "image": args.w_img,
             "semantic": args.w_sem,
-            "label": args.w_lbl if args.label_embeddings else 0.0,
         },
         "image_id_to_common": image_id_to_common,
         "image_id_to_image": {k: image_id_to_image[k] for k in common_keys},

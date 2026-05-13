@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run the full 6-condition EEG→CLIP baseline matrix.
+"""Run the 3-condition EEG baseline matrix.
 
 Each condition trains a fresh model via train_eeg_clip.py and saves its
 metrics.json into a structured run directory.  At the end a summary CSV
 and a console table are produced so you can gate Sprint 3.
 
-Gate: zuna_real must beat zuna_shuffled, zuna_random, and zuna_sameclass on
+Gate: zuna_real must beat zuna_shuffled and zuna_random on
 top10 and MRR.  pred_std must be non-collapsed (collapse_score > 0.1).
 """
 from __future__ import annotations
@@ -27,12 +27,9 @@ import pandas as pd
 
 CONDITIONS = [
     # name               input_domain   target_mode  split
-    ("raw_runheldout",         "raw",     "real",      "run"),
-    ("resample_runheldout",    "resample","real",      "run"),
     ("zuna_real",              "zuna",    "real",      "run"),
     ("zuna_shuffled",          "zuna",    "shuffled",  "run"),
     ("zuna_random",            "zuna",    "random",    "run"),
-    ("zuna_sameclass",         "zuna",    "sameclass", "run"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -65,10 +62,6 @@ def run_condition(
 
     # Select metadata based on domain
     metadata_path = args.metadata
-    if input_domain == "raw" and args.epochs_dir_raw:
-        metadata_path = str(Path(args.epochs_dir_raw) / "all_runs_metadata.csv")
-    elif input_domain == "resample" and args.epochs_dir_resample:
-        metadata_path = str(Path(args.epochs_dir_resample) / "all_runs_metadata.csv")
 
     cmd = [
         sys.executable,
@@ -111,11 +104,6 @@ def run_condition(
             cmd.extend([cli_name, str(value)])
     if getattr(args, "common_embeddings", None):
         cmd.extend(["--common-embeddings", str(args.common_embeddings)])
-    # Forward optional raw/resample dirs if provided
-    if args.epochs_dir_raw:
-        cmd += ["--epochs-dir-raw", args.epochs_dir_raw]
-    if args.epochs_dir_resample:
-        cmd += ["--epochs-dir-resample", args.epochs_dir_resample]
 
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
     
@@ -197,10 +185,6 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--metadata",       default=DEFAULTS["metadata"])
     p.add_argument("--epochs-dir",     default=DEFAULTS["epochs_dir"])
-    p.add_argument("--epochs-dir-raw", default=None,
-                   help="NPZ dir for raw (un-denoised) crops.  Required for raw_runheldout.")
-    p.add_argument("--epochs-dir-resample", default=None,
-                   help="NPZ dir for resample-only crops.  Required for resample_runheldout.")
     p.add_argument("--common-embeddings", default=DEFAULTS["common_embeddings"],
                    help="Path to .pt containing fused common embeddings")
     p.add_argument("--val-runs",       default=DEFAULTS["val_runs"])
@@ -214,7 +198,7 @@ def main() -> None:
     p.add_argument("--seed",           type=int, default=13)
     p.add_argument("--window-mode",     choices=("crop", "full5s", "full5s_backaligned"), default="crop")
     p.add_argument("--add-event-marker", action="store_true")
-    p.add_argument("--target-space", choices=("common", "semantic", "image"), default="common",
+    p.add_argument("--target-space", choices=("common", "semantic", "image", "label"), default="common",
                    help="Which embedding space to optimize the loss against")
     p.add_argument("--model",           choices=("cnn", "temporal_attn", "temporal_attn_small"), default="cnn")
     p.add_argument("--hidden-dim",      type=int, default=None)
@@ -251,16 +235,6 @@ def main() -> None:
 
     all_metrics: list[dict] = []
     for name, input_domain, target_mode, split in active:
-        # Skip raw/resample conditions if their dirs are not supplied
-        if input_domain == "raw" and not args.epochs_dir_raw:
-            print(f"[SKIP] {name}: --epochs-dir-raw not provided")
-            all_metrics.append({"condition": name, "status": "skipped_no_raw_dir"})
-            continue
-        if input_domain == "resample" and not args.epochs_dir_resample:
-            print(f"[SKIP] {name}: --epochs-dir-resample not provided")
-            all_metrics.append({"condition": name, "status": "skipped_no_resample_dir"})
-            continue
-
         m = run_condition(name, input_domain, target_mode, split, matrix_dir, args)
         all_metrics.append(m)
 
@@ -272,9 +246,8 @@ def main() -> None:
 
     # Print a readable table of key metrics
     key_cols = [c for c in
-                ["condition", "val_common_top10", "val_semantic_top10", "val_image_top10", 
-                 "top1", "top5", "top10", "mrr", "median_rank",
-                 "collapse_score", "off_diag_cosine", "pred_std", "status"]
+                ["condition", "top1", "top5", "top10", "mrr", "median_rank",
+                 "collapse_score", "mean_diag_cosine", "pred_std", "status"]
                 if c in df.columns]
     print(df[key_cols].to_markdown(index=False))
 

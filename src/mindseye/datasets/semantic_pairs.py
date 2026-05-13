@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
 WindowMode = Literal["crop", "full5s", "full5s_backaligned"]
-TargetSpace = Literal["image", "semantic", "common"]
+TargetSpace = Literal["image", "semantic", "common", "label"]
 
 
 @dataclass(frozen=True)
@@ -66,21 +66,35 @@ class ZunaClipPairDataset(Dataset):
 
         table = torch.load(self.common_embeddings_pt, map_location="cpu")
         
-        self.image_id_to_common = table["image_id_to_common"]
-        self.image_id_to_image = table["image_id_to_image"]
-        self.image_id_to_semantic = table["image_id_to_semantic"]
+        target_key = f"image_id_to_{config.target_space}"
+        if target_key not in table:
+            raise ValueError(f"Target space '{config.target_space}' not found in {self.common_embeddings_pt}")
+            
+        self.image_id_to_target = table[target_key]
+        
+        if "image_id_to_label" in table:
+            self.image_id_to_label = {str(k): F.normalize(v.float(), dim=-1) for k, v in table["image_id_to_label"].items()}
+            # Unique label embeddings for distractors
+            unique_lbls = []
+            seen = set()
+            for lbl_t in self.image_id_to_label.values():
+                key = tuple(lbl_t.round(decimals=4).tolist())
+                if key not in seen:
+                    seen.add(key)
+                    unique_lbls.append(lbl_t)
+            self.all_labels_bank = torch.stack(unique_lbls)
         
         # Pick the embedding dimension from the first item
-        first_key = next(iter(self.image_id_to_common.keys()))
-        self.embedding_dim = self.image_id_to_common[first_key].shape[-1]
+        first_key = next(iter(self.image_id_to_target.keys()))
+        self.embedding_dim = self.image_id_to_target[first_key].shape[-1]
         
         initial_n = len(self.metadata)
         self.metadata["image_id_str"] = self.metadata["image_id"].astype(str)
-        mask = self.metadata["image_id_str"].isin(self.image_id_to_common.keys())
+        mask = self.metadata["image_id_str"].isin(self.image_id_to_target.keys())
         self.metadata = self.metadata[mask].reset_index(drop=True)
         dropped = initial_n - len(self.metadata)
         if dropped > 0:
-            print(f"  [Dataset] Dropped {dropped} samples due to missing CLIP image embeddings "
+            print(f"  [Dataset] Dropped {dropped} samples due to missing target embeddings "
                   f"({len(self.metadata)} remaining)")
 
         self._epoch_offsets = self._add_epoch_offsets(self.metadata)
@@ -218,26 +232,19 @@ class ZunaClipPairDataset(Dataset):
         return x
 
     def audit_target_banks(self) -> dict[str, float]:
-        """Summarize whether common/image/semantic target banks are distinct."""
+        """Summarize whether target bank properties are sane."""
         image_ids = sorted(set(self.metadata["image_id"].astype(str).tolist()))
-        common = torch.stack([F.normalize(self.image_id_to_common[i].float(), dim=-1) for i in image_ids])
-        image = torch.stack([F.normalize(self.image_id_to_image[i].float(), dim=-1) for i in image_ids])
-        semantic = torch.stack([F.normalize(self.image_id_to_semantic[i].float(), dim=-1) for i in image_ids])
+        target = torch.stack([F.normalize(self.image_id_to_target[i].float(), dim=-1) for i in image_ids])
 
-        def stats(a: torch.Tensor, b: torch.Tensor, prefix: str) -> dict[str, float]:
-            cos = (a * b).sum(dim=-1)
-            return {
-                f"{prefix}_mean": float(cos.mean().item()),
-                f"{prefix}_std": float(cos.std(unbiased=False).item()),
-                f"{prefix}_min": float(cos.min().item()),
-                f"{prefix}_max": float(cos.max().item()),
-            }
-
-        out: dict[str, float] = {"target_bank_n": float(len(image_ids))}
-        out.update(stats(common, semantic, "cos_common_semantic"))
-        out.update(stats(common, image, "cos_common_image"))
-        out.update(stats(semantic, image, "cos_semantic_image"))
-        return out
+        cos = (target.unsqueeze(1) * target.unsqueeze(0)).sum(dim=-1)
+        # Exclude diagonal
+        cos_off = cos[~torch.eye(len(image_ids), dtype=torch.bool, device=cos.device)]
+        
+        return {
+            "target_bank_n": float(len(image_ids)),
+            "target_off_diag_mean": float(cos_off.mean().item()),
+            "target_off_diag_std": float(cos_off.std().item()),
+        }
 
     def _build_sameclass_index(self, rng: np.random.Generator) -> None:
         if "synset" not in self.metadata.columns:
@@ -253,38 +260,63 @@ class ZunaClipPairDataset(Dataset):
             pool = [i for i in synset_to_indices[syn] if i != idx]
             self._sameclass_targets.append(int(rng.choice(pool)) if pool else idx)
 
-    def _get_targets(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_targets(self, idx: int) -> torch.Tensor:
         mode = self.config.target_mode
         if mode == "shuffled":
             idx = self._target_perm[idx]
         elif mode == "random":
-            rand_t = self._random_targets[idx]
-            return rand_t, rand_t, rand_t
+            return self._random_targets[idx]
         elif mode == "sameclass":
             idx = self._sameclass_targets[idx]
         
         row = self.metadata.iloc[idx]
         img_id = str(row["image_id"])
         
-        t_common = F.normalize(self.image_id_to_common[img_id], dim=-1)
-        t_image = F.normalize(self.image_id_to_image[img_id], dim=-1)
-        t_semantic = F.normalize(self.image_id_to_semantic[img_id], dim=-1)
-        
-        return t_common, t_image, t_semantic
+        return F.normalize(self.image_id_to_target[img_id].float(), dim=-1)
 
     def __len__(self) -> int:
         return len(self.metadata)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str | int]:
-        t_common, t_image, t_semantic = self._get_targets(idx)
-        return {
+        target = self._get_targets(idx)
+        row = self.metadata.iloc[idx]
+        img_id = str(row["image_id"])
+        
+        ret: dict[str, torch.Tensor | str | int] = {
             "eeg": self._get_eeg(idx),
-            "target_common": t_common,
-            "target_image": t_image,
-            "target_semantic": t_semantic,
-            "image_id": str(self.metadata.iloc[idx]["image_id"]),
+            "target": target,
+            "image_id": img_id,
             "index": int(idx),
         }
+        
+        if hasattr(self, "image_id_to_label"):
+            true_label = self.image_id_to_label[img_id]
+            
+            # Select 15 random distractor labels
+            n_labels = len(self.all_labels_bank)
+            if n_labels > 1:
+                # Get random indices, then filter out the true label (approximate check)
+                rand_indices = torch.randint(0, n_labels, (30,))
+                distractors = []
+                for ri in rand_indices:
+                    cand = self.all_labels_bank[ri]
+                    if (cand - true_label).abs().sum() > 1e-4:
+                        distractors.append(cand)
+                    if len(distractors) == 15:
+                        break
+                
+                # Pad if we couldn't find 15
+                while len(distractors) < 15:
+                    distractors.append(self.all_labels_bank[torch.randint(0, n_labels, (1,)).item()])
+                    
+                distractor_tensor = torch.stack(distractors)
+            else:
+                distractor_tensor = true_label.repeat(15, 1)
+                
+            ret["true_label"] = true_label
+            ret["distractor_labels"] = distractor_tensor
+            
+        return ret
 
 
 def split_indices(n_items: int, *, val_fraction: float = 0.15, seed: int = 13) -> tuple[list[int], list[int]]:
