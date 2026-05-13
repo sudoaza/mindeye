@@ -71,40 +71,25 @@ Describe only visible content. Return JSON only. Use "unclear" when uncertain.
 
 {
   "is_animate": "true | false | unclear",
-  "is_living": "true | false | unclear",
   "human_visible": "true | false | unclear",
   "face_visible": "true | false | unclear",
   "animal_visible": "true | false | unclear",
-  "body_visible": "true | false | unclear",
   "real_world_size": "tiny | small | medium | large | huge | unclear",
-  "scene_dominance": "isolated_object | object_with_background | full_scene | unclear",
   "indoor_outdoor": "indoor | outdoor | mixed | unclear",
   "natural_artificial": "natural | artificial | mixed | unclear",
   "dominant_colors": ["red", "orange", "yellow", "green", "blue", "purple", "pink", "brown", "black", "white", "gray"],
   "main_subject_position_x": "left | center | right | full_frame | unclear",
-  "main_subject_position_y": "top | middle | bottom | full_frame | unclear",
   "subject_scale": "close_up | medium_shot | wide_shot | unclear",
-  "multiple_objects": "true | false | unclear",
-  "background_type": "plain | natural | urban | indoor_room | water | sky | vegetation | mixed | unclear",
   "soft_texture": "true | false | unclear",
-  "hard_surface": "true | false | unclear",
   "spiky_or_pointed": "true | false | unclear",
-  "round_or_curved": "true | false | unclear",
-  "angular_or_geometric": "true | false | unclear",
-  "furry": "true | false | unclear",
-  "smooth": "true | false | unclear",
-  "rough": "true | false | unclear",
-  "glossy": "true | false | unclear",
   "metallic": "true | false | unclear",
-  "manipulable": "true | false | unclear",
+  "furry": "true | false | unclear",
   "tool_like": "true | false | unclear",
   "vehicle_like": "true | false | unclear",
   "food_like": "true | false | unclear",
-  "calm": "true | false | unclear",
-  "threatening": "true | false | unclear",
-  "short_semantic_text": "one concise sentence summarizing the visible semantic content",
   "structured_embedding_text": "compact text listing the most important labels for CLIP embedding"
 }
+
 
 Rules:
 - Be concise. Output only the requested JSON format.
