@@ -118,10 +118,25 @@ def run_condition(
         cmd += ["--epochs-dir-resample", args.epochs_dir_resample]
 
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
-    result = subprocess.run(cmd, env=env, check=False)
+    
+    log_file_path = matrix_dir / "matrix_run.log"
+    with open(log_file_path, "a") as f:
+        # Write the header to the log file as well
+        f.write(f"\n{'='*60}\n")
+        f.write(f"  Condition: {name}  ({input_domain} → {target_mode}, split={split})\n")
+        f.write(f"{'='*60}\n")
+        
+        process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            f.write(line)
+            f.flush()
+        process.wait()
+        returncode = process.returncode
 
-    if result.returncode != 0:
-        print(f"[WARN] Condition {name} exited with code {result.returncode}")
+    if returncode != 0:
+        print(f"[WARN] Condition {name} exited with code {returncode}")
         return {"condition": name, "status": "failed"}
 
     # Locate the newest metrics.json written to matrix_dir
