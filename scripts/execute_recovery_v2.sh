@@ -8,6 +8,10 @@ echo "=== [1/7] Downloading NOD Runs 1-8 ==="
 python scripts/download_nod.py --subject sub-01 --runs 1-8
 
 echo "=== [2/7] Syncing Stimuli from S3 ==="
+python scripts/generate_clip_embeddings.py \
+    --metadata data/raw/nod/derivatives/detailed_events/sub-01_events.csv \
+    --write-openneuro-include-list data/raw/nod/stimuli_include.txt
+
 python scripts/sync_stimuli_s3_targeted.py
 
 echo "=== [3/7] Running ZUNA Batch Pipeline (15 steps) ==="
