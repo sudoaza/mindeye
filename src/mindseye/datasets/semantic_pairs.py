@@ -114,6 +114,11 @@ class ZunaClipPairDataset(Dataset):
             if "anchor_sample" not in self.metadata.columns:
                 raise ValueError("anchor_sample missing from metadata")
             self.eeg_shape = (self.eeg_shape[0], 1280)
+            
+        elif config.window_mode == "tight1s":
+            if self.eeg_shape[-1] not in (307, 308):
+                raise ValueError(f"tight1s requires sample length 307 or 308, got {self.eeg_shape[-1]}")
+            self.eeg_shape = (self.eeg_shape[0], 307)
 
         # Build shuffled / random target index once at init time
         n = len(self.metadata)
@@ -159,6 +164,8 @@ class ZunaClipPairDataset(Dataset):
         
         if self.config.window_mode == "full5s_backaligned":
             eeg = eeg[:, :1280]
+        elif self.config.window_mode == "tight1s":
+            eeg = eeg[:, :307]
         
         if self.config.normalize_eeg:
             mean = eeg.mean(dim=-1, keepdim=True)
