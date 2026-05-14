@@ -4,8 +4,32 @@ set -e
 
 source venv/bin/activate
 
-echo "=== [1/7] Downloading NOD Runs 1-40 ==="
-python scripts/download_nod.py --subject sub-01 --runs 1-40
+REQUESTED_RUNS=40
+AVAILABLE_RUNS=$(python - <<'PY_AVAIL'
+import pandas as pd
+from pathlib import Path
+p = Path("data/raw/nod/derivatives/detailed_events/sub-01_events.csv")
+if not p.exists():
+    print(40)
+else:
+    df = pd.read_csv(p)
+    pairs = df[["session", "run"]].drop_duplicates().sort_values(["session", "run"])
+    print(len(pairs))
+PY_AVAIL
+)
+# The current sub-01 detailed-events file has 32 ImageNet session-runs; still
+# request 40 from OpenNeuro so a future ImageNet05 appears automatically, but
+# train/validate only on runs with event metadata.
+if [ "$AVAILABLE_RUNS" -lt "$REQUESTED_RUNS" ]; then
+  echo "[WARN] Requested $REQUESTED_RUNS global runs, but events metadata exposes only $AVAILABLE_RUNS for sub-01."
+  echo "[WARN] Will attempt download for 1-$REQUESTED_RUNS, then crop/train/evaluate 1-$AVAILABLE_RUNS."
+fi
+RUN_ARGS=$(seq 1 "$AVAILABLE_RUNS")
+VAL_RUN="$AVAILABLE_RUNS"
+
+
+echo "=== [1/7] Downloading NOD global runs 1-$REQUESTED_RUNS ==="
+python scripts/download_nod.py --subject sub-01 --runs 1-$REQUESTED_RUNS
 
 echo "=== [2/7] Syncing Stimuli from S3 ==="
 python scripts/generate_clip_embeddings.py \
@@ -22,7 +46,7 @@ python scripts/run_cropper.py \
   --mode zuna \
   --tmin -0.2 --tmax 1.0 \
   --add-event-marker \
-  --runs $(seq 1 40) \
+  --runs $RUN_ARGS \
   --zuna-dir data/processed/zuna_real/4_fif_output \
   --output-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40
 
@@ -64,7 +88,7 @@ python scripts/train_eeg_clip.py \
   --target-space common \
   --target-mode real \
   --model temporal_attn_small \
-  --val-runs 40 \
+  --val-runs "$VAL_RUN" \
   --epochs 2 \
   --batch-size 16 \
   --device cuda \
@@ -77,7 +101,7 @@ python scripts/run_baseline_matrix.py \
   --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
   --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40 \
   --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
-  --val-runs 40 \
+  --val-runs "$VAL_RUN" \
   --window-mode tight1s \
   --target-space common \
   --model temporal_attn_small \

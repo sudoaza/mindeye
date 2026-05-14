@@ -1,0 +1,83 @@
+{
+  "metadata": "data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv",
+  "epochs_dir": "data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40",
+  "epochs_dir_raw": null,
+  "epochs_dir_resample": null,
+  "common_embeddings": "data/processed/clip_embeddings/common_embeddings.pt",
+  "input_domain": "zuna",
+  "target_mode": "real",
+  "target_space": "common",
+  "w_label": 0.2,
+  "output_dir": "outputs/baseline_matrix/20260514_132502_matrix",
+  "slug": "zuna_real_tight1s_recovery",
+  "window_mode": "tight1s",
+  "add_event_marker": true,
+  "model": "temporal_attn_small",
+  "hidden_dim": null,
+  "n_layers": null,
+  "n_heads": null,
+  "dropout": null,
+  "stem_dropout1d": 0.15,
+  "augment_eeg": true,
+  "aug_channel_dropout": 0.1,
+  "aug_noise_std": 0.03,
+  "aug_amp_scale": 0.1,
+  "aug_time_mask": 24,
+  "aug_time_jitter": 8,
+  "epochs": 50,
+  "batch_size": 64,
+  "lr": 0.0003,
+  "weight_decay": 0.01,
+  "loss": "contrastive",
+  "temperature": 0.07,
+  "split_mode": "run",
+  "val_runs": "32",
+  "val_fraction": 0.15,
+  "seed": 13,
+  "device": null,
+  "dry_run": false,
+  "setup": {
+    "items": 3974,
+    "train_items": 3849,
+    "val_items": 125,
+    "eeg_shape": [
+      63,
+      307
+    ],
+    "embedding_dim": 512,
+    "device": "cuda",
+    "first_forward_shape": [
+      64,
+      512
+    ],
+    "loss": "contrastive",
+    "temperature": 0.07,
+    "split_mode": "run",
+    "val_runs": [
+      32
+    ],
+    "input_domain": "zuna",
+    "target_mode": "real",
+    "window_mode": "tight1s",
+    "target_space": "common",
+    "model": "temporal_attn_small",
+    "hidden_dim": 128,
+    "n_layers": 2,
+    "n_heads": 4,
+    "dropout": 0.35,
+    "stem_dropout1d": 0.15,
+    "augment_eeg": true,
+    "augment_params": {
+      "channel_dropout": 0.1,
+      "noise_std": 0.03,
+      "amp_scale": 0.1,
+      "time_mask": 24,
+      "time_jitter": 8
+    },
+    "target_bank_audit": {
+      "target_bank_n": 3974.0,
+      "target_off_diag_mean": 0.9545738101005554,
+      "target_off_diag_std": 0.008043263107538223
+    }
+  }
+}

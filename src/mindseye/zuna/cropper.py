@@ -27,6 +27,16 @@ import pandas as pd
 
 
 CropMode = Literal["zuna", "raw", "resample"]
+RUNS_PER_SESSION = 8
+
+
+def global_run_to_session_run(run: int) -> tuple[str, int]:
+    """Map global ImageNet run ids to NOD session/local run ids."""
+    if run < 1:
+        raise ValueError(f"Run ids must be 1-based; got {run}")
+    session_idx = ((int(run) - 1) // RUNS_PER_SESSION) + 1
+    local_run = ((int(run) - 1) % RUNS_PER_SESSION) + 1
+    return f"ImageNet{session_idx:02d}", local_run
 
 
 @dataclass(frozen=True)
@@ -332,7 +342,10 @@ def crop_runs(
     }
 
     for run in runs:
-        raw_fif = raw_dir / f"{subject}_ses-{session}_task-ImageNet_run-{run:02d}_eeg_clean.fif"
+        # Treat requested run ids as global ImageNet runs across sessions.
+        # Example: global run 9 is ImageNet02/run-01 on disk and in events.csv.
+        actual_session, local_run = global_run_to_session_run(int(run))
+        raw_fif = raw_dir / f"{subject}_ses-{actual_session}_task-ImageNet_run-{local_run:02d}_eeg_clean.fif"
 
         # Locate source FIF (only needed for zuna mode)
         source_fif: Path | None = None
@@ -341,13 +354,15 @@ def crop_runs(
                 raise ValueError("source_dir required for mode='zuna'")
             # Accept both naming conventions (real vs mock ZUNA output)
             candidates = [
-                source_dir / f"{subject}_ses-{session}_task-ImageNet_run-{run:02d}_eeg_clean.fif",
-                source_dir / f"{subject}_ses-{session}_task-ImageNet_run-{run:02d}_eeg_clean_zuna_mock.fif",
+                source_dir / f"{subject}_ses-{actual_session}_task-ImageNet_run-{local_run:02d}_eeg_clean.fif",
+                source_dir / f"{subject}_ses-{actual_session}_task-ImageNet_run-{local_run:02d}_eeg_clean_zuna_mock.fif",
             ]
             source_fif = next((p for p in candidates if p.exists()), None)
             if source_fif is None:
                 summary["runs"].append({
                     "run": int(run),
+                    "session": actual_session,
+                    "local_run": int(local_run),
                     "status": "missing_zuna_fif",
                     "raw_exists": raw_fif.exists(),
                 })
@@ -356,6 +371,8 @@ def crop_runs(
         if not raw_fif.exists():
             summary["runs"].append({
                 "run": int(run),
+                "session": actual_session,
+                "local_run": int(local_run),
                 "status": "missing_raw_fif",
                 "raw_exists": False,
             })
@@ -365,19 +382,25 @@ def crop_runs(
             raw_fif_path=raw_fif,
             source_fif_path=source_fif,
             events_df=events_df,
-            run=int(run),
+            run=int(local_run),
             output_dir=output_dir,
             subject=subject,
-            session=session,
+            session=actual_session,
             config=config,
         )
         run_meta = pd.read_csv(result.metadata_path)
         run_meta["epoch_file"] = result.fif_path.name
         run_meta["npz_file"] = result.npz_path.name
-        run_meta["run"] = result.run
+        run_meta["session"] = actual_session
+        run_meta["local_run"] = result.run
+        run_meta["global_run"] = int(run)
+        # Keep the canonical training split column as the global run id.
+        run_meta["run"] = int(run)
         all_metadata.append(run_meta)
         summary["runs"].append({
-            "run": result.run,
+            "run": int(run),
+            "session": actual_session,
+            "local_run": result.run,
             "status": "ok",
             "epochs_saved": result.epochs_saved,
             "dropped_out_of_bounds": result.dropped_out_of_bounds,

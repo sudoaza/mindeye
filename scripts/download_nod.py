@@ -15,6 +15,8 @@ import argparse
 from pathlib import Path
 from typing import Iterable
 
+RUNS_PER_SESSION = 8
+
 
 DATASET_ID = "ds005811"
 DEFAULT_SUBJECT = "sub-01"
@@ -41,6 +43,19 @@ def parse_runs(value: str) -> list[int]:
     return sorted(runs)
 
 
+def global_run_to_session_run(run: int, *, base_session: str = "ImageNet") -> tuple[str, int]:
+    """Map 1-based global NOD run ids to ImageNet session/local run ids.
+
+    NOD stores ImageNet runs as 8 local runs per session:
+    global 1..8 -> ImageNet01/run-01..08, 9..16 -> ImageNet02/run-01..08, etc.
+    """
+    if run < 1:
+        raise ValueError(f"Run ids must be 1-based; got {run}")
+    session_idx = ((run - 1) // RUNS_PER_SESSION) + 1
+    local_run = ((run - 1) % RUNS_PER_SESSION) + 1
+    return f"{base_session}{session_idx:02d}", local_run
+
+
 def default_include_patterns(
     *,
     subject: str = DEFAULT_SUBJECT,
@@ -48,12 +63,25 @@ def default_include_patterns(
     runs: Iterable[int] = (1,),
     include_epochs: bool = True,
     include_metadata: bool = True,
+    global_runs: bool = True,
 ) -> list[str]:
-    """Build targeted OpenNeuro include paths for NOD development work."""
-    patterns = [
-        f"derivatives/preprocessed/raw/{subject}_ses-{session}_task-ImageNet_run-{run:02d}_eeg_clean.fif"
-        for run in runs
-    ]
+    """Build targeted OpenNeuro include paths for NOD development work.
+
+    With ``global_runs=True`` (default), run ids are interpreted across sessions
+    rather than as local run ids inside one session. This is required for the
+    recovery script: OpenNeuro paths are ImageNet01/run-01..08,
+    ImageNet02/run-01..08, etc., not ImageNet01/run-01..40.
+    """
+    patterns = []
+    for run in runs:
+        run = int(run)
+        if global_runs:
+            run_session, local_run = global_run_to_session_run(run)
+        else:
+            run_session, local_run = session, run
+        patterns.append(
+            f"derivatives/preprocessed/raw/{subject}_ses-{run_session}_task-ImageNet_run-{local_run:02d}_eeg_clean.fif"
+        )
     if include_epochs:
         patterns.append(f"derivatives/preprocessed/epochs/{subject}_eeg_epo.fif")
     patterns.append(f"derivatives/detailed_events/{subject}_events.csv")
@@ -125,7 +153,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--subject", default=DEFAULT_SUBJECT)
     p.add_argument("--session", default="ImageNet01")
-    p.add_argument("--runs", type=parse_runs, default=parse_runs("1"), help="Run list/range, e.g. `1` or `1-5`")
+    p.add_argument("--runs", type=parse_runs, default=parse_runs("1"), help="Run list/range, e.g. `1` or `1-5`; defaults to global run ids across ImageNet sessions")
+    p.add_argument("--session-local-runs", action="store_true", help="Interpret --runs as local run ids within --session instead of global run ids")
     p.add_argument("--no-epochs", action="store_true", help="Skip the concatenated subject epochs FIF")
     p.add_argument("--no-metadata", action="store_true", help="Skip stimulus/dataset metadata side files")
     p.add_argument(
@@ -144,6 +173,7 @@ def main() -> None:
         runs=args.runs,
         include_epochs=not args.no_epochs,
         include_metadata=not args.no_metadata,
+        global_runs=not args.session_local_runs,
     )
     if args.include_list:
         patterns.extend(read_include_list(args.include_list))

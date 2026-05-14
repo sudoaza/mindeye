@@ -1,44 +1,40 @@
-# Sprint 2 Baseline Matrix Summary
+# Sprint 2 Summary — ZUNA Tight-Window Recovery
 
-## Commit
-Local state (not yet pushed to master)
+Date: 2026-05-14
+Detailed analysis: `docs/SPRINT2_ZUNA_TIGHT1S_RECOVERY_ANALYSIS.md`
+Matrix directory: `outputs/baseline_matrix/20260514_132502_matrix`
 
-## Data
-- **Subject**: sub-01, Session: ImageNet01, Runs: 01–05
-- **ZUNA Crop duration**: 1.25s ([-0.25, 1.0] relative to stim_on)
-- **Validation**: run-heldout (Runs 01–04 train, Run 05 val)
-- **Items**: 495 Train / 123 Val
+## Verdict
 
-## Conditions
-- `raw_runheldout`: Raw EEG (250Hz)
-- `resample_runheldout`: Resampled EEG (256Hz)
-- `zuna_runheldout`: ZUNA Output (256Hz)
-- `zuna_shuffled_labels`: ZUNA + Permuted CLIP targets
-- `zuna_random_targets`: ZUNA + Gaussian random targets
-- `zuna_sameclass`: ZUNA + different image from same synset
+**PASS — proceed to Sprint 3.**
 
-## Gate Result: FAIL ❌
-The ZUNA-real condition did not outperform randomized controls.
+After correcting the global-run/session mapping and scaling to all available event-backed `sub-01` ImageNet runs, `zuna_real` clearly beats both randomized controls.
 
-## Metrics Table (Val set, n=123)
-| Condition | top1 | top5 | top10 | mrr | median_rank | collapse_score | status |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **zuna_runheldout** | **0.000** | **0.041** | **0.081** | **0.042** | **54.0** | **0.428** | ok |
-| raw_runheldout | 0.008 | 0.033 | 0.073 | 0.042 | 62.0 | 0.279 | ok |
-| resample_runheldout | 0.008 | 0.041 | 0.081 | 0.045 | 58.0 | 0.275 | ok |
-| zuna_shuffled_labels | 0.008 | 0.033 | 0.089 | 0.043 | 62.0 | 0.065 | ok |
-| zuna_random_targets | 0.000 | 0.016 | 0.114 | 0.039 | 52.0 | 0.915 | ok |
-| zuna_sameclass | 0.000 | 0.041 | 0.081 | 0.042 | 54.0 | 0.428 | ok |
+## Data note
 
-## Notes & Observations
-- **Retrieval Performance**: The Top-10 accuracy of ~8% is almost exactly the random chance for a 123-item pool (~8.1%). 
-- **ZUNA vs Raw**: ZUNA denoising shows no measurable gain over raw or resampled EEG yet.
-- **Control Mismatch**: `zuna_random_targets` actually showed a higher Top-10 (0.114) than the real condition, which strongly suggests the model is mapping EEG to a generic region of the CLIP hypersphere rather than learning semantic features.
-- **Collapse Score**: `0.428` is healthy (not collapsed), but the `pred_std` is low (~0.012), indicating the model output is quite clustered.
+The script requested global runs `1-40`, but OpenNeuro currently exposes only 32 event-backed `sub-01` ImageNet runs (`ImageNet01`-`ImageNet04`, 8 runs each). `ImageNet05/run-01..08` is absent for `sub-01`, so the valid matrix is a 32-run result, not a true 40-run result.
 
-## Immediate Action: Debugging
-As per Step 4 "Fail condition", we will now investigate:
-1. **Event/Crop Alignment**: Verify `stim_on` annotations are correctly aligned with the actual visual onset.
-2. **CLIP Centering**: Check if subtracting the global CLIP mean or applying stronger normalization to targets helps.
-3. **Architecture**: Consider if a deeper encoder or longer window is needed.
-4. **Data Normalization**: Check the range of ZUNA outputs (std~0.1 is expected; currently we normalize per-crop).
+## Gate metrics
+
+Validation set: held-out global run `32`, `n=125`.
+
+| Condition | Top-1 | Top-5 | Top-10 | MRR | Median rank | Collapse score |
+|---|---:|---:|---:|---:|---:|---:|
+| `zuna_real` | **0.056** | **0.160** | **0.256** | **0.128** | **29** | 4.281 |
+| `zuna_shuffled` | 0.024 | 0.056 | 0.112 | 0.060 | 56 | 4.735 |
+| `zuna_random` | 0.008 | 0.048 | 0.096 | 0.047 | 59 | 0.418 |
+| random expected | 0.008 | 0.040 | 0.080 | n/a | n/a | n/a |
+
+## Gate check
+
+```text
+✅ zuna_real vs zuna_shuffled: Top-10 0.256 vs 0.112, MRR 0.128 vs 0.060
+✅ zuna_real vs zuna_random:   Top-10 0.256 vs 0.096, MRR 0.128 vs 0.047
+✅ collapse_score = 4.281 > 0.1
+
+GATE: PASS
+```
+
+## Immediate next action
+
+Proceed to Sprint 3 low-channel simulation using this full-channel result as the anchor/reference.
