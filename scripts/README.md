@@ -13,7 +13,7 @@ This directory contains the orchestration scripts for the MindEye EEG-to-CLIP pi
 
 ## 3. Multimodal Latent Space
 * `generate_clip_embeddings.py`: Generates canonical 512-dim CLIP embeddings for stimuli images.
-* `generate_image_semantics.py`: Uses a VLM (Qwen2.5-VL) to extract semantic captions from images.
+* `generate_image_semantics.py`: Uses a VLM (Qwen2-VL) to extract semantic captions from images.
 * `generate_text_embeddings.py`: Generates text CLIP embeddings (from captions or ImageNet labels).
 * `build_common_embeddings.py`: Fuses image, semantic, and label signals into a single `z_common` target space using $L_2$ normalization and weighted combinations.
 
@@ -33,11 +33,11 @@ python scripts/sync_stimuli_s3_targeted.py
 python scripts/run_zuna_batch.py --diffusion-steps 15
 python scripts/run_cropper.py \
     --mode zuna \
-    --full5s-backaligned \
+    --tmin -0.2 --tmax 1.0 \
     --add-event-marker \
     --runs 1 2 3 4 5 6 7 8 \
     --zuna-dir data/processed/zuna_real/4_fif_output \
-    --output-dir data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08
+    --output-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08
 
 # 3. Generate Multimodal Latent Space
 python scripts/generate_clip_embeddings.py
@@ -53,11 +53,11 @@ python scripts/build_common_embeddings.py \
 
 # 4. Train Model via Baseline Matrix
 python scripts/run_baseline_matrix.py \
-    --metadata data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08/all_runs_metadata.csv \
-    --epochs-dir data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08 \
+    --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08/all_runs_metadata.csv \
+    --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08 \
     --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
     --val-runs 8 \
-    --window-mode full5s_backaligned \
+    --window-mode tight1s \
     --target-space common \
     --model temporal_attn_small \
     --epochs 50 \
