@@ -286,7 +286,7 @@ class ZunaClipPairDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str | int]:
         target_idx = idx
-        mode = self.split_config.target_mode
+        mode = self.config.target_mode
         if mode == "shuffled":
             target_idx = self._shuffled_targets[idx]
         elif mode == "sameclass":
