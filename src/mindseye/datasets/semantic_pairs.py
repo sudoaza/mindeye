@@ -278,19 +278,32 @@ class ZunaClipPairDataset(Dataset):
         return len(self.metadata)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str | int]:
+        target_idx = idx
+        mode = self.split_config.target_mode
+        if mode == "shuffled":
+            target_idx = self._shuffled_targets[idx]
+        elif mode == "sameclass":
+            target_idx = self._sameclass_targets[idx]
+
+        target_row = self.metadata.iloc[target_idx]
+        target_img_id = str(target_row["image_id"])
+        
         target = self._get_targets(idx)
-        row = self.metadata.iloc[idx]
-        img_id = str(row["image_id"])
         
         ret: dict[str, torch.Tensor | str | int] = {
             "eeg": self._get_eeg(idx),
             "target": target,
-            "image_id": img_id,
+            "image_id": target_img_id,
             "index": int(idx),
         }
         
         if hasattr(self, "image_id_to_label"):
-            true_label = self.image_id_to_label[img_id]
+            if mode == "random":
+                # For random targets, pick a completely random label from the bank
+                rand_idx = torch.randint(0, len(self.all_labels_bank), (1,)).item()
+                true_label = self.all_labels_bank[rand_idx]
+            else:
+                true_label = self.image_id_to_label[target_img_id]
             
             # Select 15 random distractor labels
             n_labels = len(self.all_labels_bank)
