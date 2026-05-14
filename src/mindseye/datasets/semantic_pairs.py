@@ -288,7 +288,7 @@ class ZunaClipPairDataset(Dataset):
         target_idx = idx
         mode = self.config.target_mode
         if mode == "shuffled":
-            target_idx = self._shuffled_targets[idx]
+            target_idx = self._target_perm[idx]
         elif mode == "sameclass":
             target_idx = self._sameclass_targets[idx]
 
