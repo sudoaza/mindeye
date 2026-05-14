@@ -196,7 +196,7 @@ def main() -> None:
     p.add_argument("--slug",           default=None)
     p.add_argument("--device",         default=DEFAULTS["device"])
     p.add_argument("--seed",           type=int, default=13)
-    p.add_argument("--window-mode",     choices=("crop", "full5s", "full5s_backaligned"), default="crop")
+    p.add_argument("--window-mode",     choices=("crop", "full5s", "full5s_backaligned", "tight1s"), default="crop")
     p.add_argument("--add-event-marker", action="store_true")
     p.add_argument("--target-space", choices=("common", "semantic", "image", "label"), default="common",
                    help="Which embedding space to optimize the loss against")

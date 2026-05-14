@@ -78,8 +78,8 @@ def parse_args() -> argparse.Namespace:
                    help="Base output directory. Defaults to outputs/runs/")
     p.add_argument("--slug", default=None,
                    help="Optional slug appended to the run directory name")
-    p.add_argument("--window-mode", choices=("crop", "full5s", "full5s_backaligned"), default="crop",
-                   help="EEG window duration: crop (1.25s) or full5s (5s) or full5s_backaligned (5s)")
+    p.add_argument("--window-mode", choices=("crop", "full5s", "full5s_backaligned", "tight1s"), default="crop",
+                   help="EEG window duration: crop (1.25s) or full5s (5s) or full5s_backaligned (5s) or tight1s (1.2s)")
     p.add_argument("--add-event-marker", action="store_true",
                    help="Add event marker bump as an extra channel to EEG inputs")
     p.add_argument("--model", choices=("cnn", "temporal_attn", "temporal_attn_small"), default="cnn",
