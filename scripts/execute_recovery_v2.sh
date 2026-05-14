@@ -4,8 +4,8 @@ set -e
 
 source venv/bin/activate
 
-echo "=== [1/7] Downloading NOD Runs 1-8 ==="
-python scripts/download_nod.py --subject sub-01 --runs 1-8
+echo "=== [1/7] Downloading NOD Runs 1-40 ==="
+python scripts/download_nod.py --subject sub-01 --runs 1-40
 
 echo "=== [2/7] Syncing Stimuli from S3 ==="
 python scripts/generate_clip_embeddings.py \
@@ -22,9 +22,9 @@ python scripts/run_cropper.py \
   --mode zuna \
   --tmin -0.2 --tmax 1.0 \
   --add-event-marker \
-  --runs 1 2 3 4 5 6 7 8 \
+  --runs $(seq 1 40) \
   --zuna-dir data/processed/zuna_real/4_fif_output \
-  --output-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08
+  --output-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40
 
 echo "=== [5/7] Generating Embeddings ==="
 python scripts/generate_clip_embeddings.py \
@@ -32,7 +32,7 @@ python scripts/generate_clip_embeddings.py \
     --output data/processed/clip_embeddings/sub01_image_embeddings.pt
 
 python scripts/generate_image_semantics.py \
-  --metadata data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08/all_runs_metadata.csv \
+  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
   --image-root data/raw/nod/stimuli/ImageNet \
   --output data/processed/clip_embeddings/image_semantics.jsonl
 
@@ -43,28 +43,28 @@ python scripts/generate_text_embeddings.py \
 
 python scripts/generate_text_embeddings.py \
   --source templates \
-  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08/all_runs_metadata.csv \
+  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
   --output data/processed/clip_embeddings/imagenet_text_embeddings.pt
 
 python scripts/build_common_embeddings.py \
   --image-embeddings data/processed/clip_embeddings/sub01_image_embeddings.pt \
   --semantic-embeddings data/processed/clip_embeddings/image_semantic_text_embeddings.pt \
   --label-embeddings data/processed/clip_embeddings/imagenet_text_embeddings.pt \
-  --metadata data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08/all_runs_metadata.csv \
+  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
   --w-img 0.25 --w-sem 0.75 \
   --output data/processed/clip_embeddings/common_embeddings.pt
 
 echo "=== [6/7] Smoke Test (2 epochs) ==="
 python scripts/train_eeg_clip.py \
-  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08/all_runs_metadata.csv \
-  --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08 \
+  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
+  --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40 \
   --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
   --input-domain zuna \
   --window-mode tight1s \
   --target-space common \
   --target-mode real \
   --model temporal_attn_small \
-  --val-runs 8 \
+  --val-runs 40 \
   --epochs 2 \
   --batch-size 16 \
   --device cuda \
@@ -74,10 +74,10 @@ python scripts/train_eeg_clip.py \
 
 echo "=== [7/7] Launching Full Recovery Matrix ==="
 python scripts/run_baseline_matrix.py \
-  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08/all_runs_metadata.csv \
-  --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08 \
+  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
+  --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40 \
   --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
-  --val-runs 8 \
+  --val-runs 40 \
   --window-mode tight1s \
   --target-space common \
   --model temporal_attn_small \
