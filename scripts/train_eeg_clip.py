@@ -118,6 +118,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None, help="cuda, cpu, or omitted for auto")
     p.add_argument("--dry-run", action="store_true",
                    help="Load data/model and run one forward pass only")
+    p.add_argument("--no-spatial-mixing", action="store_true",
+                   help="Disable early spatial mixing in spatial-temporal encoder")
     args = p.parse_args()
     if args.model in {"temporal_attn_small", "spatial_temporal_small", "spatial_temporal"} and args.weight_decay == 1e-4:
         args.weight_decay = 1e-2
@@ -339,6 +341,7 @@ def main() -> None:
         if args.dropout is not None:
             overrides["dropout"] = args.dropout
         overrides["stem_dropout"] = args.stem_dropout1d
+        overrides["spatial_mixing"] = not args.no_spatial_mixing
         model = build_spatial_temporal_encoder(
             preset,
             n_channels=n_channels,

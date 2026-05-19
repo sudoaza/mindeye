@@ -134,8 +134,13 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 - ✅ Sprint 3: EPOC-14 channel subset masking and baseline matrix comparison.
 - ✅ Validate retrieval robustness to channel loss (ZUNA retains ~74% of full-density signal; ZUNA gain vs raw EPOC-14 is ~0.98x).
 
-### Phase 5: Improve EEG Encoder (Next)
-- [ ] Sprint 4: Implement Spatial-Temporal Coordinate-Aware Encoder.
+### Phase 5: Improve EEG Encoder (Active)
+- [x] Sprint 4: Implement Spatial-Temporal Coordinate-Aware Encoder.
+  - [x] Grouped temporal convolution stem with strided time downsampling (preserving temporal sequence structure).
+  - [x] MNE-based standard 1005 electrode physical 3D coordinate lookup with robust EOG fallbacks.
+  - [x] Coordinate projection MLP to map 3D positions to spatial positional embeddings.
+  - [x] Spatial transformer over channel tokens.
+- [ ] Evaluate coordinate-aware architecture vs baseline temporal_attn on single subject.
 - [ ] Train on multiple subjects to scale performance.
 
 *Do not add diffusion until semantic retrieval beats shuffled baselines.*

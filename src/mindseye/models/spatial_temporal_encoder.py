@@ -119,11 +119,18 @@ class SpatialTemporalEncoder(nn.Module):
         stem_width: int = 8,
         normalize_output: bool = True,
         ch_names: list[str] | None = None,
+        spatial_mixing: bool = True,
     ):
         super().__init__()
         self.n_channels = n_channels
         self.hidden_dim = hidden_dim
         self.normalize_output = normalize_output
+
+        # ── Early spatial filtering (denoising mixing) ────────────────────
+        if spatial_mixing:
+            self.spatial_mix = nn.Conv1d(n_channels, n_channels, kernel_size=1, bias=False)
+        else:
+            self.spatial_mix = None
 
         w = stem_width  # features per channel before projection
 
@@ -243,6 +250,10 @@ class SpatialTemporalEncoder(nn.Module):
         """
         b, c, t = eeg.shape
 
+        # Early spatial filtering (mixing)
+        if self.spatial_mix is not None:
+            eeg = self.spatial_mix(eeg)
+
         # Phase 1: per-channel temporal features
         h = self.temporal_stem(eeg)  # [B, C*w, T']
         h = self.temporal_pool(h)    # [B, C*w, 16]
@@ -289,6 +300,7 @@ def build_spatial_temporal_encoder(
     n_channels: int = 63,
     embedding_dim: int = 512,
     ch_names: list[str] | None = None,
+    spatial_mixing: bool = True,
     **overrides,
 ) -> SpatialTemporalEncoder:
     """Build a SpatialTemporalEncoder with a named preset.
@@ -333,5 +345,6 @@ def build_spatial_temporal_encoder(
         n_channels=n_channels,
         embedding_dim=embedding_dim,
         ch_names=ch_names,
+        spatial_mixing=spatial_mixing,
         **cfg,
     )
