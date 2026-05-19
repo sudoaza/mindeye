@@ -90,35 +90,41 @@ class SpatialTemporalEncoder(nn.Module):
 
         # ── Phase 1: Per-channel temporal feature extraction ──────────────
         # Grouped convolutions keep channels independent.
-        # Each channel goes from 1 → w features across three temporal scales.
+        # Each channel goes from 1 → w features across three temporal scales,
+        # with strided convolutions downsampling the time dimension.
         self.temporal_stem = nn.Sequential(
-            # Fine temporal (kernel=7, ~27ms at 256Hz)
-            nn.Conv1d(n_channels, n_channels * w, kernel_size=7, padding=3,
+            # Fine temporal (kernel=7, stride=2) -> T/2
+            nn.Conv1d(n_channels, n_channels * w, kernel_size=7, stride=2, padding=3,
                       groups=n_channels, bias=False),
             nn.BatchNorm1d(n_channels * w),
             nn.GELU(),
 
-            # Medium temporal (kernel=15, ~59ms)
-            nn.Conv1d(n_channels * w, n_channels * w, kernel_size=15, padding=7,
+            # Medium temporal (kernel=15, stride=2) -> T/4
+            nn.Conv1d(n_channels * w, n_channels * w, kernel_size=15, stride=2, padding=7,
                       groups=n_channels * w, bias=False),
             nn.BatchNorm1d(n_channels * w),
             nn.GELU(),
             nn.Dropout1d(stem_dropout),
 
-            # Wide temporal (kernel=31, ~121ms)
-            nn.Conv1d(n_channels * w, n_channels * w, kernel_size=31, padding=15,
+            # Wide temporal (kernel=31, stride=2) -> T/8
+            nn.Conv1d(n_channels * w, n_channels * w, kernel_size=31, stride=2, padding=15,
                       groups=n_channels * w, bias=False),
             nn.BatchNorm1d(n_channels * w),
             nn.GELU(),
             nn.Dropout1d(stem_dropout),
-
-            # Collapse temporal dimension
-            nn.AdaptiveAvgPool1d(1),  # → [B, C*w, 1]
         )
 
-        # Project per-channel features (w dims) → hidden_dim
+        # We will flatten the time dimension dynamically in forward(),
+        # then project the flattened features to hidden_dim.
+        # Assuming T ≈ 307, T/8 ≈ 39. So input to linear is w * T'
+        # We use a LazyLinear to avoid hardcoding the exact time length,
+        # or we can use an AdaptiveAvgPool1d(16) to ensure a fixed size.
+        # Let's use AdaptiveAvgPool1d(16) before flattening to guarantee size.
+        self.temporal_pool = nn.AdaptiveAvgPool1d(16)
+
+        # Project per-channel features (w * 16 dims) → hidden_dim
         self.channel_proj = nn.Sequential(
-            nn.Linear(w, hidden_dim),
+            nn.Linear(w * 16, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(stem_dropout),
@@ -185,10 +191,17 @@ class SpatialTemporalEncoder(nn.Module):
         b, c, t = eeg.shape
 
         # Phase 1: per-channel temporal features
-        h = self.temporal_stem(eeg)  # [B, C*w, 1]
-        h = h.squeeze(-1)           # [B, C*w]
-        w = h.shape[1] // c
-        h = h.view(b, c, w)         # [B, C, w]
+        h = self.temporal_stem(eeg)  # [B, C*w, T']
+        h = self.temporal_pool(h)    # [B, C*w, 16]
+        w_features = h.shape[1] // c
+        
+        # Reshape to keep channels separate: [B, C, w_features, 16]
+        h = h.view(b, c, w_features, 16)
+        
+        # Flatten time and feature dimensions: [B, C, w_features * 16]
+        h = h.flatten(2)
+        
+        # Project to hidden_dim
         h = self.channel_proj(h)    # [B, C, D]
 
         # Add channel identity
