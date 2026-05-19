@@ -82,8 +82,9 @@ def parse_args() -> argparse.Namespace:
                    help="EEG window duration: crop (1.25s) or full5s (5s) or full5s_backaligned (5s) or tight1s (1.2s)")
     p.add_argument("--add-event-marker", action="store_true",
                    help="Add event marker bump as an extra channel to EEG inputs")
-    p.add_argument("--model", choices=("cnn", "temporal_attn", "temporal_attn_small"), default="cnn",
-                   help="Encoder architecture: cnn (default), temporal_attn, or temporal_attn_small")
+    p.add_argument("--model", choices=("cnn", "temporal_attn", "temporal_attn_small",
+                                       "spatial_temporal", "spatial_temporal_small"), default="cnn",
+                   help="Encoder architecture")
     p.add_argument("--hidden-dim", type=int, default=None,
                    help="Override encoder hidden width")
     p.add_argument("--n-layers", type=int, default=None,
@@ -118,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="Load data/model and run one forward pass only")
     args = p.parse_args()
-    if args.model == "temporal_attn_small" and args.weight_decay == 1e-4:
+    if args.model in {"temporal_attn_small", "spatial_temporal_small", "spatial_temporal"} and args.weight_decay == 1e-4:
         args.weight_decay = 1e-2
     return args
 
@@ -325,7 +326,33 @@ def main() -> None:
     print(f"[Dataset] EEG shape: [{n_channels}, {n_times}]")
     print(f"[Dataset] n_samples: {len(dataset)}")
 
-    if args.model in {"temporal_attn", "temporal_attn_small"}:
+    if args.model in {"spatial_temporal", "spatial_temporal_small"}:
+        from mindseye.models.spatial_temporal_encoder import build_spatial_temporal_encoder
+        preset = "small" if args.model == "spatial_temporal_small" else "medium"
+        overrides = {}
+        if args.hidden_dim is not None:
+            overrides["hidden_dim"] = args.hidden_dim
+        if args.n_layers is not None:
+            overrides["n_layers"] = args.n_layers
+        if args.n_heads is not None:
+            overrides["n_heads"] = args.n_heads
+        if args.dropout is not None:
+            overrides["dropout"] = args.dropout
+        overrides["stem_dropout"] = args.stem_dropout1d
+        model = build_spatial_temporal_encoder(
+            preset,
+            n_channels=n_channels,
+            embedding_dim=dataset.embedding_dim,
+            **overrides,
+        ).to(device)
+        hidden_dim = model.hidden_dim
+        n_layers = len(model.spatial_transformer.layers)
+        n_heads = model.spatial_transformer.layers[0].self_attn.num_heads
+        dropout = args.dropout if args.dropout is not None else (0.35 if preset == "small" else 0.25)
+        model.n_channels = n_channels
+        print(f"[Model] model: {args.model} (preset={preset}) hidden_dim={hidden_dim} "
+              f"n_layers={n_layers} n_heads={n_heads} dropout={dropout}")
+    elif args.model in {"temporal_attn", "temporal_attn_small"}:
         from mindseye.models.eeg_encoder import TemporalAttnEncoder
         if args.model == "temporal_attn_small":
             hidden_dim = args.hidden_dim or 128
