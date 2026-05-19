@@ -51,32 +51,39 @@ python scripts/run_cropper.py \
   --output-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40
 
 echo "=== [5/7] Generating Embeddings ==="
-python scripts/generate_clip_embeddings.py \
-    --metadata data/raw/nod/derivatives/detailed_events/sub-01_events.csv \
-    --output data/processed/clip_embeddings/sub01_image_embeddings.pt
+if [ ! -f "data/processed/clip_embeddings/common_embeddings.pt" ]; then
+  python scripts/generate_clip_embeddings.py \
+      --metadata data/raw/nod/derivatives/detailed_events/sub-01_events.csv \
+      --output data/processed/clip_embeddings/sub01_image_embeddings.pt
 
-python scripts/generate_image_semantics.py \
-  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
-  --image-root data/raw/nod/stimuli/ImageNet \
-  --output data/processed/clip_embeddings/image_semantics.jsonl
+  python scripts/generate_image_semantics.py \
+    --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
+    --image-root data/raw/nod/stimuli/ImageNet \
+    --output data/processed/clip_embeddings/image_semantics.jsonl
 
-python scripts/generate_text_embeddings.py \
-  --source image_semantics \
-  --semantics-jsonl data/processed/clip_embeddings/image_semantics.jsonl \
-  --output data/processed/clip_embeddings/image_semantic_text_embeddings.pt
+  python scripts/generate_text_embeddings.py \
+    --source image_semantics \
+    --semantics-jsonl data/processed/clip_embeddings/image_semantics.jsonl \
+    --output data/processed/clip_embeddings/image_semantic_text_embeddings.pt
 
-python scripts/generate_text_embeddings.py \
-  --source templates \
-  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
-  --output data/processed/clip_embeddings/imagenet_text_embeddings.pt
+  python scripts/generate_text_embeddings.py \
+    --source templates \
+    --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
+    --output data/processed/clip_embeddings/imagenet_text_embeddings.pt
 
-python scripts/build_common_embeddings.py \
-  --image-embeddings data/processed/clip_embeddings/sub01_image_embeddings.pt \
-  --semantic-embeddings data/processed/clip_embeddings/image_semantic_text_embeddings.pt \
-  --label-embeddings data/processed/clip_embeddings/imagenet_text_embeddings.pt \
-  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
-  --w-img 0.25 --w-sem 0.75 \
-  --output data/processed/clip_embeddings/common_embeddings.pt
+  python scripts/build_common_embeddings.py \
+    --image-embeddings data/processed/clip_embeddings/sub01_image_embeddings.pt \
+    --semantic-embeddings data/processed/clip_embeddings/image_semantic_text_embeddings.pt \
+    --label-embeddings data/processed/clip_embeddings/imagenet_text_embeddings.pt \
+    --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
+    --w-img 0.25 --w-sem 0.75 \
+    --output data/processed/clip_embeddings/common_embeddings.pt
+else
+  echo "[SKIP] common_embeddings.pt already exists, skipping regeneration."
+fi
+
+# Re-evaluate the max valid run since the file is now guaranteed to exist
+VAL_RUN=$(python -c "import pandas as pd; df=pd.read_csv('data/raw/nod/derivatives/detailed_events/sub-01_events.csv'); print(df['run'].max())")
 
 echo "=== [6/7] Smoke Test (2 epochs) ==="
 python scripts/train_eeg_clip.py \

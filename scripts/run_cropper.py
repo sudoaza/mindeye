@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir", default=None,
         help="Output directory for NPZ/FIF/metadata",
     )
+    p.add_argument("--raw-dir", default=None, help="Override default raw directory (e.g. for simulated data)")
     p.add_argument("--tmin", type=float, default=-0.25)
     p.add_argument("--tmax", type=float, default=1.0)
     p.add_argument("--full5s", action="store_true",
@@ -104,7 +105,7 @@ def main() -> None:
         print(f"Source dir  : {source_dir}")
 
     summary = crop_runs(
-        raw_dir=data_root / "derivatives/preprocessed/raw",
+        raw_dir=Path(args.raw_dir) if args.raw_dir else data_root / "derivatives/preprocessed/raw",
         source_dir=source_dir,
         events_csv=data_root / "derivatives/detailed_events" / f"{args.subject}_events.csv",
         output_dir=output_dir,

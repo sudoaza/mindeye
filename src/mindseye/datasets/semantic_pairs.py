@@ -59,6 +59,10 @@ class ZunaClipPairDataset(Dataset):
             self.epochs_dir = Path(config.epochs_dir)
 
         self.metadata = pd.read_csv(self.metadata_csv).reset_index(drop=True)
+        if config.input_domain == "raw":
+            self.metadata["npz_file"] = self.metadata["npz_file"].str.replace("_zuna_semantic.npz", "_raw_semantic.npz")
+        elif config.input_domain == "resample":
+            self.metadata["npz_file"] = self.metadata["npz_file"].str.replace("_zuna_semantic.npz", "_resample_semantic.npz")
         required = {"image_id", "npz_file"}
         missing = required - set(self.metadata.columns)
         if missing:
@@ -116,9 +120,11 @@ class ZunaClipPairDataset(Dataset):
             self.eeg_shape = (self.eeg_shape[0], 1280)
             
         elif config.window_mode == "tight1s":
-            if self.eeg_shape[-1] not in (307, 308):
-                raise ValueError(f"tight1s requires sample length 307 or 308, got {self.eeg_shape[-1]}")
-            self.eeg_shape = (self.eeg_shape[0], 307)
+            if self.eeg_shape[-1] not in (301, 302, 307, 308):
+                raise ValueError(f"tight1s requires sample length 301, 302, 307 or 308, got {self.eeg_shape[-1]}")
+            # Standardize length based on the frequency (301 for 250Hz, 307 for 256Hz)
+            target_len = 301 if self.eeg_shape[-1] in (301, 302) else 307
+            self.eeg_shape = (self.eeg_shape[0], target_len)
 
         # Build shuffled / random target index once at init time
         n = len(self.metadata)
@@ -165,7 +171,8 @@ class ZunaClipPairDataset(Dataset):
         if self.config.window_mode == "full5s_backaligned":
             eeg = eeg[:, :1280]
         elif self.config.window_mode == "tight1s":
-            eeg = eeg[:, :307]
+            target_len = 301 if eeg.shape[-1] in (301, 302) else 307
+            eeg = eeg[:, :target_len]
         
         if self.config.normalize_eeg:
             mean = eeg.mean(dim=-1, keepdim=True)

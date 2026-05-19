@@ -52,6 +52,7 @@ def simulate_low_channel_recording(raw_fif_path, target_channels, output_path):
     
     # Create new raw object with masked data
     simulated_raw = mne.io.RawArray(masked_data, raw.info)
+    simulated_raw.set_annotations(raw.annotations)
     
     # Save
     simulated_raw.save(output_path, overwrite=True)

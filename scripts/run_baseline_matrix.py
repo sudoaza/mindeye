@@ -30,6 +30,7 @@ CONDITIONS = [
     ("zuna_real",              "zuna",    "real",      "run"),
     ("zuna_shuffled",          "zuna",    "shuffled",  "run"),
     ("zuna_random",            "zuna",    "random",    "run"),
+    ("raw_real",               "raw",     "real",      "run"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,7 @@ def run_condition(
         str(Path(__file__).parent / "train_eeg_clip.py"),
         "--metadata",       metadata_path,
         "--epochs-dir",     args.epochs_dir,
+        "--epochs-dir-raw", getattr(args, "epochs_dir_raw", ""),
         "--input-domain",   input_domain,
         "--target-mode",    target_mode,
         "--split-mode",     split,
@@ -185,6 +187,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--metadata",       default=DEFAULTS["metadata"])
     p.add_argument("--epochs-dir",     default=DEFAULTS["epochs_dir"])
+    p.add_argument("--epochs-dir-raw", default="")
     p.add_argument("--common-embeddings", default=DEFAULTS["common_embeddings"],
                    help="Path to .pt containing fused common embeddings")
     p.add_argument("--val-runs",       default=DEFAULTS["val_runs"])

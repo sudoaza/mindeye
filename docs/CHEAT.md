@@ -55,10 +55,12 @@ Create a new GPU pod using a specific Docker image and environment variables (li
 
 ## SSH & File Transfer
 
-Use -o StrictHostKeyChecking=no for SSHing into pods.
+Use -o StrictHostKeyChecking=no for SSHing into pods and key named id_ed25519 under ~/.ssh/.
 
 ### Sync Code to Pod
-Quickly sync your local workspace to the pod, ignoring heavy virtual environments. Ensure you use the exact mapped port and Public IP provided by the pod info.
+
+Prefer git clone over rsync. Only rsync as last resort when testing and debugging code changes. When using rsync, make sure to ignore heavy virtual environments, __pycache__ and any data folders. Ensure you use the exact mapped port and Public IP provided by the pod info.
+
 ```bash
 # First, ensure rsync is installed on the pod:
 ssh -p <MAPPED_PORT> root@<PUBLIC_IP> "apt-get update && apt-get install -y rsync"
