@@ -343,6 +343,7 @@ def main() -> None:
             preset,
             n_channels=n_channels,
             embedding_dim=dataset.embedding_dim,
+            ch_names=getattr(dataset, "ch_names", None),
             **overrides,
         ).to(device)
         hidden_dim = model.hidden_dim

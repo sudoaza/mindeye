@@ -110,6 +110,20 @@ class ZunaClipPairDataset(Dataset):
         first = self._get_eeg(0)
         self.eeg_shape = tuple(int(x) for x in first.shape)
 
+        # Load channel names from first NPZ if available
+        self.ch_names = None
+        try:
+            first_npz = self.metadata.iloc[0]["npz_file"]
+            with np.load(self.epochs_dir / first_npz) as f:
+                if "ch_names" in f:
+                    self.ch_names = list(f["ch_names"])
+        except Exception:
+            pass
+
+        if self.ch_names is not None:
+            if config.add_event_marker:
+                self.ch_names = self.ch_names + ["EVENT_MARKER"]
+
         if config.window_mode == "full5s_backaligned":
             if self.eeg_shape[-1] not in (1280, 1281):
                 raise ValueError(f"full5s_backaligned requires sample length 1280 or 1281, got {self.eeg_shape[-1]}")

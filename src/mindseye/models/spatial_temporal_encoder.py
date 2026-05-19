@@ -17,6 +17,44 @@ from torch import nn
 
 
 # ---------------------------------------------------------------------------
+# Helper: Coordinate lookup
+# ---------------------------------------------------------------------------
+
+def get_channel_coordinates(ch_names: list[str]) -> torch.Tensor:
+    """Look up 3D positions for EEG channels using MNE standard 1005 montage."""
+    try:
+        import mne
+        montage = mne.channels.make_standard_montage('standard_1005')
+        ch_pos = montage.get_positions()['ch_pos']
+    except ImportError:
+        ch_pos = {}
+        
+    coords = []
+    for ch in ch_names:
+        # Match case-insensitively
+        match = None
+        for name in ch_pos.keys():
+            if name.lower() == ch.lower():
+                match = name
+                break
+        if match:
+            coords.append(ch_pos[match])
+        else:
+            # Fallback for common non-EEG marker / EOG channels
+            if ch.lower() == 'heo':
+                coords.append([-0.04, 0.08, -0.02])
+            elif ch.lower() == 'veo':
+                coords.append([0.0, 0.08, -0.02])
+            elif ch.lower() == 'event_marker':
+                coords.append([0.0, 0.0, 0.12])  # Place event marker at vertex height + offset
+            else:
+                coords.append([0.0, 0.0, 0.0])
+                
+    import numpy as np
+    return torch.tensor(np.array(coords), dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
 # Building blocks
 # ---------------------------------------------------------------------------
 
@@ -80,6 +118,7 @@ class SpatialTemporalEncoder(nn.Module):
         stem_dropout: float = 0.15,
         stem_width: int = 8,
         normalize_output: bool = True,
+        ch_names: list[str] | None = None,
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -130,10 +169,24 @@ class SpatialTemporalEncoder(nn.Module):
             nn.Dropout(stem_dropout),
         )
 
-        # ── Learnable channel identity embeddings ─────────────────────────
-        self.channel_embed = nn.Parameter(
-            torch.randn(1, n_channels, hidden_dim) * 0.02
-        )
+        # ── Coordinate-aware or Learnable channel embeddings ──────────────
+        if ch_names is not None:
+            # Map channel names to physical 3D coordinates and store as buffer
+            coords = get_channel_coordinates(ch_names) # [C, 3]
+            self.register_buffer("channel_coords", coords)
+            # Project physical 3D coordinates to hidden_dim
+            self.coord_proj = nn.Sequential(
+                nn.Linear(3, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.channel_embed = None
+        else:
+            self.channel_coords = None
+            self.coord_proj = None
+            self.channel_embed = nn.Parameter(
+                torch.randn(1, n_channels, hidden_dim) * 0.02
+            )
 
         # ── Phase 2: Spatial transformer ──────────────────────────────────
         encoder_layer = nn.TransformerEncoderLayer(
@@ -204,8 +257,13 @@ class SpatialTemporalEncoder(nn.Module):
         # Project to hidden_dim
         h = self.channel_proj(h)    # [B, C, D]
 
-        # Add channel identity
-        h = h + self.channel_embed[:, :c, :]
+        # Add physical spatial embeddings or fallback to learnable positional embeddings
+        if self.channel_coords is not None:
+            # self.channel_coords: [C, 3] -> project: [C, D] -> unsqueeze: [1, C, D]
+            pos_emb = self.coord_proj(self.channel_coords[:c])
+            h = h + pos_emb.unsqueeze(0)
+        elif self.channel_embed is not None:
+            h = h + self.channel_embed[:, :c, :]
 
         # Phase 2: spatial attention across channels
         h = self.spatial_transformer(h)  # [B, C, D]
@@ -230,6 +288,7 @@ def build_spatial_temporal_encoder(
     *,
     n_channels: int = 63,
     embedding_dim: int = 512,
+    ch_names: list[str] | None = None,
     **overrides,
 ) -> SpatialTemporalEncoder:
     """Build a SpatialTemporalEncoder with a named preset.
@@ -273,5 +332,6 @@ def build_spatial_temporal_encoder(
     return SpatialTemporalEncoder(
         n_channels=n_channels,
         embedding_dim=embedding_dim,
+        ch_names=ch_names,
         **cfg,
     )
