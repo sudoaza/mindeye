@@ -16,6 +16,10 @@ ATTRIBUTE_SCHEMAS = {
     "natural_artificial": ["natural", "artificial", "mixed"],
     "scene_dominance": ["isolated_object", "object_with_background", "full_scene"],
     "real_world_size": ["tiny", "small", "medium", "large", "huge"],
+    "dominant_color": ["red", "blue", "green", "yellow", "orange", "purple", "pink", "brown", "black", "white", "gray", "multicolor"],
+    "lighting_condition": ["bright_daylight", "indoor_warm", "dim_dark", "high_contrast", "studio_artificial"],
+    "object_presence": ["single_object", "multiple_objects", "no_clear_object"],
+    "contrast_level": ["high", "low"],
 }
 
 IGNORE_INDEX = -100

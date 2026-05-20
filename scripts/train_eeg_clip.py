@@ -243,11 +243,9 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
     with torch.inference_mode():
         for batch in loader:
             batch_data = _batch_to_device(batch, device)
+            pred = model(batch_data["eeg"])
             if attr_model and "attrs" in batch_data:
-                pred, features = model(batch_data["eeg"], return_features=True)
-                a_preds = attr_model(features)
-            else:
-                pred = model(batch_data["eeg"])
+                a_preds = attr_model(pred)
                 
             preds.append(pred.cpu())
             targets.append(batch_data["target"].cpu())
@@ -445,7 +443,7 @@ def main() -> None:
     if args.vlm_attributes:
         from mindseye.models.attribute_heads import MultiTaskAttributeHeads, ATTRIBUTE_SCHEMAS
         attr_model = MultiTaskAttributeHeads(
-            in_features=hidden_dim,
+            in_features=dataset.embedding_dim,
             attributes=list(ATTRIBUTE_SCHEMAS.keys())
         ).to(device)
         print(f"[Model] attr_model: MultiTaskAttributeHeads with {len(ATTRIBUTE_SCHEMAS)} tasks")
@@ -460,11 +458,9 @@ def main() -> None:
     first_batch = next(iter(train_loader))
     batch_data = _batch_to_device(first_batch, device)
     with torch.inference_mode():
+        pred = model(batch_data["eeg"])
         if attr_model is not None:
-            pred, features = model(batch_data["eeg"], return_features=True)
-            attr_pred = attr_model(features)
-        else:
-            pred = model(batch_data["eeg"])
+            attr_pred = attr_model(pred)
 
     setup = {
         "items": len(dataset),
@@ -554,10 +550,7 @@ def main() -> None:
         for batch in train_loader:
             batch_data = _batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
-            if attr_model:
-                pred, features = model(batch_data["eeg"], return_features=True)
-            else:
-                pred = model(batch_data["eeg"])
+            pred = model(batch_data["eeg"])
             
             # Primary contrastive loss
             loss = _loss_fn(pred, batch_data["target"], loss_name=args.loss, temperature=args.temperature)
@@ -566,7 +559,7 @@ def main() -> None:
             if attr_model and "attrs" in batch_data and epoch >= args.aux_start_epoch:
                 import torch.nn.functional as F
                 from mindseye.models.attribute_heads import IGNORE_INDEX
-                attr_preds = attr_model(features)
+                attr_preds = attr_model(pred)
                 
                 # Warmup factor calculation
                 if args.aux_warmup_epochs > 0:
@@ -584,6 +577,10 @@ def main() -> None:
                     "natural_artificial": 0.005,
                     "scene_dominance": 0.005,
                     "real_world_size": 0.005,
+                    "dominant_color": 0.005,
+                    "lighting_condition": 0.005,
+                    "object_presence": 0.005,
+                    "contrast_level": 0.005,
                 }
                 
                 for attr_name, attr_pred in attr_preds.items():

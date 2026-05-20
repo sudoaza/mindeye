@@ -21,7 +21,7 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=4)
     return p.parse_args()
 
-SYSTEM_PROMPT = """You are an expert image annotator. Analyze the image and provide a JSON response describing its semantic attributes based exactly on the provided schema.
+SYSTEM_PROMPT = """You are an expert image annotator. Analyze the image and provide a JSON response describing its semantic and visual attributes based exactly on the provided schema.
 
 Return ONLY a valid JSON object matching this schema:
 {
@@ -32,7 +32,11 @@ Return ONLY a valid JSON object matching this schema:
   "indoor_outdoor": "indoor" | "outdoor" | "mixed" | "unclear",
   "natural_artificial": "natural" | "artificial" | "mixed" | "unclear",
   "scene_dominance": "isolated_object" | "object_with_background" | "full_scene" | "unclear",
-  "real_world_size": "tiny" | "small" | "medium" | "large" | "huge" | "unclear"
+  "real_world_size": "tiny" | "small" | "medium" | "large" | "huge" | "unclear",
+  "dominant_color": "red" | "blue" | "green" | "yellow" | "orange" | "purple" | "pink" | "brown" | "black" | "white" | "gray" | "multicolor" | "unclear",
+  "lighting_condition": "bright_daylight" | "indoor_warm" | "dim_dark" | "high_contrast" | "studio_artificial" | "unclear",
+  "object_presence": "single_object" | "multiple_objects" | "no_clear_object" | "unclear",
+  "contrast_level": "high" | "low" | "unclear"
 }"""
 
 def main():
@@ -145,7 +149,11 @@ def main():
                   "indoor_outdoor": "unclear",
                   "natural_artificial": "unclear",
                   "scene_dominance": "unclear",
-                  "real_world_size": "unclear"
+                  "real_world_size": "unclear",
+                  "dominant_color": "unclear",
+                  "lighting_condition": "unclear",
+                  "object_presence": "unclear",
+                  "contrast_level": "unclear"
                 }
                 
         # Save every chunk to avoid data loss
