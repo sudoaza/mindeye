@@ -98,11 +98,11 @@ def main() -> None:
             epochs_dir_raw=train_config.get("epochs_dir_raw"),
             epochs_dir_resample=train_config.get("epochs_dir_resample"),
             vlm_attributes_json=train_config.get("vlm_attributes"),
-            input_domain=setup.get("input_domain", "zuna"),
-            target_mode=setup.get("target_mode", "real"),
-            window_mode=setup.get("window_mode", "crop"),
-            target_space=setup.get("target_space", "common"),
-            add_event_marker=setup.get("add_event_marker", False),
+            input_domain=train_config.get("input_domain") or setup.get("input_domain", "zuna"),
+            target_mode=train_config.get("target_mode") or setup.get("target_mode", "real"),
+            window_mode=train_config.get("window_mode") or setup.get("window_mode", "crop"),
+            target_space=train_config.get("target_space") or setup.get("target_space", "common"),
+            add_event_marker=train_config.get("add_event_marker", setup.get("add_event_marker", False)),
             augment_eeg=False,
         )
     )
@@ -236,8 +236,43 @@ def main() -> None:
         json.dump(results, f, indent=2)
     print(f"Successfully saved retrieved visual priors to: {output_path}")
     
-    # FAISS Sanity Check Metrics Calculation
-    print("Running retrieval metrics sanity check...")
+    # 1. Validation target bank check (using a temporary FAISS index built on-the-fly)
+    print("\nComputing retrieval metrics against the validation-only target bank...")
+    val_temp_index = FAISSIndex(dimension=dataset.embedding_dim, metric="cosine")
+    val_targets = torch.stack([dataset._get_targets(idx) for idx in val_idx])
+    val_temp_index.add(val_targets, [str(i) for i in range(len(val_idx))])
+    
+    val_distances, val_retrieved_ids = val_temp_index.search(preds, k=len(val_idx))
+    val_ranks = []
+    for i in range(len(preds)):
+        rank = val_retrieved_ids[i].index(str(i))
+        val_ranks.append(rank)
+        
+    val_ranks_t = torch.tensor(val_ranks, dtype=torch.float32)
+    val_top1 = (val_ranks_t < 1).float().mean().item()
+    val_top5 = (val_ranks_t < 5).float().mean().item()
+    val_top10 = (val_ranks_t < 10).float().mean().item()
+    val_mrr = (1.0 / (val_ranks_t + 1.0)).mean().item()
+    val_median_rank = float(val_ranks_t.median().item() + 1)
+    
+    print("\n=== FAISS Validation Bank Metrics (Match Checkpoint) ===")
+    print(f"Top-1:       {val_top1:.6f}")
+    print(f"Top-5:       {val_top5:.6f}")
+    print(f"Top-10:      {val_top10:.6f}")
+    print(f"MRR:         {val_mrr:.6f}")
+    print(f"Median Rank: {val_median_rank}")
+    
+    if "metrics" in checkpoint:
+        ckpt_metrics = checkpoint["metrics"]
+        print("\n=== Checkpoint Logged Metrics ===")
+        print(f"Top-1:       {ckpt_metrics.get('top1', 'N/A')}")
+        print(f"Top-5:       {ckpt_metrics.get('top5', 'N/A')}")
+        print(f"Top-10:      {ckpt_metrics.get('top10', 'N/A')}")
+        print(f"MRR:         {ckpt_metrics.get('mrr', 'N/A')}")
+        print(f"Median Rank: {ckpt_metrics.get('median_rank', 'N/A')}")
+        
+    # 2. General FAISS index check
+    print("\nRunning retrieval metrics sanity check against full FAISS index...")
     distances_full, retrieved_ids_full = index.search(preds, k=len(index.ids))
     
     ranks = []
@@ -258,24 +293,14 @@ def main() -> None:
         mrr = (1.0 / (ranks_t + 1.0)).mean().item()
         median_rank = float(ranks_t.median().item() + 1)
         
-        print("\n=== FAISS Sanity Check Metrics (against Index target bank) ===")
-        print(f"Top-1:  {top1:.6f}")
-        print(f"Top-5:  {top5:.6f}")
-        print(f"Top-10: {top10:.6f}")
-        print(f"MRR:    {mrr:.6f}")
+        print("\n=== FAISS Full Index Retrieval Metrics (All Candidates) ===")
+        print(f"Top-1:       {top1:.6f}")
+        print(f"Top-5:       {top5:.6f}")
+        print(f"Top-10:      {top10:.6f}")
+        print(f"MRR:         {mrr:.6f}")
         print(f"Median Rank: {median_rank}")
-        
-        # Compare with checkpoint metrics if available
-        if "metrics" in checkpoint:
-            ckpt_metrics = checkpoint["metrics"]
-            print("\n=== Checkpoint Logged Metrics ===")
-            print(f"Top-1:  {ckpt_metrics.get('top1', 'N/A')}")
-            print(f"Top-5:  {ckpt_metrics.get('top5', 'N/A')}")
-            print(f"Top-10: {ckpt_metrics.get('top10', 'N/A')}")
-            print(f"MRR:    {ckpt_metrics.get('mrr', 'N/A')}")
-            print(f"Median Rank: {ckpt_metrics.get('median_rank', 'N/A')}")
     else:
-        print(f"\nWarning: Mapped only {found_gt}/{len(ground_truth_ids)} ground truth IDs in FAISS index. Skipping metrics sanity check.")
+        print(f"\nWarning: Mapped only {found_gt}/{len(ground_truth_ids)} ground truth IDs in FAISS index. Skipping full metrics check.")
 
 
 if __name__ == "__main__":
