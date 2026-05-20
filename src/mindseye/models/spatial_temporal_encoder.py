@@ -240,10 +240,11 @@ class SpatialTemporalEncoder(nn.Module):
                     nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------
-    def forward(self, eeg: torch.Tensor) -> torch.Tensor:
+    def forward(self, eeg: torch.Tensor, return_features: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             eeg: ``[B, C, T]`` — batch of EEG tensors (channels × time).
+            return_features: If True, return both predictions and features before projection.
 
         Returns:
             ``[B, embedding_dim]`` — L2-normalised CLIP-space embedding.
@@ -281,12 +282,14 @@ class SpatialTemporalEncoder(nn.Module):
         h = self.post_norm(h)
 
         # Readout
-        h = self.pooler(h)   # [B, D]
-        out = self.head(h)   # [B, embedding_dim]
+        features = self.pooler(h)   # [B, D]
+        out = self.head(features)   # [B, embedding_dim]
 
         if self.normalize_output:
             out = F.normalize(out, dim=-1)
 
+        if return_features:
+            return out, features
         return out
 
 

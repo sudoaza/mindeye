@@ -203,7 +203,7 @@ def main() -> None:
     p.add_argument("--add-event-marker", action="store_true")
     p.add_argument("--target-space", choices=("common", "semantic", "image", "label"), default="common",
                    help="Which embedding space to optimize the loss against")
-    p.add_argument("--model",           choices=("cnn", "temporal_attn", "temporal_attn_small"), default="cnn")
+    p.add_argument("--model",           choices=("cnn", "temporal_attn", "temporal_attn_small", "spatial_temporal", "spatial_temporal_small"), default="cnn")
     p.add_argument("--hidden-dim",      type=int, default=None)
     p.add_argument("--n-layers",        type=int, default=None)
     p.add_argument("--n-heads",         type=int, default=None)

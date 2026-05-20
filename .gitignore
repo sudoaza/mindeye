@@ -11,3 +11,5 @@ data/
 *.pth
 *.fif
 .ipynb_checkpoints/
+outputs/
+*.log

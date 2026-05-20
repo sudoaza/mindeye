@@ -59,11 +59,14 @@ class EEGClipEncoder(nn.Module):
             nn.Linear(hidden_dim, embedding_dim),
         )
 
-    def forward(self, eeg: torch.Tensor) -> torch.Tensor:
-        x = self.net(eeg)
-        x = self.head(x)
+    def forward(self, eeg: torch.Tensor, return_features: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        features = self.net(eeg)
+        features = torch.flatten(features, 1)  # [B, hidden_dim]
+        x = self.head(features)
         if self.normalize_output:
             x = F.normalize(x, dim=-1)
+        if return_features:
+            return x, features
         return x
 
 
