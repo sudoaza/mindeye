@@ -161,6 +161,8 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 ### Phase 8: BatchNorm Cleanup and Subject FiLM Adapters (Complete)
 - [x] Replace remaining BatchNorm1d layers with GroupNorm to prevent cross-channel leakage.
 - [x] Implement subject-specific FiLM scale/shift adapters to handle multi-subject variance without global parameter bloat.
+- [x] Refactor temporal stem to include per-channel pointwise 1x1 convolutions, allowing multi-scale feature mixing within each electrode.
 - [x] Validate model on the 3-condition baseline matrix.
-- [x] Results: Passed all gates with new baseline records (MRR = **0.0861**, Top-1 = **4.0%**, Top-10 = **16.8%**).
+- [x] Results: Passed all gates. Compact `spatial_temporal_small` preset with pointwise mixing, 5e-3 weight decay, and 2e-4 learning rate achieved all-time records: MRR = **0.0873**, Median Rank = **37**, Top-1 = **4.0%**, and a lowest-ever validation loss of **4.646**.
+
 
