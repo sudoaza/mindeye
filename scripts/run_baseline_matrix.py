@@ -89,6 +89,8 @@ def run_condition(
         cmd.append("--add-event-marker")
     if getattr(args, "augment_eeg", False):
         cmd.append("--augment-eeg")
+    if getattr(args, "vlm_attributes", None):
+        cmd.extend(["--vlm-attributes", str(args.vlm_attributes)])
     for arg_name, cli_name in [
         ("hidden_dim", "--hidden-dim"),
         ("n_layers", "--n-layers"),
@@ -215,6 +217,8 @@ def main() -> None:
     p.add_argument("--aug-amp-scale", type=float, default=0.10)
     p.add_argument("--aug-time-mask", type=int, default=24)
     p.add_argument("--aug-time-jitter", type=int, default=8)
+    p.add_argument("--vlm-attributes", default=None,
+                   help="Path to vlm_attributes.json for auxiliary multitask semantic training")
     p.add_argument("--conditions",     nargs="*", default=None,
                    help="Subset of condition names to run (default: all 6)")
     p.add_argument("--dry-run", action="store_true",
