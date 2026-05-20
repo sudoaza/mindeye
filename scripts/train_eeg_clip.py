@@ -653,21 +653,21 @@ def main() -> None:
             best_top10 = float(val["top10"])
             best_collapse_score = float(val["collapse_score"])
             epochs_without_improvement = 0
-            torch.save(
-                {
-                    "model_state": model.state_dict(),
-                    "setup": setup,
-                    "epoch": epoch,
-                    "metrics": row,
-                    "best_selection": {
-                        "score": best_score,
-                        "mrr": best_mrr,
-                        "top10": best_top10,
-                        "collapse_score": best_collapse_score,
-                    },
+            save_dict = {
+                "model_state": model.state_dict(),
+                "setup": setup,
+                "epoch": epoch,
+                "metrics": row,
+                "best_selection": {
+                    "score": best_score,
+                    "mrr": best_mrr,
+                    "top10": best_top10,
+                    "collapse_score": best_collapse_score,
                 },
-                run_dir / "best.pt",
-            )
+            }
+            if attr_model is not None:
+                save_dict["attr_model_state"] = attr_model.state_dict()
+            torch.save(save_dict, run_dir / "best.pt")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.patience:
@@ -677,11 +677,13 @@ def main() -> None:
     # Save final artefacts
     (run_dir / "history.json").write_text(json.dumps(history, indent=2))
 
-    # Compute final val metrics on best checkpoint
-    ckpt = torch.load(run_dir / "best.pt", map_location=device, weights_only=True)
+    ckpt = torch.load(run_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model_state"])
+    if attr_model is not None and "attr_model_state" in ckpt:
+        attr_model.load_state_dict(ckpt["attr_model_state"])
     final_metrics = evaluate(model, val_loader, device, loss_name=args.loss,
-                             temperature=args.temperature, target_space=args.target_space)
+                             temperature=args.temperature, target_space=args.target_space,
+                             attr_model=attr_model)
     final_metrics["best_epoch"] = int(ckpt["epoch"])
     final_metrics["best_score"] = float(best_score)
     final_metrics["best_mrr"] = float(best_mrr) if best_mrr is not None else None
