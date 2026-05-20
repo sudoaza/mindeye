@@ -143,10 +143,6 @@ class SpatialTemporalEncoder(nn.Module):
 
         w = stem_width  # features per channel before projection
 
-        # ── Phase 1: Per-channel temporal feature extraction ──────────────
-        # Grouped convolutions keep channels independent.
-        # Each channel goes from 1 → w features across three temporal scales,
-        # with strided convolutions downsampling the time dimension.
         self.temporal_stem = nn.Sequential(
             # Fine temporal (kernel=7, stride=2) -> T/2
             nn.Conv1d(n_channels, n_channels * w, kernel_size=7, stride=2, padding=3,
@@ -157,6 +153,7 @@ class SpatialTemporalEncoder(nn.Module):
             # Medium temporal (kernel=15, stride=2) -> T/4
             nn.Conv1d(n_channels * w, n_channels * w, kernel_size=15, stride=2, padding=7,
                       groups=n_channels * w, bias=False),
+            nn.Conv1d(n_channels * w, n_channels * w, kernel_size=1, groups=n_channels, bias=False),
             nn.GroupNorm(n_channels, n_channels * w),
             nn.GELU(),
             nn.Dropout1d(stem_dropout),
@@ -164,6 +161,7 @@ class SpatialTemporalEncoder(nn.Module):
             # Wide temporal (kernel=31, stride=2) -> T/8
             nn.Conv1d(n_channels * w, n_channels * w, kernel_size=31, stride=2, padding=15,
                       groups=n_channels * w, bias=False),
+            nn.Conv1d(n_channels * w, n_channels * w, kernel_size=1, groups=n_channels, bias=False),
             nn.GroupNorm(n_channels, n_channels * w),
             nn.GELU(),
             nn.Dropout1d(stem_dropout),

@@ -97,6 +97,7 @@ def run_condition(
         ("n_heads", "--n-heads"),
         ("dropout", "--dropout"),
         ("stem_dropout1d", "--stem-dropout1d"),
+        ("lr", "--lr"),
         ("aug_channel_dropout", "--aug-channel-dropout"),
         ("aug_noise_std", "--aug-noise-std"),
         ("aug_amp_scale", "--aug-amp-scale"),
@@ -211,6 +212,7 @@ def main() -> None:
     p.add_argument("--n-heads",         type=int, default=None)
     p.add_argument("--dropout",         type=float, default=None)
     p.add_argument("--stem-dropout1d",  type=float, default=0.15)
+    p.add_argument("--lr",              type=float, default=None)
     p.add_argument("--augment-eeg",     action="store_true")
     p.add_argument("--aug-channel-dropout", type=float, default=0.10)
     p.add_argument("--aug-noise-std", type=float, default=0.03)
