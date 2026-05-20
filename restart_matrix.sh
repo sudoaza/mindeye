@@ -1,12 +1,7 @@
 #!/bin/bash
 ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 -p 33396 root@157.157.221.29 '
 cd /workspace/mindeye
-git init
-git remote add origin git@github.com:sudoaza/mindeye.git
-git config user.email "agent@example.com"
-git config user.name "Agent"
-git add .
-git commit -m "sync from local" || true
+# Sync from local is already done via rsync
 
 # Kill the currently running baseline matrix script
 pkill -f "python scripts/run_baseline_matrix.py" || true
@@ -16,7 +11,7 @@ export PYTHONPATH=src
 nohup python scripts/run_baseline_matrix.py \
   --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
   --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40 \
-  --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
+  --common-embeddings data/processed/clip_embeddings/combined_common_embeddings.pt \
   --val-runs 32 \
   --window-mode tight1s \
   --target-space common \
