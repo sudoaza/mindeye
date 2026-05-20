@@ -203,7 +203,11 @@ def main() -> None:
     with torch.no_grad():
         for batch in val_loader:
             eeg = batch["eeg"].to(device).float()
-            pred = model(eeg)
+            subject_id = batch.get("subject_id", None)
+            if subject_id is not None:
+                subject_id = subject_id.to(device)
+            kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+            pred = model(eeg, **kwargs)
             if isinstance(pred, tuple):
                 pred = pred[0]
             preds.append(pred.cpu())

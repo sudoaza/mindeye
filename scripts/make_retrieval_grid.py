@@ -128,7 +128,12 @@ def main() -> None:
     batch = next(iter(loader))
     eeg = batch["eeg"].to(device).float()
     with torch.inference_mode():
-        pred = F.normalize(model(eeg), dim=-1).cpu()
+        subject_id = batch.get("subject_id", None)
+        if subject_id is not None:
+            subject_id = subject_id.to(device)
+        kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+        
+        pred = F.normalize(model(eeg, **kwargs), dim=-1).cpu()
 
     table = torch.load(args.clip_embeddings, map_location="cpu")
     bank_raw = table["embedding"].float()

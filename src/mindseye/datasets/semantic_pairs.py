@@ -140,6 +140,13 @@ class ZunaClipPairDataset(Dataset):
             print(f"  [Dataset] Dropped {dropped} samples due to missing target embeddings "
                   f"({len(self.metadata)} remaining)")
 
+        if "subject" in self.metadata.columns:
+            self.unique_subjects = sorted(self.metadata["subject"].astype(str).unique().tolist())
+            self.subject_to_id = {sub: i for i, sub in enumerate(self.unique_subjects)}
+        else:
+            self.unique_subjects = ["unknown"]
+            self.subject_to_id = {"unknown": 0}
+
         self._epoch_offsets = self._add_epoch_offsets(self.metadata)
         self._npz_cache: dict[tuple[str, str], np.ndarray] = {}
         if config.preload_npz:
@@ -366,11 +373,15 @@ class ZunaClipPairDataset(Dataset):
         
         target = self._get_targets(idx)
         
+        subject_str = str(target_row["subject"]) if "subject" in target_row else "unknown"
+        subject_id = self.subject_to_id.get(subject_str, 0)
+        
         ret: dict[str, torch.Tensor | str | int | dict] = {
             "eeg": self._get_eeg(idx),
             "target": target,
             "image_id": target_img_id,
             "index": int(idx),
+            "subject_id": int(subject_id),
         }
         
         if hasattr(self, "vlm_attributes") and self.vlm_attributes:

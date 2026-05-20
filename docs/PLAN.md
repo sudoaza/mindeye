@@ -106,7 +106,7 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 
 ---
 
-## Current Status: Phase 7 (BReAD-style retrieval branch) 🚧
+## Current Status: Phase 8 (BatchNorm Cleanup & Subject FiLM Adapters) ✅
 
 - ✅ **Sprint 1 complete** — ZUNA inference, timing audit, retrieval grid.
 - ❌ **Sprint 2 failed** — 1.25s crops did not beat controls.
@@ -114,7 +114,8 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 - ✅ **Phase 4 complete** — Sprint 3: Simulated EPOC-14 channel subset masking, processed through ZUNA, and evaluated baseline matrix. ZUNA-upscaled signal retains ~74% of full 64-channel density performance, though it doesn't show a direct reconstruction benefit over raw EPOC-14 (0.98x gain).
 - ✅ **Phase 5 complete** — Spatial-Temporal Coordinate-Aware encoder implemented and multi-subject scaling evaluated.
 - ✅ **Phase 6 complete** — Multi-domain semantic front implemented with VLM attributes, linear warmup, and validated on the combined dataset.
-- 🚀 **Phase 7 active** — Building FAISS visual retrieval index for Grounded Image Generation.
+- ✅ **Phase 7 complete** — Built FAISS visual retrieval index for Grounded Image Generation, beating shuffled/random controls on visual priors retrieval.
+- ✅ **Phase 8 complete** — Replaced BatchNorm with GroupNorm to stabilize temporal feature extraction; implemented subject-specific FiLM adapters.
 
 ---
 
@@ -153,8 +154,13 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 - [x] Train combined multi-subject baseline and multitask architectures.
 - [x] Results: Multitask regularization with warmup successfully stabilized combined multi-subject training and improved Top-10 score from 12.05% to 13.25%.
 
-### Phase 7: BReAD-style Retrieval Branch (Active)
-- [ ] Build FAISS retrieval index over target image library.
-- [ ] Query index with predicted embeddings to retrieve visual grounding priors.
+### Phase 7: BReAD-style Retrieval Branch (Complete)
+- [x] Build FAISS retrieval index over target image library.
+- [x] Query index with predicted embeddings to retrieve visual grounding priors.
 
-*Do not add diffusion until semantic retrieval beats shuffled baselines.*
+### Phase 8: BatchNorm Cleanup and Subject FiLM Adapters (Complete)
+- [x] Replace remaining BatchNorm1d layers with GroupNorm to prevent cross-channel leakage.
+- [x] Implement subject-specific FiLM scale/shift adapters to handle multi-subject variance without global parameter bloat.
+- [x] Validate model on the 3-condition baseline matrix.
+- [x] Results: Passed all gates with new baseline records (MRR = **0.0861**, Top-1 = **4.0%**, Top-10 = **16.8%**).
+

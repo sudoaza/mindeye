@@ -120,11 +120,20 @@ class SpatialTemporalEncoder(nn.Module):
         normalize_output: bool = True,
         ch_names: list[str] | None = None,
         spatial_mixing: bool = True,
+        num_subjects: int = 1,
     ):
         super().__init__()
         self.n_channels = n_channels
         self.hidden_dim = hidden_dim
         self.normalize_output = normalize_output
+        self.num_subjects = num_subjects
+
+        if num_subjects > 1:
+            self.subject_embed = nn.Embedding(num_subjects, hidden_dim * 2)
+            # init to 0 so it starts as identity (scale=1, shift=0)
+            nn.init.zeros_(self.subject_embed.weight)
+        else:
+            self.subject_embed = None
 
         # ── Early spatial filtering (denoising mixing) ────────────────────
         if spatial_mixing:
@@ -142,20 +151,20 @@ class SpatialTemporalEncoder(nn.Module):
             # Fine temporal (kernel=7, stride=2) -> T/2
             nn.Conv1d(n_channels, n_channels * w, kernel_size=7, stride=2, padding=3,
                       groups=n_channels, bias=False),
-            nn.BatchNorm1d(n_channels * w),
+            nn.GroupNorm(n_channels, n_channels * w),
             nn.GELU(),
 
             # Medium temporal (kernel=15, stride=2) -> T/4
             nn.Conv1d(n_channels * w, n_channels * w, kernel_size=15, stride=2, padding=7,
                       groups=n_channels * w, bias=False),
-            nn.BatchNorm1d(n_channels * w),
+            nn.GroupNorm(n_channels, n_channels * w),
             nn.GELU(),
             nn.Dropout1d(stem_dropout),
 
             # Wide temporal (kernel=31, stride=2) -> T/8
             nn.Conv1d(n_channels * w, n_channels * w, kernel_size=31, stride=2, padding=15,
                       groups=n_channels * w, bias=False),
-            nn.BatchNorm1d(n_channels * w),
+            nn.GroupNorm(n_channels, n_channels * w),
             nn.GELU(),
             nn.Dropout1d(stem_dropout),
         )
@@ -233,14 +242,14 @@ class SpatialTemporalEncoder(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
+            elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
                 if m.weight is not None:
                     nn.init.ones_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------
-    def forward(self, eeg: torch.Tensor, return_features: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, eeg: torch.Tensor, subject_id: torch.Tensor | None = None, return_features: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             eeg: ``[B, C, T]`` — batch of EEG tensors (channels × time).
@@ -268,6 +277,13 @@ class SpatialTemporalEncoder(nn.Module):
         
         # Project to hidden_dim
         h = self.channel_proj(h)    # [B, C, D]
+
+        # Apply subject adapter via FiLM if provided
+        if self.subject_embed is not None and subject_id is not None:
+            film_params = self.subject_embed(subject_id) # [B, D*2]
+            gamma, beta = film_params.chunk(2, dim=-1) # [B, D] each
+            # h is [B, C, D], so we unsqueeze to [B, 1, D]
+            h = h * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
 
         # Add physical spatial embeddings or fallback to learnable positional embeddings
         if self.channel_coords is not None:
@@ -349,5 +365,6 @@ def build_spatial_temporal_encoder(
         embedding_dim=embedding_dim,
         ch_names=ch_names,
         spatial_mixing=spatial_mixing,
+        num_subjects=cfg.pop("num_subjects", 1),
         **cfg,
     )

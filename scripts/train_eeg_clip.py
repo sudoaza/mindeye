@@ -243,7 +243,9 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
     with torch.inference_mode():
         for batch in loader:
             batch_data = _batch_to_device(batch, device)
-            pred = model(batch_data["eeg"])
+            subject_id = batch_data.get("subject_id", None)
+            kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+            pred = model(batch_data["eeg"], **kwargs)
             if attr_model and "attrs" in batch_data:
                 a_preds = attr_model(pred)
                 
@@ -388,6 +390,7 @@ def main() -> None:
             n_channels=n_channels,
             embedding_dim=dataset.embedding_dim,
             ch_names=getattr(dataset, "ch_names", None),
+            num_subjects=len(getattr(dataset, "unique_subjects", ["unknown"])),
             **overrides,
         ).to(device)
         hidden_dim = model.hidden_dim
@@ -458,7 +461,9 @@ def main() -> None:
     first_batch = next(iter(train_loader))
     batch_data = _batch_to_device(first_batch, device)
     with torch.inference_mode():
-        pred = model(batch_data["eeg"])
+        subject_id = batch_data.get("subject_id", None)
+        kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+        pred = model(batch_data["eeg"], **kwargs)
         if attr_model is not None:
             attr_pred = attr_model(pred)
 
@@ -550,7 +555,9 @@ def main() -> None:
         for batch in train_loader:
             batch_data = _batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
-            pred = model(batch_data["eeg"])
+            subject_id = batch_data.get("subject_id", None)
+            kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+            pred = model(batch_data["eeg"], **kwargs)
             
             # Primary contrastive loss
             loss = _loss_fn(pred, batch_data["target"], loss_name=args.loss, temperature=args.temperature)
