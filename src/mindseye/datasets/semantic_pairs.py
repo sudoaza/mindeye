@@ -22,6 +22,7 @@ class SemanticPairConfig:
     metadata_csv: str | Path
     epochs_dir: str | Path
     common_embeddings_pt: str | Path
+    vlm_attributes_json: str | Path | None = None
     normalize_eeg: bool = True
     preload_npz: bool = True
     target_mode: TargetMode = "real"
@@ -69,6 +70,12 @@ class ZunaClipPairDataset(Dataset):
             raise ValueError(f"Metadata missing required columns: {sorted(missing)}")
 
         table = torch.load(self.common_embeddings_pt, map_location="cpu")
+        
+        self.vlm_attributes = {}
+        if config.vlm_attributes_json is not None:
+            import json
+            with open(config.vlm_attributes_json, "r") as f:
+                self.vlm_attributes = json.load(f)
         
         target_key = f"image_id_to_{config.target_space}"
         if target_key not in table:
@@ -318,12 +325,21 @@ class ZunaClipPairDataset(Dataset):
         
         target = self._get_targets(idx)
         
-        ret: dict[str, torch.Tensor | str | int] = {
+        ret: dict[str, torch.Tensor | str | int | dict] = {
             "eeg": self._get_eeg(idx),
             "target": target,
             "image_id": target_img_id,
             "index": int(idx),
         }
+        
+        if hasattr(self, "vlm_attributes") and self.vlm_attributes:
+            from mindseye.models.attribute_heads import MultiTaskAttributeHeads, ATTRIBUTE_SCHEMAS
+            attrs_dict = {}
+            img_attrs = self.vlm_attributes.get(target_img_id, {})
+            for attr in ATTRIBUTE_SCHEMAS.keys():
+                val = img_attrs.get(attr, "unclear")
+                attrs_dict[attr] = MultiTaskAttributeHeads.encode_label(attr, val)
+            ret["attrs"] = attrs_dict
         
         if hasattr(self, "image_id_to_label"):
             if mode == "random":

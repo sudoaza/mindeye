@@ -127,7 +127,7 @@ class TemporalAttnEncoder(nn.Module):
         self.pooler = AttentionPooler(hidden_dim, heads=n_heads)
         self.head = nn.Linear(hidden_dim, embedding_dim)
 
-    def forward(self, eeg: torch.Tensor) -> torch.Tensor:
+    def forward(self, eeg: torch.Tensor, return_features: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # eeg: [B, C, T]
         x = self.stem(eeg)  # [B, D, T']
         x = x.transpose(1, 2)  # [B, T', D]
@@ -138,10 +138,13 @@ class TemporalAttnEncoder(nn.Module):
         x = x + self.pos_embed[:, :t, :]
 
         x = self.transformer(x)
-        x = self.pooler(x)
-        x = self.head(x)
+        features = self.pooler(x)
+        x = self.head(features)
         if self.normalize_output:
             x = F.normalize(x, dim=-1)
+            
+        if return_features:
+            return x, features
         return x
 
 

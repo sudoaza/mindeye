@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
                    help="Load data/model and run one forward pass only")
     p.add_argument("--no-spatial-mixing", action="store_true",
                    help="Disable early spatial mixing in spatial-temporal encoder")
+    p.add_argument("--vlm-attributes", default=None,
+                   help="Optional path to vlm_attributes.json for auxiliary multitask semantic training")
+    p.add_argument("--patience", type=int, default=15,
+                   help="Number of epochs without improvement before early stopping (autostop)")
+    p.add_argument("--aux-start-epoch", type=int, default=1,
+                   help="Epoch to start applying auxiliary multitask loss (for delayed starts)")
     args = p.parse_args()
     if args.model in {"temporal_attn_small", "spatial_temporal_small", "spatial_temporal"} and args.weight_decay == 1e-4:
         args.weight_decay = 1e-2
@@ -159,6 +165,8 @@ def _batch_to_device(
     if "true_label" in batch:
         ret["true_label"] = batch["true_label"].to(device).float()
         ret["distractor_labels"] = batch["distractor_labels"].to(device).float()
+    if "attrs" in batch:
+        ret["attrs"] = {k: v.to(device).long() for k, v in batch["attrs"].items()}
     return ret
 
 
@@ -216,17 +224,33 @@ def _save_env(run_dir: Path, args: argparse.Namespace, setup: dict) -> None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str) -> dict[str, float]:
+def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str, attr_model=None) -> dict[str, float]:
     from mindseye.models.eeg_encoder import retrieval_topk
     import torch
     model.eval()
+    if attr_model:
+        attr_model.eval()
     preds, targets = [], []
+    attr_preds_dict = {}
+    attr_targets_dict = {}
+    
     with torch.inference_mode():
         for batch in loader:
             batch_data = _batch_to_device(batch, device)
-            pred = model(batch_data["eeg"])
+            if attr_model and "attrs" in batch_data:
+                pred, features = model(batch_data["eeg"], return_features=True)
+                a_preds = attr_model(features)
+            else:
+                pred = model(batch_data["eeg"])
+                
             preds.append(pred.cpu())
             targets.append(batch_data["target"].cpu())
+            
+            if attr_model and "attrs" in batch_data:
+                for k, v in a_preds.items():
+                    attr_preds_dict.setdefault(k, []).append(v.cpu())
+                for k, v in batch_data["attrs"].items():
+                    attr_targets_dict.setdefault(k, []).append(v.cpu())
 
     pred_t = torch.cat(preds)
     target_t = torch.cat(targets)
@@ -254,6 +278,18 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
     n = metrics["n"]
     for k in (1, 5, 10):
         metrics[f"random_top{k}_expected"] = min(k, n) / n
+        
+    if attr_model and attr_preds_dict:
+        from mindseye.models.attribute_heads import IGNORE_INDEX
+        for attr in attr_preds_dict.keys():
+            ap = torch.cat(attr_preds_dict[attr])
+            at = torch.cat(attr_targets_dict[attr])
+            mask = at != IGNORE_INDEX
+            if mask.any():
+                acc = (ap.argmax(dim=-1)[mask] == at[mask]).float().mean().item()
+                metrics[f"attr_{attr}_acc"] = acc
+            else:
+                metrics[f"attr_{attr}_acc"] = 0.0
 
     return metrics
 
@@ -283,6 +319,7 @@ def main() -> None:
             epochs_dir_raw=args.epochs_dir_raw,
             epochs_dir_resample=args.epochs_dir_resample,
             common_embeddings_pt=args.common_embeddings,
+            vlm_attributes_json=args.vlm_attributes,
             input_domain=args.input_domain,
             target_mode=args.target_mode,
             window_mode=args.window_mode,
@@ -398,13 +435,30 @@ def main() -> None:
     if getattr(model, "n_channels", n_channels) != n_channels:
         raise ValueError(f"model.n_channels != dataset_eeg_channels")
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    attr_model = None
+    if args.vlm_attributes:
+        from mindseye.models.attribute_heads import MultiTaskAttributeHeads, ATTRIBUTE_SCHEMAS
+        attr_model = MultiTaskAttributeHeads(
+            in_features=hidden_dim,
+            attributes=list(ATTRIBUTE_SCHEMAS.keys())
+        ).to(device)
+        print(f"[Model] attr_model: MultiTaskAttributeHeads with {len(ATTRIBUTE_SCHEMAS)} tasks")
+        
+    opt_params = list(model.parameters())
+    if attr_model is not None:
+        opt_params += list(attr_model.parameters())
+        
+    optimizer = torch.optim.AdamW(opt_params, lr=args.lr, weight_decay=args.weight_decay)
 
     # Quick forward pass to verify shapes
     first_batch = next(iter(train_loader))
     batch_data = _batch_to_device(first_batch, device)
     with torch.inference_mode():
-        pred = model(batch_data["eeg"])
+        if attr_model is not None:
+            pred, features = model(batch_data["eeg"], return_features=True)
+            attr_pred = attr_model(features)
+        else:
+            pred = model(batch_data["eeg"])
 
     setup = {
         "items": len(dataset),
@@ -454,26 +508,61 @@ def main() -> None:
     best_mrr = None
     best_top10 = None
     best_collapse_score = None
+    epochs_without_improvement = 0
     history: list[dict] = []
 
     import csv
     log_path = run_dir / "train_log.csv"
     log_fields = ["epoch", "train_loss", "val_loss", "val_score",
                   "top1", "top5", "top10", "mrr", "median_rank", "mean_diag_cosine", "collapse_score"]
+                  
+    if attr_model:
+        from mindseye.models.attribute_heads import ATTRIBUTE_SCHEMAS
+        for attr in ATTRIBUTE_SCHEMAS.keys():
+            log_fields.append(f"attr_{attr}_acc")
 
     with open(log_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=log_fields).writeheader()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if attr_model:
+            attr_model.train()
         train_losses: list[float] = []
         for batch in train_loader:
             batch_data = _batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
-            pred = model(batch_data["eeg"])
+            if attr_model:
+                pred, features = model(batch_data["eeg"], return_features=True)
+            else:
+                pred = model(batch_data["eeg"])
             
             # Primary contrastive loss
             loss = _loss_fn(pred, batch_data["target"], loss_name=args.loss, temperature=args.temperature)
+            
+            # Auxiliary semantic attribute loss
+            if attr_model and "attrs" in batch_data and epoch >= args.aux_start_epoch:
+                import torch.nn.functional as F
+                from mindseye.models.attribute_heads import IGNORE_INDEX
+                attr_preds = attr_model(features)
+                
+                # Attribute weights
+                attr_weights = {
+                    "is_animate": 0.02,
+                    "human_visible": 0.02,
+                    "face_visible": 0.02,
+                    "animal_visible": 0.02,
+                    "indoor_outdoor": 0.02,
+                    "natural_artificial": 0.02,
+                    "scene_dominance": 0.02,
+                    "real_world_size": 0.02,
+                }
+                
+                for attr_name, attr_pred in attr_preds.items():
+                    attr_target = batch_data["attrs"][attr_name]
+                    # Compute cross entropy, ignoring IGNORE_INDEX (-100)
+                    w = attr_weights.get(attr_name, 0.05)
+                    loss += w * F.cross_entropy(attr_pred, attr_target, ignore_index=IGNORE_INDEX)
             
             # Auxiliary multi-choice classification loss
             if "true_label" in batch_data and args.w_label > 0:
@@ -504,7 +593,7 @@ def main() -> None:
             train_losses.append(float(loss.item()))
 
         val = evaluate(model, val_loader, device, loss_name=args.loss,
-                       temperature=args.temperature, target_space=args.target_space)
+                       temperature=args.temperature, target_space=args.target_space, attr_model=attr_model)
         score = float(val["mrr"] + 0.25 * val["top10"])
         if val["collapse_score"] < 0.1:
             score = -1.0
@@ -521,6 +610,10 @@ def main() -> None:
             "mean_diag_cosine": val["mean_diag_cosine"],
             "collapse_score": val["collapse_score"]
         }
+        for k, v in val.items():
+            if k.startswith("attr_"):
+                row[k] = v
+                
         history.append(row)
         print(json.dumps(row))
 
@@ -534,6 +627,7 @@ def main() -> None:
             best_mrr = float(val["mrr"])
             best_top10 = float(val["top10"])
             best_collapse_score = float(val["collapse_score"])
+            epochs_without_improvement = 0
             torch.save(
                 {
                     "model_state": model.state_dict(),
@@ -549,6 +643,11 @@ def main() -> None:
                 },
                 run_dir / "best.pt",
             )
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= args.patience:
+                print(f"Early stopping triggered after {epoch} epochs (no improvement for {args.patience} epochs).")
+                break
 
     # Save final artefacts
     (run_dir / "history.json").write_text(json.dumps(history, indent=2))
