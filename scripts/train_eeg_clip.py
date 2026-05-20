@@ -126,6 +126,12 @@ def parse_args() -> argparse.Namespace:
                    help="Number of epochs without improvement before early stopping (autostop)")
     p.add_argument("--aux-start-epoch", type=int, default=1,
                    help="Epoch to start applying auxiliary multitask loss (for delayed starts)")
+    p.add_argument("--aux-warmup-epochs", type=int, default=20,
+                   help="Number of epochs to linearly warmup the auxiliary multitask weights (ramps from 0 to 1)")
+    p.add_argument("--warmup-epochs", type=int, default=5,
+                   help="Number of epochs to warmup learning rate")
+    p.add_argument("--min-lr", type=float, default=1e-6,
+                   help="Minimum learning rate for cosine annealing")
     args = p.parse_args()
     if args.model in {"temporal_attn_small", "spatial_temporal_small", "spatial_temporal"} and args.weight_decay == 1e-4:
         args.weight_decay = 1e-2
@@ -525,6 +531,22 @@ def main() -> None:
         csv.DictWriter(f, fieldnames=log_fields).writeheader()
 
     for epoch in range(1, args.epochs + 1):
+        # Adjust learning rate with linear warmup + cosine annealing
+        import math
+        if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
+            lr = args.lr * epoch / args.warmup_epochs
+        else:
+            total_decay_epochs = max(1, args.epochs - args.warmup_epochs)
+            progress = (epoch - args.warmup_epochs - 1) / total_decay_epochs
+            # Clamp progress between 0 and 1
+            progress = max(0.0, min(1.0, progress))
+            lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + math.cos(math.pi * progress))
+        
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+            
+        print(f"\n--- Epoch {epoch}/{args.epochs} (Learning Rate: {lr:.6f}) ---")
+        
         model.train()
         if attr_model:
             attr_model.train()
@@ -546,22 +568,28 @@ def main() -> None:
                 from mindseye.models.attribute_heads import IGNORE_INDEX
                 attr_preds = attr_model(features)
                 
+                # Warmup factor calculation
+                if args.aux_warmup_epochs > 0:
+                    warmup_factor = min(1.0, (epoch - args.aux_start_epoch + 1) / args.aux_warmup_epochs)
+                else:
+                    warmup_factor = 1.0
+                
                 # Attribute weights
                 attr_weights = {
-                    "is_animate": 0.02,
-                    "human_visible": 0.02,
-                    "face_visible": 0.02,
-                    "animal_visible": 0.02,
-                    "indoor_outdoor": 0.02,
-                    "natural_artificial": 0.02,
-                    "scene_dominance": 0.02,
-                    "real_world_size": 0.02,
+                    "is_animate": 0.005,
+                    "human_visible": 0.005,
+                    "face_visible": 0.005,
+                    "animal_visible": 0.005,
+                    "indoor_outdoor": 0.005,
+                    "natural_artificial": 0.005,
+                    "scene_dominance": 0.005,
+                    "real_world_size": 0.005,
                 }
                 
                 for attr_name, attr_pred in attr_preds.items():
                     attr_target = batch_data["attrs"][attr_name]
                     # Compute cross entropy, ignoring IGNORE_INDEX (-100)
-                    w = attr_weights.get(attr_name, 0.05)
+                    w = attr_weights.get(attr_name, 0.05) * warmup_factor
                     loss += w * F.cross_entropy(attr_pred, attr_target, ignore_index=IGNORE_INDEX)
             
             # Auxiliary multi-choice classification loss

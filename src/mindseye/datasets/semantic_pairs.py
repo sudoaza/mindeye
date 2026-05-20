@@ -44,30 +44,62 @@ class SemanticPairConfig:
 class ZunaClipPairDataset(Dataset):
     def __init__(self, config: SemanticPairConfig):
         self.config = config
-        self.metadata_csv = Path(config.metadata_csv)
         self.common_embeddings_pt = Path(config.common_embeddings_pt)
 
-        # Select the epoch dir based on input domain
+        # Allow comma-separated strings for metadata_csv and epochs_dir paths
+        def split_paths(path_str_or_paths) -> list[str]:
+            if not path_str_or_paths:
+                return []
+            if isinstance(path_str_or_paths, (list, tuple)):
+                return [str(p) for p in path_str_or_paths]
+            return [p.strip() for p in str(path_str_or_paths).split(",")]
+
+        metadata_csv_list = split_paths(config.metadata_csv)
+        
+        # Select base epochs_dir list based on input domain
         if config.input_domain == "raw":
             if config.epochs_dir_raw is None:
                 raise ValueError("epochs_dir_raw must be set when input_domain='raw'")
-            self.epochs_dir = Path(config.epochs_dir_raw)
+            epochs_dir_list = split_paths(config.epochs_dir_raw)
         elif config.input_domain == "resample":
             if config.epochs_dir_resample is None:
                 raise ValueError("epochs_dir_resample must be set when input_domain='resample'")
-            self.epochs_dir = Path(config.epochs_dir_resample)
+            epochs_dir_list = split_paths(config.epochs_dir_resample)
         else:
-            self.epochs_dir = Path(config.epochs_dir)
+            epochs_dir_list = split_paths(config.epochs_dir)
 
-        self.metadata = pd.read_csv(self.metadata_csv).reset_index(drop=True)
-        if config.input_domain == "raw":
-            self.metadata["npz_file"] = self.metadata["npz_file"].str.replace("_zuna_semantic.npz", "_raw_semantic.npz")
-        elif config.input_domain == "resample":
-            self.metadata["npz_file"] = self.metadata["npz_file"].str.replace("_zuna_semantic.npz", "_resample_semantic.npz")
-        required = {"image_id", "npz_file"}
-        missing = required - set(self.metadata.columns)
-        if missing:
-            raise ValueError(f"Metadata missing required columns: {sorted(missing)}")
+        if len(metadata_csv_list) != len(epochs_dir_list):
+            if len(epochs_dir_list) == 1:
+                epochs_dir_list = epochs_dir_list * len(metadata_csv_list)
+            elif len(metadata_csv_list) == 1:
+                metadata_csv_list = metadata_csv_list * len(epochs_dir_list)
+            else:
+                raise ValueError(
+                    f"Mismatch in number of metadata CSVs ({len(metadata_csv_list)}) "
+                    f"and epochs directories ({len(epochs_dir_list)})"
+                )
+
+        dfs = []
+        for csv_path, ep_dir in zip(metadata_csv_list, epochs_dir_list):
+            csv_path = Path(csv_path)
+            ep_dir = Path(ep_dir)
+            df = pd.read_csv(csv_path)
+            if config.input_domain == "raw":
+                df["npz_file"] = df["npz_file"].str.replace("_zuna_semantic.npz", "_raw_semantic.npz")
+            elif config.input_domain == "resample":
+                df["npz_file"] = df["npz_file"].str.replace("_zuna_semantic.npz", "_resample_semantic.npz")
+            
+            required = {"image_id", "npz_file"}
+            missing = required - set(df.columns)
+            if missing:
+                raise ValueError(f"Metadata {csv_path} missing required columns: {sorted(missing)}")
+                
+            df["epochs_dir_resolved"] = str(ep_dir)
+            dfs.append(df)
+
+        self.metadata = pd.concat(dfs, ignore_index=True).reset_index(drop=True)
+        # Use first epochs_dir as default for backwards compatibility
+        self.epochs_dir = Path(epochs_dir_list[0]) if epochs_dir_list else Path(".")
 
         table = torch.load(self.common_embeddings_pt, map_location="cpu")
         
@@ -109,10 +141,13 @@ class ZunaClipPairDataset(Dataset):
                   f"({len(self.metadata)} remaining)")
 
         self._epoch_offsets = self._add_epoch_offsets(self.metadata)
-        self._npz_cache: dict[str, np.ndarray] = {}
+        self._npz_cache: dict[tuple[str, str], np.ndarray] = {}
         if config.preload_npz:
-            for npz_file in sorted(self.metadata["npz_file"].astype(str).unique()):
-                self._npz_cache[npz_file] = self._load_npz(npz_file)
+            unique_npz_pairs = self.metadata[["npz_file", "epochs_dir_resolved"]].drop_duplicates()
+            for _, row in unique_npz_pairs.iterrows():
+                npz_f = str(row["npz_file"])
+                ep_d = str(row["epochs_dir_resolved"])
+                self._npz_cache[(npz_f, ep_d)] = self._load_npz(npz_f, Path(ep_d))
 
         first = self._get_eeg(0)
         self.eeg_shape = tuple(int(x) for x in first.shape)
@@ -120,8 +155,10 @@ class ZunaClipPairDataset(Dataset):
         # Load channel names from first NPZ if available
         self.ch_names = None
         try:
-            first_npz = self.metadata.iloc[0]["npz_file"]
-            with np.load(self.epochs_dir / first_npz) as f:
+            first_row = self.metadata.iloc[0]
+            first_npz = first_row["npz_file"]
+            first_ep_dir = Path(first_row["epochs_dir_resolved"])
+            with np.load(first_ep_dir / first_npz) as f:
                 if "ch_names" in f:
                     self.ch_names = list(f["ch_names"])
         except Exception:
@@ -165,29 +202,32 @@ class ZunaClipPairDataset(Dataset):
     @staticmethod
     def _add_epoch_offsets(metadata: pd.DataFrame) -> list[int]:
         offsets: list[int] = []
-        counts: dict[str, int] = {}
-        for npz_file in metadata["npz_file"].astype(str):
-            offset = counts.get(npz_file, 0)
+        counts: dict[tuple[str, str], int] = {}
+        for _, row in metadata.iterrows():
+            key = (str(row["npz_file"]), str(row["epochs_dir_resolved"]))
+            offset = counts.get(key, 0)
             offsets.append(offset)
-            counts[npz_file] = offset + 1
+            counts[key] = offset + 1
         return offsets
 
-    def _load_npz(self, npz_file: str) -> np.ndarray:
-        path = self.epochs_dir / npz_file
+    def _load_npz(self, npz_file: str, epochs_dir: Path) -> np.ndarray:
+        path = epochs_dir / npz_file
         if not path.exists():
             raise FileNotFoundError(f"Missing semantic epoch NPZ: {path}")
         return np.load(path)["eeg"].astype("float32")
 
-    def _get_npz(self, npz_file: str) -> np.ndarray:
-        if npz_file not in self._npz_cache:
-            self._npz_cache[npz_file] = self._load_npz(npz_file)
-        return self._npz_cache[npz_file]
+    def _get_npz(self, npz_file: str, epochs_dir: Path) -> np.ndarray:
+        key = (npz_file, str(epochs_dir))
+        if key not in self._npz_cache:
+            self._npz_cache[key] = self._load_npz(npz_file, epochs_dir)
+        return self._npz_cache[key]
 
     def _get_eeg(self, idx: int) -> torch.Tensor:
         row = self.metadata.iloc[idx]
         npz_file = str(row["npz_file"])
+        epochs_dir = Path(row["epochs_dir_resolved"])
         epoch_idx = self._epoch_offsets[idx]
-        eeg = torch.from_numpy(self._get_npz(npz_file)[epoch_idx]).float()
+        eeg = torch.from_numpy(self._get_npz(npz_file, epochs_dir)[epoch_idx]).float()
         
         if self.config.window_mode == "full5s_backaligned":
             eeg = eeg[:, :1280]
@@ -271,7 +311,8 @@ class ZunaClipPairDataset(Dataset):
         image_ids = sorted(set(self.metadata["image_id"].astype(str).tolist()))
         target = torch.stack([F.normalize(self.image_id_to_target[i].float(), dim=-1) for i in image_ids])
 
-        cos = (target.unsqueeze(1) * target.unsqueeze(0)).sum(dim=-1)
+        # Optimize memory usage using matrix multiplication
+        cos = torch.mm(target, target.t())
         # Exclude diagonal
         cos_off = cos[~torch.eye(len(image_ids), dtype=torch.bool, device=cos.device)]
         
