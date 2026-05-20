@@ -64,7 +64,14 @@ def main():
             results = json.load(f)
         print(f"Resuming from {len(results)} existing annotations.")
         
-    images_to_process = [k for k in image_paths.keys() if k not in results]
+    images_to_process = []
+    for k in image_paths.keys():
+        if k not in results:
+            images_to_process.append(k)
+        else:
+            missing = any(attr not in results[k] for attr in ["dominant_color", "lighting_condition", "object_presence", "contrast_level"])
+            if missing:
+                images_to_process.append(k)
     print(f"Remaining images to process: {len(images_to_process)}")
     
     if not images_to_process:
