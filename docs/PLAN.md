@@ -66,17 +66,17 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 ## 8. Phase 5 — Improve the EEG encoder (Sprint 4)
 
 **Objective**: Upgrade from Conv1D to a Spatial-Temporal Coordinate-Aware Encoder.
-- [ ] Add `src/mindseye/models/spatial_temporal_encoder.py`.
-- [ ] Input API: `eeg: [B, C, T]`, `channel_xyz: [B, C, 3]`, `subject_id` (optional), `run_id` (optional).
-- [ ] Architecture target: temporal convolution / learned filterbank + coordinate embedding MLP + channel attention or transformer + temporal pooling + subject/run adapter + projection to CLIP dimension.
-- [ ] Keep the Conv1D baseline for comparison.
-- [ ] Increase dataset, include other subjects' data from the set.
+- [x] Add `src/mindseye/models/spatial_temporal_encoder.py`.
+- [x] Input API: `eeg: [B, C, T]`, `channel_xyz: [B, C, 3]`, `subject_id` (optional), `run_id` (optional).
+- [x] Architecture target: temporal convolution / learned filterbank + coordinate embedding MLP + channel attention or transformer + temporal pooling + subject/run adapter + projection to CLIP dimension.
+- [x] Keep the Conv1D baseline for comparison.
+- [x] Increase dataset, include other subjects' data from the set (sub-01 + sub-02).
 
 ## 9. Phase 6 — Multi-domain semantic front (Sprint 5)
 
 **Objective**: Move from CLIP image embeddings to structured semantic state.
-- [ ] Add structured targets: CLIP image embedding, CLIP text/class embedding, object caption embedding, spatial/composition embedding, color/material embedding, mood/theme embedding, abstract concept embedding, direction/action embedding.
-- [ ] This is core Neural-MCRL / Semantic-Prompts inspiration. Do not jump to diffusion before this has measurable signal.
+- [x] Add structured targets: CLIP image embedding, CLIP text/class embedding, object caption embedding, spatial/composition embedding, color/material embedding, mood/theme embedding, abstract concept embedding, direction/action embedding.
+- [x] This is core Neural-MCRL / Semantic-Prompts inspiration. Do not jump to diffusion before this has measurable signal.
 
 ## 10. Phase 7 — BReAD-style retrieval branch
 
@@ -106,13 +106,15 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 
 ---
 
-## Current Status: Phase 5 (Improve EEG Encoder) 🚧
+## Current Status: Phase 7 (BReAD-style retrieval branch) 🚧
 
 - ✅ **Sprint 1 complete** — ZUNA inference, timing audit, retrieval grid.
 - ❌ **Sprint 2 failed** — 1.25s crops did not beat controls.
 - ✅ **Phase 3.5 complete** — Back-aligned 1.2s ZUNA windows with event marker and combined VLM/Text CLIP supervision successfully avoided collapse and robustly beat shuffled/random controls across Top-10 and MRR! Matrix evaluation gate passed.
 - ✅ **Phase 4 complete** — Sprint 3: Simulated EPOC-14 channel subset masking, processed through ZUNA, and evaluated baseline matrix. ZUNA-upscaled signal retains ~74% of full 64-channel density performance, though it doesn't show a direct reconstruction benefit over raw EPOC-14 (0.98x gain).
-- 🚀 **Phase 5 active** — Sprint 4: Upgrading EEG encoder to spatial-temporal coordinate-aware architecture.
+- ✅ **Phase 5 complete** — Spatial-Temporal Coordinate-Aware encoder implemented and multi-subject scaling evaluated.
+- ✅ **Phase 6 complete** — Multi-domain semantic front implemented with VLM attributes, linear warmup, and validated on the combined dataset.
+- 🚀 **Phase 7 active** — Building FAISS visual retrieval index for Grounded Image Generation.
 
 ---
 
@@ -143,6 +145,16 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 - [x] Evaluate coordinate-aware architecture vs baseline temporal_attn on single subject.
   - [x] Identified raw channel temporal overfitting. Prepended Early Spatial Mixing (1x1 Conv1d) to act as a learned CAR / spatial filter.
   - [x] Results: Spatial-Temporal Coordinate-Aware (with spatial mix) achieved Top-10 of **0.232** (MRR = **0.1084**), closing the gap to baseline `temporal_attn` (**0.256**).
-- [─] Train on multiple subjects to scale performance (Deferred: Only sub-01 is present in remote dataset).
+- [x] Train on multiple subjects to scale performance (sub-01 + sub-02 datasets).
+
+### Phase 6: Multi-Domain Semantic Front (Complete)
+- [x] Extract VLM semantic attributes for sub-01 and sub-02 visual stimuli.
+- [x] Implement linear auxiliary weight warmup scaling (epochs 1-20).
+- [x] Train combined multi-subject baseline and multitask architectures.
+- [x] Results: Multitask regularization with warmup successfully stabilized combined multi-subject training and improved Top-10 score from 12.05% to 13.25%.
+
+### Phase 7: BReAD-style Retrieval Branch (Active)
+- [ ] Build FAISS retrieval index over target image library.
+- [ ] Query index with predicted embeddings to retrieve visual grounding priors.
 
 *Do not add diffusion until semantic retrieval beats shuffled baselines.*
