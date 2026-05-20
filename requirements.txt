@@ -16,3 +16,4 @@ requests
 openneuro-py
 zuna
 qwen-vl-utils
+faiss-cpu
