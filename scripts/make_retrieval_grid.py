@@ -55,10 +55,11 @@ def _resolve_image(path_str: str, stimuli_root: Path) -> Path:
     path = Path(path_str)
     if path.exists():
         return path
-    candidate = stimuli_root / path.name
-    if candidate.exists():
-        return candidate
-    # Some tables may store paths relative to the repo root.
+    stem = path.stem
+    for ext in ("", ".JPEG", ".jpg", ".png", ".jpeg"):
+        candidate = stimuli_root / f"{stem}{ext}"
+        if candidate.exists():
+            return candidate
     candidate = Path.cwd() / path
     if candidate.exists():
         return candidate
@@ -101,13 +102,26 @@ def main() -> None:
         SemanticPairConfig(
             metadata_csv=args.metadata,
             epochs_dir=args.epochs_dir,
-            clip_embeddings_pt=args.clip_embeddings,
+            common_embeddings_pt=args.clip_embeddings,
         )
     )
     n_channels, n_times = dataset.eeg_shape
-    model = EEGClipEncoder(n_channels=n_channels, n_times=n_times, embedding_dim=dataset.embedding_dim).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     setup = checkpoint.get("setup", {})
+    model_name = setup.get("model", "cnn")
+    if model_name in {"spatial_temporal", "spatial_temporal_small"}:
+        from mindseye.models.spatial_temporal_encoder import build_spatial_temporal_encoder
+        preset = "small" if model_name == "spatial_temporal_small" else "medium"
+        model = build_spatial_temporal_encoder(
+            preset=preset,
+            n_channels=setup.get("eeg_shape", [n_channels])[0],
+            embedding_dim=dataset.embedding_dim,
+            dropout=setup.get("dropout", 0.0),
+            stem_dropout=setup.get("stem_dropout1d", 0.15)
+        ).to(device)
+    else:
+        from mindseye.models.eeg_encoder import EEGClipEncoder
+        model = EEGClipEncoder(n_channels=n_channels, n_times=n_times, embedding_dim=dataset.embedding_dim).to(device)
     split_mode = args.split_mode or setup.get("split_mode", "random")
     val_runs = args.val_runs or (",".join(str(x) for x in setup.get("val_runs") or []) if setup.get("val_runs") else None)
     if split_mode == "run":
@@ -127,6 +141,9 @@ def main() -> None:
 
     batch = next(iter(loader))
     eeg = batch["eeg"].to(device).float()
+    expected_channels = setup.get("eeg_shape", [63])[0]
+    if eeg.shape[1] < expected_channels:
+        eeg = F.pad(eeg, (0, 0, 0, expected_channels - eeg.shape[1]))
     with torch.inference_mode():
         subject_id = batch.get("subject_id", None)
         if subject_id is not None:
@@ -136,7 +153,14 @@ def main() -> None:
         pred = F.normalize(model(eeg, **kwargs), dim=-1).cpu()
 
     table = torch.load(args.clip_embeddings, map_location="cpu")
-    bank_raw = table["embedding"].float()
+    if "image_id_to_common" in table:
+        bank_image_ids = list(table["image_id_to_common"].keys())
+        bank_raw = torch.stack([table["image_id_to_common"][img_id] for img_id in bank_image_ids]).float()
+        bank_image_paths = [f"{img_id}.png" for img_id in bank_image_ids]
+    else:
+        bank_image_ids = table["image_id"]
+        bank_raw = table["embedding"].float()
+        bank_image_paths = table["image_path"]
     if target_center is not None:
         bank_raw = bank_raw - target_center
     bank = F.normalize(bank_raw, dim=-1)
@@ -157,7 +181,7 @@ def main() -> None:
     rows_json: list[dict] = []
     for r, dataset_idx in enumerate(val_idx):
         gt_id = str(batch["image_id"][r])
-        gt_table_i = table["image_id"].index(gt_id)
+        gt_table_i = bank_image_ids.index(gt_id)
         image_indices = [gt_table_i] + topk.indices[r].tolist()
         labels = ["GT"] + [f"top{i+1} {float(topk.values[r, i]):.2f}" for i in range(topk.indices.shape[1])]
         row_info = {"dataset_index": int(dataset_idx), "ground_truth": gt_id, "retrieved": []}
@@ -165,10 +189,10 @@ def main() -> None:
         for c, image_i in enumerate(image_indices):
             x = margin + c * (thumb + margin)
             y = margin + r * (thumb + label_h + margin)
-            image_path = _resolve_image(str(table["image_path"][image_i]), stimuli_root)
+            image_path = _resolve_image(str(bank_image_paths[image_i]), stimuli_root)
             img = _fit_image(Image.open(image_path), thumb)
             grid.paste(img, (x, y))
-            image_id = str(table["image_id"][image_i])
+            image_id = str(bank_image_ids[image_i])
             _draw_label(draw, (x, y + thumb + 2), f"{labels[c]} {image_id}")
             if c > 0:
                 row_info["retrieved"].append(
