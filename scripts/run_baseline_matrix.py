@@ -31,6 +31,8 @@ CONDITIONS = [
     ("zuna_shuffled",          "zuna",    "shuffled",  "run"),
     ("zuna_random",            "zuna",    "random",    "run"),
     ("raw_real",               "raw",     "real",      "run"),
+    # Ablation: real without probe regularizer
+    ("zuna_real_noprobe",      "zuna",    "real",      "run"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -55,6 +57,7 @@ def run_condition(
     split: str,
     matrix_dir: Path,
     args: argparse.Namespace,
+    probe_weight_override: float | None = None,
 ) -> dict:
     """Launch train_eeg_clip.py for one condition and return its metrics dict."""
     print(f"\n{'='*60}")
@@ -102,12 +105,15 @@ def run_condition(
         ("aug_amp_scale", "--aug-amp-scale"),
         ("aug_time_mask", "--aug-time-mask"),
         ("aug_time_jitter", "--aug-time-jitter"),
-        ("common_probe", "--common-probe"),
-        ("probe_weight", "--probe-weight"),
     ]:
         value = getattr(args, arg_name, None)
         if value is not None:
             cmd.extend([cli_name, str(value)])
+    # Probe: use per-condition override if provided, else fall back to global
+    effective_probe_weight = probe_weight_override if probe_weight_override is not None else getattr(args, "probe_weight", None)
+    if effective_probe_weight is not None and effective_probe_weight > 0 and getattr(args, "common_probe", None):
+        cmd.extend(["--common-probe", str(args.common_probe)])
+        cmd.extend(["--probe-weight", str(effective_probe_weight)])
     if getattr(args, "common_embeddings", None):
         cmd.extend(["--common-embeddings", str(args.common_embeddings)])
 
@@ -209,6 +215,9 @@ def main() -> None:
                    help="Path to pretrained common_probe.pt checkpoint")
     p.add_argument("--probe-weight", type=float, default=0.03,
                    help="Weight for the auxiliary probe loss")
+    p.add_argument("--probe-weights", default=None,
+                   help="Comma-separated probe weights for sweep mode (e.g. '0,0.01,0.03,0.05,0.10'). "
+                        "Generates one zuna_real run per weight. Ignores --conditions when set.")
     p.add_argument("--model",           choices=("cnn", "temporal_attn", "temporal_attn_small", "spatial_temporal", "spatial_temporal_small"), default="cnn")
     p.add_argument("--hidden-dim",      type=int, default=None)
     p.add_argument("--n-layers",        type=int, default=None)
@@ -264,8 +273,20 @@ def main() -> None:
 
     all_metrics: list[dict] = []
     for name, input_domain, target_mode, split in active:
-        m = run_condition(name, input_domain, target_mode, split, matrix_dir, args)
-        all_metrics.append(m)
+        # For probe-weight sweep, generate one run per weight under zuna_real
+        if args.probe_weights and name == "zuna_real":
+            probe_weights = [float(w.strip()) for w in args.probe_weights.split(",") if w.strip()]
+            for pw in probe_weights:
+                sweep_name = f"zuna_real_p{str(pw).replace('.', '')}"
+                m = run_condition(sweep_name, input_domain, target_mode, split,
+                                  matrix_dir, args, probe_weight_override=pw)
+                all_metrics.append(m)
+        else:
+            # noprobe condition: force probe_weight to 0
+            pw_override = 0.0 if name == "zuna_real_noprobe" else None
+            m = run_condition(name, input_domain, target_mode, split,
+                              matrix_dir, args, probe_weight_override=pw_override)
+            all_metrics.append(m)
 
     # Aggregate
     df = pd.DataFrame(all_metrics)

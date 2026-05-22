@@ -62,11 +62,12 @@ def parse_args() -> argparse.Namespace:
         default="real",
         help="Target mapping mode: real (default), shuffled, random, or sameclass distractors",
     )
+    # --target-space is kept as a hidden ablation flag; canonical path always uses 'common'.
     p.add_argument(
         "--target-space",
         choices=("common", "semantic", "image", "label"),
         default="common",
-        help="Which embedding space to optimize the loss against",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--common-probe",
@@ -232,9 +233,10 @@ def _save_env(run_dir: Path, args: argparse.Namespace, setup: dict) -> None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str, probe_model=None, active_tasks=None, target_center=None) -> dict[str, float]:
+def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str = "common", probe_model=None, active_tasks=None, target_center=None) -> dict[str, float]:
     from mindseye.models.eeg_encoder import retrieval_topk
     import torch
+    import torch.nn.functional as F
     model.eval()
     if probe_model:
         probe_model.eval()
@@ -249,7 +251,8 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
             kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
             pred = model(batch_data["eeg"], **kwargs)
             if probe_model and active_tasks and "probe_targets" in batch_data:
-                a_preds = probe_model(pred)
+                # Probe was pretrained on F.normalize(z_common); normalize pred to match.
+                a_preds = probe_model(F.normalize(pred, dim=-1))
                 
             preds.append(pred.cpu())
             targets.append(batch_data["target"].cpu())
@@ -499,6 +502,18 @@ def main() -> None:
         if probe_model is not None:
             _ = probe_model(pred)
 
+    # Subject audit
+    subjects_loaded = list(getattr(dataset, "unique_subjects", []))
+    samples_per_subject = (
+        dataset.metadata.groupby("subject").size().to_dict()
+        if "subject" in dataset.metadata.columns else {}
+    )
+    # Infer requested subjects from comma-separated metadata paths
+    subjects_requested = [
+        Path(p.strip()).parent.name for p in str(args.metadata).split(",")
+    ] if "," in str(args.metadata) else []
+    subjects_skipped = [s for s in subjects_requested if not any(s in sl for sl in subjects_loaded)]
+
     setup = {
         "items": len(dataset),
         "train_items": len(train_idx),
@@ -514,7 +529,7 @@ def main() -> None:
         "input_domain": args.input_domain,
         "target_mode": args.target_mode,
         "window_mode": args.window_mode,
-        "target_space": args.target_space,
+        "target_space": "common",
         "model": args.model,
         "hidden_dim": hidden_dim,
         "n_layers": n_layers,
@@ -530,6 +545,10 @@ def main() -> None:
             "time_jitter": args.aug_time_jitter,
         },
         "target_bank_audit": target_bank_audit,
+        "subjects_requested": subjects_requested,
+        "subjects_loaded": subjects_loaded,
+        "samples_per_subject": {str(k): int(v) for k, v in samples_per_subject.items()},
+        "subjects_skipped": subjects_skipped,
     }
     print(json.dumps({"setup": setup}, indent=2))
 
@@ -602,7 +621,8 @@ def main() -> None:
             if probe_model is not None and "probe_targets" in batch_data:
                 import torch.nn.functional as F
                 from mindseye.models.common_probe import IGNORE_INDEX
-                logits_dict = probe_model(pred)
+                # Probe was pretrained on F.normalize(z_common); normalize pred to match.
+                logits_dict = probe_model(F.normalize(pred, dim=-1))
                 
                 probe_loss = 0.0
                 has_active = False

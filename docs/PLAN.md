@@ -1,4 +1,4 @@
-# MindEye Development Plan — ZUNA-first EEG→Semantic→Image Pipeline
+# MindEye Development Plan — z_common Canonical Latent Pipeline
 
 ## 1. Strategic direction
 
@@ -106,7 +106,50 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 
 ---
 
-## Current Status: Phase 8 (BatchNorm Cleanup & Subject FiLM Adapters) ✅
+## Current Status: Phase 9 — z_common Canonical Latent + Probe Ablation ✅
+
+### Architecture (canonical, do not deviate)
+```
+image/VLM/attributes → z_common          (frozen CLIP + VLM fused embedding)
+EEG  → z_pred_common                     (trained encoder output)
+frozen_probe(normalize(z_pred_common))   (semantic regularizer, 10 tasks)
+```
+
+### Latest Gate Result (Sprint 2, 40-run multi-subject)
+```
+zuna_real     top10=20.2%  MRR=9.6%   collapse=0.862   ✅
+zuna_shuffled top10=9.7%   MRR=5.2%
+zuna_random   top10=11.3%  MRR=4.4%
+
+GATE: PASS
+```
+
+### Probe Pretraining Results (on z_common, 40 runs)
+| Task | Accuracy | Baseline |
+|---|---|---|
+| class_label | 21.6% | 0.1% |
+| dominant_color | 65.1% | 28.7% |
+| is_animate | 79.4% | 50% |
+| human_visible | 90.1% | 50% |
+| face_visible | 89.3% | 50% |
+| animal_visible | 88.7% | 50% |
+| indoor_outdoor | 72.3% | 33% |
+| soft_texture | 61.2% | 50% |
+| spiky_or_pointed | 58.4% | 50% |
+| furry | 73.8% | 50% |
+
+### Known Issues / In Progress
+- **Probe accuracy during EEG training** was 0.0 throughout due to normalization mismatch: probe pretrained on `F.normalize(z_common)` but EEG training applied probe to raw `pred`. **Fixed in current sprint** — must verify probe_acc rises above 0 after re-run.
+- **Multi-subject audit**: pipeline supports 4 subjects but hasn't been verified to actually load all 4. Subject audit fields added to setup JSON in current sprint.
+- **Probe ablation pending**: need to prove `probe_weight=0.03` improves retrieval vs `probe_weight=0` before making probes canonical.
+
+### Immediate Next Steps
+1. Run `make ablation` on pod — no-probe vs probe=0.03 (key comparison)
+2. Run `python scripts/eval_probe_sanity.py` to verify probe(z_common) matches pretraining accuracy
+3. Verify probe_*_acc rises above 0 after normalization fix
+4. Run `make probe_sweep` if ablation shows probes help
+
+---
 
 - ✅ **Sprint 1 complete** — ZUNA inference, timing audit, retrieval grid.
 - ❌ **Sprint 2 failed** — 1.25s crops did not beat controls.
@@ -160,10 +203,25 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 - [x] Query index with predicted embeddings to retrieve visual grounding priors.
 
 ### Phase 8: BatchNorm Cleanup and Subject FiLM Adapters (Complete)
-- [x] Replace remaining BatchNorm1d layers with GroupNorm to prevent cross-channel leakage.
-- [x] Implement subject-specific FiLM scale/shift adapters to handle multi-subject variance without global parameter bloat.
-- [x] Refactor temporal stem to include per-channel pointwise 1x1 convolutions, allowing multi-scale feature mixing within each electrode.
-- [x] Validate model on the 3-condition baseline matrix.
-- [x] Results: Passed all gates. Compact `spatial_temporal_small` preset with pointwise mixing, 5e-3 weight decay, and 2e-4 learning rate achieved all-time records: MRR = **0.0873**, Median Rank = **37**, Top-1 = **4.0%**, and a lowest-ever validation loss of **4.646**.
+- [x] Replace remaining BatchNorm1d layers with GroupNorm.
+- [x] Implement subject-specific FiLM scale/shift adapters.
+- [x] Validate on 3-condition baseline matrix.
 
+### Phase 9: z_common Canonical Latent + Frozen Probe Regularization (Current)
+- [x] Enforce single canonical representation: `z_common` for images, `z_pred_common` for EEG.
+- [x] All semantic/label tasks are frozen probe heads from `z_common` — no separate latent spaces.
+- [x] Pretrain `CommonProbeModel` on 40-run VLM attributes (10 tasks active, class_label 21.6%).
+- [x] Scale to 4 subjects × 40 runs dataset.
+- [x] Run 3-condition gate: `zuna_real` top10=20.2% vs shuffled 9.7% vs random 11.3%. **GATE PASS**.
+- [x] Fix probe normalization mismatch (`pred` must be normalized before probe, matching pretraining).
+- [x] Add subject audit to setup JSON (subjects_loaded, samples_per_subject, subjects_skipped).
+- [x] Add `scripts/eval_probe_sanity.py` for probe diagnostic evaluation.
+- [ ] **Ablation**: run `make ablation` — prove probe improves or is neutral vs no-probe baseline.
+- [ ] **Probe-weight sweep**: `make probe_sweep` — find optimal weight (0 / 0.01 / 0.03 / 0.05 / 0.10).
+- [ ] **Subject audit**: verify all 4 subjects actually load via subject audit fields in setup JSON.
+- [ ] **Cross-fold validation**: validate gate holds with different val-run splits.
 
+### Phase 10: Image Reconstruction / Diffusion (Blocked)
+- [ ] **Prerequisite**: probe ablation must confirm probes help or are neutral.
+- [ ] **Prerequisite**: multi-subject generalization verified.
+- [ ] Hook `z_pred_common` to SDXL-Turbo / SD3 img2img via retrieval grounding.

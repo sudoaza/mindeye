@@ -25,6 +25,43 @@ matrix:
 		--common-probe outputs/common_probe/common_probe.pt \
 		--conditions zuna_real zuna_shuffled zuna_random
 
+# Ablation: no-probe vs probe=0.03 on zuna_real + controls (fastest key comparison ~2-3h)
+ablation:
+	. venv/bin/activate && python -u scripts/run_baseline_matrix.py \
+		--subjects sub-01 \
+		--run-range 01_40 \
+		--common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
+		--val-runs 8 \
+		--window-mode tight1s \
+		--model temporal_attn_small \
+		--epochs 50 \
+		--batch-size 64 \
+		--device cuda \
+		--slug ablation_probe \
+		--add-event-marker \
+		--augment-eeg \
+		--common-probe outputs/common_probe/common_probe.pt \
+		--conditions zuna_real zuna_real_noprobe zuna_shuffled zuna_random
+
+# Probe weight sweep: 0 / 0.01 / 0.03 / 0.05 / 0.10 on zuna_real (~5 runs, ~4-5h)
+probe_sweep:
+	. venv/bin/activate && python -u scripts/run_baseline_matrix.py \
+		--subjects sub-01 \
+		--run-range 01_40 \
+		--common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
+		--val-runs 8 \
+		--window-mode tight1s \
+		--model temporal_attn_small \
+		--epochs 50 \
+		--batch-size 64 \
+		--device cuda \
+		--slug probe_sweep \
+		--add-event-marker \
+		--augment-eeg \
+		--common-probe outputs/common_probe/common_probe.pt \
+		--probe-weights 0,0.01,0.03,0.05,0.10 \
+		--conditions zuna_real
+
 # Sprint 3: simulate EPOC-14 low-channel conditions for all runs
 simulate:
 	. venv/bin/activate && \
