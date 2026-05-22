@@ -100,6 +100,19 @@ def main() -> None:
     print(f"Loaded probe with {len(active_tasks)} tasks: {active_tasks}")
 
     # ── Build dataset for val split ──────────────────────────────────────────
+    # Derive add_event_marker from the checkpoint's eeg_shape channel count.
+    # The key may be None in old checkpoints; channel count is always reliable:
+    # base tight1s = 62 channels; +1 with event marker = 63.
+    ckpt_setup = {}
+    add_event_marker = False
+    if args.checkpoint:
+        _ckpt_peek = torch.load(args.checkpoint, map_location="cpu")
+        ckpt_setup = _ckpt_peek.get("setup", {})
+        del _ckpt_peek
+        n_ch = ckpt_setup.get("eeg_shape", [62])[0]
+        add_event_marker = n_ch > 62  # 63 = marker added, 62 = base channels
+        print(f"Inferred add_event_marker={add_event_marker} from eeg_shape n_channels={n_ch}")
+
     config = SemanticPairConfig(
         metadata_csv=args.metadata,
         epochs_dir=args.epochs_dir,
@@ -107,7 +120,7 @@ def main() -> None:
         vlm_attributes_json=args.vlm_attributes,
         window_mode=args.window_mode,
         target_mode="real",
-        add_event_marker=False,
+        add_event_marker=add_event_marker,
         augment_eeg=False,
     )
     dataset = ZunaClipPairDataset(config)
@@ -189,6 +202,24 @@ def main() -> None:
                 eeg = batch["eeg"].to(device).float()
                 z_pred_list.append(model(eeg).cpu())
         z_pred = torch.cat(z_pred_list)
+
+        # Diagnostics: geometry of z_pred vs z_common
+        import torch.nn.functional as F
+        z_pred_norm = F.normalize(z_pred, dim=-1)
+        z_common_norm = F.normalize(z_common, dim=-1)
+        diag_cosine = (z_pred_norm * z_common_norm).sum(dim=-1)
+        print(f"\nz_pred geometry:")
+        print(f"  norm(z_pred)       mean={z_pred.norm(dim=-1).mean():.4f}  std={z_pred.norm(dim=-1).std():.4f}")
+        print(f"  norm(z_common)     mean={z_common.norm(dim=-1).mean():.4f}")
+        print(f"  cosine(z_pred, z_common) mean={diag_cosine.mean():.4f}  std={diag_cosine.std():.4f}  min={diag_cosine.min():.4f}  max={diag_cosine.max():.4f}")
+
+        # Probe logit distribution on z_pred (first task) — diagnose silent failures
+        with torch.inference_mode():
+            sample_logits = probe_model(F.normalize(z_pred[:32].to(device), dim=-1))
+        first_task = active_tasks[0]
+        sl = sample_logits[first_task].cpu()
+        print(f"\nProbe logit distribution ({first_task}, 32 samples):")
+        print(f"  logit mean={sl.mean():.4f}  std={sl.std():.4f}  argmax distribution={sl.argmax(dim=-1).tolist()}")
 
         print(f"\n" + "=" * 60)
         print(f"  probe(z_pred_{target_mode}) — should be > 0 after training converges")
