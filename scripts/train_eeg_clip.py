@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--probe-weight",
         type=float,
-        default=0.03,
+        default=0.05,
         help="Weight for the auxiliary probe loss",
     )
     p.add_argument("--output-dir", default=None,
