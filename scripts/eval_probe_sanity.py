@@ -113,6 +113,12 @@ def main() -> None:
         add_event_marker = n_ch > 62  # 63 = marker added, 62 = base channels
         print(f"Inferred add_event_marker={add_event_marker} from eeg_shape n_channels={n_ch}")
 
+    if args.vlm_attributes is None and args.common_probe:
+        candidate = Path(args.common_probe).parent / "vlm_attributes_runs01_40.json"
+        if candidate.exists():
+            args.vlm_attributes = str(candidate)
+            print(f"[Dataset] Auto-detected vlm_attributes at {args.vlm_attributes}")
+
     config = SemanticPairConfig(
         metadata_csv=args.metadata,
         epochs_dir=args.epochs_dir,

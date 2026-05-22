@@ -331,6 +331,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     
+    if args.vlm_attributes is None and args.common_probe:
+        candidate = Path(args.common_probe).parent / "vlm_attributes_runs01_40.json"
+        if candidate.exists():
+            args.vlm_attributes = str(candidate)
+            print(f"[Dataset] Auto-detected vlm_attributes at {args.vlm_attributes}")
+            
     if args.target_space != "common":
         print("[WARN] Non-canonical target_space used for ablation only.")
 
