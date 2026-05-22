@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--probe-weight",
         type=float,
-        default=0.05,
+        default=0.04,
         help="Weight for the auxiliary probe loss",
     )
     p.add_argument("--output-dir", default=None,
@@ -306,8 +306,14 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
             if mask.any():
                 acc = (ap.argmax(dim=-1)[mask] == at[mask]).float().mean().item()
                 metrics[f"probe_{task}_acc"] = acc
+                if task == "class_label":
+                    top10_idx = ap[mask].topk(10, dim=-1).indices
+                    correct_top10 = (top10_idx == at[mask].unsqueeze(-1)).any(dim=-1)
+                    metrics["probe_class_label_top10_acc"] = correct_top10.float().mean().item()
             else:
                 metrics[f"probe_{task}_acc"] = 0.0
+                if task == "class_label":
+                    metrics["probe_class_label_top10_acc"] = 0.0
 
     return metrics
 
@@ -583,6 +589,8 @@ def main() -> None:
     if active_tasks:
         for task in active_tasks:
             log_fields.append(f"probe_{task}_acc")
+            if task == "class_label":
+                log_fields.append("probe_class_label_top10_acc")
 
     with open(log_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=log_fields).writeheader()
