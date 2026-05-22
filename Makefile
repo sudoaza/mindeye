@@ -9,13 +9,12 @@ pipeline:
 
 # Run just the baseline matrix assuming prior steps (ZUNA, crop, embeddings) are completed
 matrix:
-	. venv/bin/activate && python scripts/run_baseline_matrix.py \
-		--metadata data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08/all_runs_metadata.csv \
-		--epochs-dir data/processed/semantic_epochs/zuna_full5s_backaligned_sub01_runs01_08 \
+	. venv/bin/activate && python -u scripts/run_baseline_matrix.py \
+		--subjects sub-01,sub-02,sub-03,sub-04 \
+		--run-range 01_40 \
 		--common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
 		--val-runs 8 \
-		--window-mode full5s_backaligned \
-		--target-space common \
+		--window-mode tight1s \
 		--model temporal_attn_small \
 		--epochs 50 \
 		--batch-size 64 \
@@ -23,6 +22,7 @@ matrix:
 		--slug common_space_sprint2 \
 		--add-event-marker \
 		--augment-eeg \
+		--common-probe outputs/common_probe/common_probe.pt \
 		--conditions zuna_real zuna_shuffled zuna_random
 
 # Sprint 3: simulate EPOC-14 low-channel conditions for all runs

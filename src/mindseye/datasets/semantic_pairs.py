@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from mindseye.models.common_probe import CommonProbeModel, ATTRIBUTE_SCHEMAS, IGNORE_INDEX
 
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
@@ -80,9 +81,14 @@ class ZunaClipPairDataset(Dataset):
                 )
 
         dfs = []
+        valid_ep_dirs = []
         for csv_path, ep_dir in zip(metadata_csv_list, epochs_dir_list):
             csv_path = Path(csv_path)
             ep_dir = Path(ep_dir)
+            if not csv_path.exists() or not ep_dir.exists():
+                print(f"[WARN] Skipping missing subject dataset: csv={csv_path} (exists={csv_path.exists()}), ep_dir={ep_dir} (exists={ep_dir.exists()})")
+                continue
+            
             df = pd.read_csv(csv_path)
             if config.input_domain == "raw":
                 df["npz_file"] = df["npz_file"].str.replace("_zuna_semantic.npz", "_raw_semantic.npz")
@@ -96,10 +102,22 @@ class ZunaClipPairDataset(Dataset):
                 
             df["epochs_dir_resolved"] = str(ep_dir)
             dfs.append(df)
+            valid_ep_dirs.append(ep_dir)
+
+        if not dfs:
+            raise FileNotFoundError(
+                f"No valid subject datasets found among the requested paths.\n"
+                f"Metadata paths checked: {metadata_csv_list}\n"
+                f"Epochs paths checked: {epochs_dir_list}"
+            )
 
         self.metadata = pd.concat(dfs, ignore_index=True).reset_index(drop=True)
-        # Use first epochs_dir as default for backwards compatibility
-        self.epochs_dir = Path(epochs_dir_list[0]) if epochs_dir_list else Path(".")
+        # Use first valid epochs_dir as default for backwards compatibility
+        self.epochs_dir = valid_ep_dirs[0] if valid_ep_dirs else Path(".")
+
+        if config.target_space != "common":
+            import warnings
+            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common' is canonical.")
 
         table = torch.load(self.common_embeddings_pt, map_location="cpu")
         
@@ -115,17 +133,13 @@ class ZunaClipPairDataset(Dataset):
             
         self.image_id_to_target = table[target_key]
         
-        if "image_id_to_label" in table:
-            self.image_id_to_label = {str(k): F.normalize(v.float(), dim=-1) for k, v in table["image_id_to_label"].items()}
-            # Unique label embeddings for distractors
-            unique_lbls = []
-            seen = set()
-            for lbl_t in self.image_id_to_label.values():
-                key = tuple(lbl_t.round(decimals=4).tolist())
-                if key not in seen:
-                    seen.add(key)
-                    unique_lbls.append(lbl_t)
-            self.all_labels_bank = torch.stack(unique_lbls)
+        if "class" in self.metadata.columns:
+            unique_classes = sorted(self.metadata["class"].dropna().unique().tolist())
+            self.class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
+            self.idx_to_class = unique_classes
+        else:
+            self.class_to_idx = {}
+            self.idx_to_class = []
         
         # Pick the embedding dimension from the first item
         first_key = next(iter(self.image_id_to_target.keys()))
@@ -360,7 +374,7 @@ class ZunaClipPairDataset(Dataset):
     def __len__(self) -> int:
         return len(self.metadata)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str | int]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str | int | dict]:
         target_idx = idx
         mode = self.config.target_mode
         if mode == "shuffled":
@@ -376,55 +390,33 @@ class ZunaClipPairDataset(Dataset):
         subject_str = str(target_row["subject"]) if "subject" in target_row else "unknown"
         subject_id = self.subject_to_id.get(subject_str, 0)
         
+        probe_targets = {}
+        if mode == "random":
+            probe_targets["class_label"] = IGNORE_INDEX
+            for attr in ATTRIBUTE_SCHEMAS.keys():
+                probe_targets[attr] = IGNORE_INDEX
+        else:
+            class_val = target_row.get("class", None)
+            if pd.isna(class_val) or class_val not in self.class_to_idx:
+                probe_targets["class_label"] = IGNORE_INDEX
+            else:
+                probe_targets["class_label"] = self.class_to_idx[class_val]
+                
+            img_attrs = self.vlm_attributes.get(target_img_id, {}) if hasattr(self, "vlm_attributes") else {}
+            for attr in ATTRIBUTE_SCHEMAS.keys():
+                val = img_attrs.get(attr, "unclear")
+                probe_targets[attr] = CommonProbeModel.encode_label(attr, val)
+                
         ret: dict[str, torch.Tensor | str | int | dict] = {
             "eeg": self._get_eeg(idx),
             "target": target,
+            "target_common": target,
+            "probe_targets": probe_targets,
             "image_id": target_img_id,
             "index": int(idx),
             "subject_id": int(subject_id),
         }
         
-        if hasattr(self, "vlm_attributes") and self.vlm_attributes:
-            from mindseye.models.attribute_heads import MultiTaskAttributeHeads, ATTRIBUTE_SCHEMAS
-            attrs_dict = {}
-            img_attrs = self.vlm_attributes.get(target_img_id, {})
-            for attr in ATTRIBUTE_SCHEMAS.keys():
-                val = img_attrs.get(attr, "unclear")
-                attrs_dict[attr] = MultiTaskAttributeHeads.encode_label(attr, val)
-            ret["attrs"] = attrs_dict
-        
-        if hasattr(self, "image_id_to_label"):
-            if mode == "random":
-                # For random targets, pick a completely random label from the bank
-                rand_idx = torch.randint(0, len(self.all_labels_bank), (1,)).item()
-                true_label = self.all_labels_bank[rand_idx]
-            else:
-                true_label = self.image_id_to_label[target_img_id]
-            
-            # Select 15 random distractor labels
-            n_labels = len(self.all_labels_bank)
-            if n_labels > 1:
-                # Get random indices, then filter out the true label (approximate check)
-                rand_indices = torch.randint(0, n_labels, (30,))
-                distractors = []
-                for ri in rand_indices:
-                    cand = self.all_labels_bank[ri]
-                    if (cand - true_label).abs().sum() > 1e-4:
-                        distractors.append(cand)
-                    if len(distractors) == 15:
-                        break
-                
-                # Pad if we couldn't find 15
-                while len(distractors) < 15:
-                    distractors.append(self.all_labels_bank[torch.randint(0, n_labels, (1,)).item()])
-                    
-                distractor_tensor = torch.stack(distractors)
-            else:
-                distractor_tensor = true_label.repeat(15, 1)
-                
-            ret["true_label"] = true_label
-            ret["distractor_labels"] = distractor_tensor
-            
         return ret
 
 

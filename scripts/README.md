@@ -52,13 +52,22 @@ python scripts/build_common_embeddings.py \
     --output data/processed/clip_embeddings/common_embeddings.pt
 
 # 4. Train Model via Baseline Matrix
+# First, pretrain the common probe model on static visual embeddings
+python scripts/pretrain_common_probe.py \
+    --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
+    --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
+    --metadata data/raw/nod/derivatives/detailed_events/sub-01_events.csv \
+    --output-dir outputs/common_probe
+
+# Then, train the EEG model using the baseline matrix and pass the pretrained probe
 python scripts/run_baseline_matrix.py \
     --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08/all_runs_metadata.csv \
     --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08 \
     --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
+    --common-probe outputs/common_probe/common_probe.pt \
+    --probe-weight 0.03 \
     --val-runs 8 \
     --window-mode tight1s \
-    --target-space common \
     --model temporal_attn_small \
     --epochs 50 \
     --batch-size 64 \

@@ -33,10 +33,16 @@ Return ONLY a valid JSON object matching this schema:
   "natural_artificial": "natural" | "artificial" | "mixed" | "unclear",
   "scene_dominance": "isolated_object" | "object_with_background" | "full_scene" | "unclear",
   "real_world_size": "tiny" | "small" | "medium" | "large" | "huge" | "unclear",
-  "dominant_color": "red" | "blue" | "green" | "yellow" | "orange" | "purple" | "pink" | "brown" | "black" | "white" | "gray" | "multicolor" | "unclear",
-  "lighting_condition": "bright_daylight" | "indoor_warm" | "dim_dark" | "high_contrast" | "studio_artificial" | "unclear",
-  "object_presence": "single_object" | "multiple_objects" | "no_clear_object" | "unclear",
-  "contrast_level": "high" | "low" | "unclear"
+  "dominant_color": "red" | "orange" | "yellow" | "green" | "blue" | "purple" | "pink" | "brown" | "black" | "white" | "gray" | "unclear",
+  "main_subject_position_x": "left" | "center" | "right" | "full_frame" | "unclear",
+  "subject_scale": "close_up" | "medium_shot" | "wide_shot" | "unclear",
+  "soft_texture": "yes" | "no" | "unclear",
+  "spiky_or_pointed": "yes" | "no" | "unclear",
+  "furry": "yes" | "no" | "unclear",
+  "metallic": "yes" | "no" | "unclear",
+  "tool_like": "yes" | "no" | "unclear",
+  "vehicle_like": "yes" | "no" | "unclear",
+  "food_like": "yes" | "no" | "unclear"
 }"""
 
 def main():
@@ -65,11 +71,18 @@ def main():
         print(f"Resuming from {len(results)} existing annotations.")
         
     images_to_process = []
+    required_attrs = [
+        "is_animate", "human_visible", "face_visible", "animal_visible",
+        "indoor_outdoor", "natural_artificial", "scene_dominance", "real_world_size",
+        "dominant_color", "main_subject_position_x", "subject_scale",
+        "soft_texture", "spiky_or_pointed", "furry", "metallic",
+        "tool_like", "vehicle_like", "food_like"
+    ]
     for k in image_paths.keys():
         if k not in results:
             images_to_process.append(k)
         else:
-            missing = any(attr not in results[k] for attr in ["dominant_color", "lighting_condition", "object_presence", "contrast_level"])
+            missing = any(attr not in results[k] for attr in required_attrs)
             if missing:
                 images_to_process.append(k)
     print(f"Remaining images to process: {len(images_to_process)}")
@@ -81,11 +94,11 @@ def main():
     # Load Model
     print("Loading Qwen2-VL...")
     model = Qwen2VLForConditionalGeneration.from_pretrained(
-        "Qwen/Qwen2-VL-7B-Instruct",
+        "Qwen/Qwen2-VL-2B-Instruct",
         torch_dtype=torch.bfloat16,
         device_map="auto"
     )
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
     
     # Create chunks
     chunks = [images_to_process[i:i + args.batch_size] for i in range(0, len(images_to_process), args.batch_size)]
@@ -158,9 +171,15 @@ def main():
                   "scene_dominance": "unclear",
                   "real_world_size": "unclear",
                   "dominant_color": "unclear",
-                  "lighting_condition": "unclear",
-                  "object_presence": "unclear",
-                  "contrast_level": "unclear"
+                  "main_subject_position_x": "unclear",
+                  "subject_scale": "unclear",
+                  "soft_texture": "unclear",
+                  "spiky_or_pointed": "unclear",
+                  "furry": "unclear",
+                  "metallic": "unclear",
+                  "tool_like": "unclear",
+                  "vehicle_like": "unclear",
+                  "food_like": "unclear"
                 }
                 
         # Save every chunk to avoid data loss

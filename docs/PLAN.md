@@ -152,7 +152,8 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 - [x] Extract VLM semantic attributes for sub-01 and sub-02 visual stimuli.
 - [x] Implement linear auxiliary weight warmup scaling (epochs 1-20).
 - [x] Train combined multi-subject baseline and multitask architectures.
-- [x] Results: Multitask regularization with warmup successfully stabilized combined multi-subject training and improved Top-10 score from 12.05% to 13.25%.
+- [x] Transition multi-domain semantic front to rely exclusively on a single canonical embedding representation (z_common) with frozen multi-task probe heads prediction.
+- [x] Results: Successfully deleted direct label embedding target space, separate attribute heads, and w_label loss in favor of frozen multi-task probe loss predictions, maintaining single latent integrity. Multitask regularization with warmup successfully stabilized combined multi-subject training and improved Top-10 score from 12.05% to 13.25%.
 
 ### Phase 7: BReAD-style Retrieval Branch (Complete)
 - [x] Build FAISS retrieval index over target image library.

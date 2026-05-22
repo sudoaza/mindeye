@@ -69,10 +69,15 @@ def parse_args() -> argparse.Namespace:
         help="Which embedding space to optimize the loss against",
     )
     p.add_argument(
-        "--w-label",
+        "--common-probe",
+        default=None,
+        help="Path to pretrained common_probe.pt checkpoint",
+    )
+    p.add_argument(
+        "--probe-weight",
         type=float,
-        default=0.2,
-        help="Weight for the auxiliary multiple-choice label classification loss",
+        default=0.03,
+        help="Weight for the auxiliary probe loss",
     )
     p.add_argument("--output-dir", default=None,
                    help="Base output directory. Defaults to outputs/runs/")
@@ -166,13 +171,10 @@ def _batch_to_device(
 ) -> dict:
     ret = {
         "eeg": batch["eeg"].to(device).float(),
-        "target": batch["target"].to(device).float()
+        "target": batch["target_common"].to(device).float() if "target_common" in batch else batch["target"].to(device).float()
     }
-    if "true_label" in batch:
-        ret["true_label"] = batch["true_label"].to(device).float()
-        ret["distractor_labels"] = batch["distractor_labels"].to(device).float()
-    if "attrs" in batch:
-        ret["attrs"] = {k: v.to(device).long() for k, v in batch["attrs"].items()}
+    if "probe_targets" in batch:
+        ret["probe_targets"] = {k: v.to(device).long() for k, v in batch["probe_targets"].items()}
     return ret
 
 
@@ -230,15 +232,15 @@ def _save_env(run_dir: Path, args: argparse.Namespace, setup: dict) -> None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str, attr_model=None) -> dict[str, float]:
+def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str, probe_model=None, active_tasks=None, target_center=None) -> dict[str, float]:
     from mindseye.models.eeg_encoder import retrieval_topk
     import torch
     model.eval()
-    if attr_model:
-        attr_model.eval()
+    if probe_model:
+        probe_model.eval()
     preds, targets = [], []
-    attr_preds_dict = {}
-    attr_targets_dict = {}
+    probe_preds_dict = {task: [] for task in (active_tasks or [])}
+    probe_targets_dict = {task: [] for task in (active_tasks or [])}
     
     with torch.inference_mode():
         for batch in loader:
@@ -246,34 +248,41 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
             subject_id = batch_data.get("subject_id", None)
             kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
             pred = model(batch_data["eeg"], **kwargs)
-            if attr_model and "attrs" in batch_data:
-                a_preds = attr_model(pred)
+            if probe_model and active_tasks and "probe_targets" in batch_data:
+                a_preds = probe_model(pred)
                 
             preds.append(pred.cpu())
             targets.append(batch_data["target"].cpu())
             
-            if attr_model and "attrs" in batch_data:
-                for k, v in a_preds.items():
-                    attr_preds_dict.setdefault(k, []).append(v.cpu())
-                for k, v in batch_data["attrs"].items():
-                    attr_targets_dict.setdefault(k, []).append(v.cpu())
+            if probe_model and active_tasks and "probe_targets" in batch_data:
+                for task in active_tasks:
+                    probe_preds_dict[task].append(a_preds[task].cpu())
+                    probe_targets_dict[task].append(batch_data["probe_targets"][task].cpu())
 
     pred_t = torch.cat(preds)
     target_t = torch.cat(targets)
     
-    loss = float(_loss_fn(pred_t, target_t, loss_name=loss_name, temperature=temperature).item())
+    if target_center is not None:
+        tc = target_center.cpu()
+        pred_t_eval = torch.nn.functional.normalize(pred_t - tc, dim=-1)
+        target_t_eval = torch.nn.functional.normalize(target_t - tc, dim=-1)
+    else:
+        pred_t_eval = torch.nn.functional.normalize(pred_t, dim=-1)
+        target_t_eval = torch.nn.functional.normalize(target_t, dim=-1)
+        
+    loss = float(_loss_fn(pred_t_eval, target_t_eval, loss_name=loss_name, temperature=temperature).item())
     
     metrics = {"loss": loss, "n": int(pred_t.shape[0])}
     
     # evaluate top-k
-    m = retrieval_topk(pred_t, target_t)
+    m = retrieval_topk(pred_t_eval, target_t_eval)
     for k, v in m.items():
         metrics[k] = v
         
     metrics["mean_diag_cosine"] = float(
         (
-            torch.nn.functional.normalize(pred_t, dim=-1)
-            * torch.nn.functional.normalize(target_t, dim=-1)
+            torch.nn.functional.normalize(pred_t_eval, dim=-1)
+            * torch.nn.functional.normalize(target_t_eval, dim=-1)
         )
         .sum(dim=-1)
         .mean()
@@ -285,17 +294,17 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
     for k in (1, 5, 10):
         metrics[f"random_top{k}_expected"] = min(k, n) / n
         
-    if attr_model and attr_preds_dict:
-        from mindseye.models.attribute_heads import IGNORE_INDEX
-        for attr in attr_preds_dict.keys():
-            ap = torch.cat(attr_preds_dict[attr])
-            at = torch.cat(attr_targets_dict[attr])
+    if probe_model and active_tasks and probe_preds_dict:
+        from mindseye.models.common_probe import IGNORE_INDEX
+        for task in active_tasks:
+            ap = torch.cat(probe_preds_dict[task])
+            at = torch.cat(probe_targets_dict[task])
             mask = at != IGNORE_INDEX
             if mask.any():
                 acc = (ap.argmax(dim=-1)[mask] == at[mask]).float().mean().item()
-                metrics[f"attr_{attr}_acc"] = acc
+                metrics[f"probe_{task}_acc"] = acc
             else:
-                metrics[f"attr_{attr}_acc"] = 0.0
+                metrics[f"probe_{task}_acc"] = 0.0
 
     return metrics
 
@@ -318,6 +327,9 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    
+    if args.target_space != "common":
+        print("[WARN] Non-canonical target_space used for ablation only.")
 
     dataset_config = SemanticPairConfig(
             metadata_csv=args.metadata,
@@ -363,6 +375,16 @@ def main() -> None:
         drop_last=args.loss == "contrastive",
     )
     val_loader = DataLoader(Subset(dataset, val_idx), batch_size=args.batch_size, shuffle=False)
+
+    # Compute target center over the training split
+    print("Computing mean target embedding vector over the training set...")
+    with torch.inference_mode():
+        all_train_targets = []
+        for idx in train_idx:
+            all_train_targets.append(dataset._get_targets(idx))
+        target_center = torch.stack(all_train_targets).mean(dim=0).to(device)
+        tc_norm = float(torch.linalg.norm(target_center).item())
+        print(f"Target center vector computed. Norm: {tc_norm:.4f}")
 
     n_channels, n_times = dataset.eeg_shape
     print(f"\n[Dataset] window_mode: {args.window_mode}")
@@ -442,18 +464,28 @@ def main() -> None:
     if getattr(model, "n_channels", n_channels) != n_channels:
         raise ValueError(f"model.n_channels != dataset_eeg_channels")
     
-    attr_model = None
-    if args.vlm_attributes:
-        from mindseye.models.attribute_heads import MultiTaskAttributeHeads, ATTRIBUTE_SCHEMAS
-        attr_model = MultiTaskAttributeHeads(
-            in_features=dataset.embedding_dim,
-            attributes=list(ATTRIBUTE_SCHEMAS.keys())
+    probe_model = None
+    active_tasks = []
+    if args.common_probe:
+        from mindseye.models.common_probe import CommonProbeModel
+        probe_specs_path = Path(args.common_probe).parent / "task_specs.json"
+        if not probe_specs_path.exists():
+            raise FileNotFoundError(f"Active tasks specification not found at {probe_specs_path}")
+        with open(probe_specs_path, "r") as f:
+            active_task_specs = json.load(f)
+        
+        probe_model = CommonProbeModel(
+            embedding_dim=dataset.embedding_dim,
+            task_specs=active_task_specs
         ).to(device)
-        print(f"[Model] attr_model: MultiTaskAttributeHeads with {len(ATTRIBUTE_SCHEMAS)} tasks")
+        probe_model.load_state_dict(torch.load(args.common_probe, map_location=device))
+        probe_model.eval()
+        for p in probe_model.parameters():
+            p.requires_grad = False
+        active_tasks = list(active_task_specs.keys())
+        print(f"[Model] Loaded frozen CommonProbeModel with {len(active_tasks)} active tasks from {args.common_probe}")
         
     opt_params = list(model.parameters())
-    if attr_model is not None:
-        opt_params += list(attr_model.parameters())
         
     optimizer = torch.optim.AdamW(opt_params, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -464,8 +496,8 @@ def main() -> None:
         subject_id = batch_data.get("subject_id", None)
         kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
         pred = model(batch_data["eeg"], **kwargs)
-        if attr_model is not None:
-            attr_pred = attr_model(pred)
+        if probe_model is not None:
+            _ = probe_model(pred)
 
     setup = {
         "items": len(dataset),
@@ -523,10 +555,9 @@ def main() -> None:
     log_fields = ["epoch", "train_loss", "val_loss", "val_score",
                   "top1", "top5", "top10", "mrr", "median_rank", "mean_diag_cosine", "collapse_score"]
                   
-    if attr_model:
-        from mindseye.models.attribute_heads import ATTRIBUTE_SCHEMAS
-        for attr in ATTRIBUTE_SCHEMAS.keys():
-            log_fields.append(f"attr_{attr}_acc")
+    if active_tasks:
+        for task in active_tasks:
+            log_fields.append(f"probe_{task}_acc")
 
     with open(log_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=log_fields).writeheader()
@@ -549,8 +580,6 @@ def main() -> None:
         print(f"\n--- Epoch {epoch}/{args.epochs} (Learning Rate: {lr:.6f}) ---")
         
         model.train()
-        if attr_model:
-            attr_model.train()
         train_losses: list[float] = []
         for batch in train_loader:
             batch_data = _batch_to_device(batch, device)
@@ -560,72 +589,41 @@ def main() -> None:
             pred = model(batch_data["eeg"], **kwargs)
             
             # Primary contrastive loss
-            loss = _loss_fn(pred, batch_data["target"], loss_name=args.loss, temperature=args.temperature)
+            if target_center is not None:
+                pred_for_loss = torch.nn.functional.normalize(pred - target_center, dim=-1)
+                target_for_loss = torch.nn.functional.normalize(batch_data["target"] - target_center, dim=-1)
+            else:
+                pred_for_loss = pred
+                target_for_loss = batch_data["target"]
+                
+            loss = _loss_fn(pred_for_loss, target_for_loss, loss_name=args.loss, temperature=args.temperature)
             
-            # Auxiliary semantic attribute loss
-            if attr_model and "attrs" in batch_data and epoch >= args.aux_start_epoch:
+            # Auxiliary probe loss
+            if probe_model is not None and "probe_targets" in batch_data:
                 import torch.nn.functional as F
-                from mindseye.models.attribute_heads import IGNORE_INDEX
-                attr_preds = attr_model(pred)
+                from mindseye.models.common_probe import IGNORE_INDEX
+                logits_dict = probe_model(pred)
                 
-                # Warmup factor calculation
-                if args.aux_warmup_epochs > 0:
-                    warmup_factor = min(1.0, (epoch - args.aux_start_epoch + 1) / args.aux_warmup_epochs)
-                else:
-                    warmup_factor = 1.0
+                probe_loss = 0.0
+                has_active = False
+                for task in active_tasks:
+                    task_targets = batch_data["probe_targets"][task]
+                    if (task_targets != IGNORE_INDEX).any():
+                        task_loss = F.cross_entropy(logits_dict[task], task_targets, ignore_index=IGNORE_INDEX)
+                        probe_loss += task_loss
+                        has_active = True
                 
-                # Attribute weights
-                attr_weights = {
-                    "is_animate": 0.005,
-                    "human_visible": 0.005,
-                    "face_visible": 0.005,
-                    "animal_visible": 0.005,
-                    "indoor_outdoor": 0.005,
-                    "natural_artificial": 0.005,
-                    "scene_dominance": 0.005,
-                    "real_world_size": 0.005,
-                    "dominant_color": 0.005,
-                    "lighting_condition": 0.005,
-                    "object_presence": 0.005,
-                    "contrast_level": 0.005,
-                }
-                
-                for attr_name, attr_pred in attr_preds.items():
-                    attr_target = batch_data["attrs"][attr_name]
-                    # Compute cross entropy, ignoring IGNORE_INDEX (-100)
-                    w = attr_weights.get(attr_name, 0.05) * warmup_factor
-                    loss += w * F.cross_entropy(attr_pred, attr_target, ignore_index=IGNORE_INDEX)
-            
-            # Auxiliary multi-choice classification loss
-            if "true_label" in batch_data and args.w_label > 0:
-                import torch.nn.functional as F
-                # pred: [B, D]
-                # true_label: [B, D]
-                # distractor_labels: [B, 15, D]
-                
-                # Normalize pred to get true cosine similarities
-                pred_norm = F.normalize(pred, dim=-1)
-                
-                # Similarity to true label [B, 1]
-                true_sim = (pred_norm * batch_data["true_label"]).sum(dim=-1, keepdim=True)
-                # Similarity to distractors [B, 15]
-                dist_sim = torch.bmm(batch_data["distractor_labels"], pred_norm.unsqueeze(2)).squeeze(2)
-                
-                # Combine [B, 16]
-                logits = torch.cat([true_sim, dist_sim], dim=1)
-                
-                # True label is always at index 0
-                label_idx = torch.zeros(pred.shape[0], dtype=torch.long, device=device)
-                loss_ce = F.cross_entropy(logits / args.temperature, label_idx)
-                
-                loss = loss + args.w_label * loss_ce
+                if has_active:
+                    loss = loss + args.probe_weight * probe_loss
                 
             loss.backward()
             optimizer.step()
             train_losses.append(float(loss.item()))
 
         val = evaluate(model, val_loader, device, loss_name=args.loss,
-                       temperature=args.temperature, target_space=args.target_space, attr_model=attr_model)
+                       temperature=args.temperature, target_space=args.target_space,
+                       probe_model=probe_model, active_tasks=active_tasks,
+                       target_center=target_center)
         score = float(val["mrr"] + 0.25 * val["top10"])
         if val["collapse_score"] < 0.1:
             score = -1.0
@@ -643,7 +641,7 @@ def main() -> None:
             "collapse_score": val["collapse_score"]
         }
         for k, v in val.items():
-            if k.startswith("attr_"):
+            if k.startswith("probe_"):
                 row[k] = v
                 
         history.append(row)
@@ -671,9 +669,10 @@ def main() -> None:
                     "top10": best_top10,
                     "collapse_score": best_collapse_score,
                 },
+                "target_center": target_center.cpu() if target_center is not None else None,
             }
-            if attr_model is not None:
-                save_dict["attr_model_state"] = attr_model.state_dict()
+            if probe_model is not None:
+                save_dict["probe_model_state"] = probe_model.state_dict()
             torch.save(save_dict, run_dir / "best.pt")
         else:
             epochs_without_improvement += 1
@@ -686,11 +685,15 @@ def main() -> None:
 
     ckpt = torch.load(run_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model_state"])
-    if attr_model is not None and "attr_model_state" in ckpt:
-        attr_model.load_state_dict(ckpt["attr_model_state"])
+    if probe_model is not None and "probe_model_state" in ckpt:
+        probe_model.load_state_dict(ckpt["probe_model_state"])
+    target_center_eval = ckpt.get("target_center", None)
+    if target_center_eval is not None:
+        target_center_eval = target_center_eval.to(device)
     final_metrics = evaluate(model, val_loader, device, loss_name=args.loss,
                              temperature=args.temperature, target_space=args.target_space,
-                             attr_model=attr_model)
+                             probe_model=probe_model, active_tasks=active_tasks,
+                             target_center=target_center_eval)
     final_metrics["best_epoch"] = int(ckpt["epoch"])
     final_metrics["best_score"] = float(best_score)
     final_metrics["best_mrr"] = float(best_mrr) if best_mrr is not None else None

@@ -81,7 +81,6 @@ def run_condition(
         "--output-dir",     str(matrix_dir),
         "--slug",           f"{name}_{args.slug}" if args.slug else name,
         "--window-mode",     args.window_mode,
-        "--target-space",    args.target_space,
         "--model",           args.model,
         "--seed",            str(getattr(args, "seed", 13)),
     ]
@@ -103,6 +102,8 @@ def run_condition(
         ("aug_amp_scale", "--aug-amp-scale"),
         ("aug_time_mask", "--aug-time-mask"),
         ("aug_time_jitter", "--aug-time-jitter"),
+        ("common_probe", "--common-probe"),
+        ("probe_weight", "--probe-weight"),
     ]:
         value = getattr(args, arg_name, None)
         if value is not None:
@@ -204,8 +205,10 @@ def main() -> None:
     p.add_argument("--seed",           type=int, default=13)
     p.add_argument("--window-mode",     choices=("crop", "full5s", "full5s_backaligned", "tight1s"), default="crop")
     p.add_argument("--add-event-marker", action="store_true")
-    p.add_argument("--target-space", choices=("common", "semantic", "image", "label"), default="common",
-                   help="Which embedding space to optimize the loss against")
+    p.add_argument("--common-probe", default=None,
+                   help="Path to pretrained common_probe.pt checkpoint")
+    p.add_argument("--probe-weight", type=float, default=0.03,
+                   help="Weight for the auxiliary probe loss")
     p.add_argument("--model",           choices=("cnn", "temporal_attn", "temporal_attn_small", "spatial_temporal", "spatial_temporal_small"), default="cnn")
     p.add_argument("--hidden-dim",      type=int, default=None)
     p.add_argument("--n-layers",        type=int, default=None)
@@ -221,11 +224,28 @@ def main() -> None:
     p.add_argument("--aug-time-jitter", type=int, default=8)
     p.add_argument("--vlm-attributes", default=None,
                    help="Path to vlm_attributes.json for auxiliary multitask semantic training")
+    p.add_argument("--subjects", default=None,
+                   help="Comma-separated list of subjects (e.g. sub-01,sub-02,sub-03,sub-04). Overrides --metadata and --epochs-dir.")
+    p.add_argument("--run-range", default="01_40",
+                   help="Run range for directory template when using --subjects, e.g. 01_40")
     p.add_argument("--conditions",     nargs="*", default=None,
                    help="Subset of condition names to run (default: all 6)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print planned conditions and exit without training")
     args = p.parse_args()
+    
+    if args.subjects:
+        subjects = [s.strip() for s in args.subjects.split(",") if s.strip()]
+        meta_paths = []
+        ep_paths = []
+        for sub in subjects:
+            sub_compact = sub.replace("-", "")
+            base = f"data/processed/semantic_epochs/zuna_{args.window_mode}_{sub_compact}_runs{args.run_range}"
+            meta_paths.append(f"{base}/all_runs_metadata.csv")
+            ep_paths.append(base)
+        args.metadata = ",".join(meta_paths)
+        args.epochs_dir = ",".join(ep_paths)
+
     if args.model == "temporal_attn_small" and args.weight_decay == 1e-4:
         args.weight_decay = 1e-2
 
