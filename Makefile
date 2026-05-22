@@ -1,4 +1,4 @@
-.PHONY: setup pipeline matrix simulate
+.PHONY: setup pipeline matrix simulate fold_replication
 
 setup:
 	python3 -m venv venv
@@ -69,3 +69,14 @@ simulate:
 			python scripts/simulate_low_channel_zuna.py \
 				--subject sub-01 --run $$run; \
 		done
+
+# Run fold replication sweep (5 folds x 3 probe weights)
+fold_replication:
+	. venv/bin/activate && python -u scripts/run_fold_replication.py \
+		--metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
+		--epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40 \
+		--common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
+		--common-probe outputs/common_probe/common_probe.pt \
+		--epochs 50 \
+		--batch-size 64 \
+		--device cuda
