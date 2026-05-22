@@ -115,39 +115,31 @@ EEG  → z_pred_common                     (trained encoder output)
 frozen_probe(normalize(z_pred_common))   (semantic regularizer, 10 tasks)
 ```
 
-### Latest Gate Result (Sprint 2, 40-run multi-subject)
-```
-zuna_real     top10=20.2%  MRR=9.6%   collapse=0.862   ✅
-zuna_shuffled top10=9.7%   MRR=5.2%
-zuna_random   top10=11.3%  MRR=4.4%
+> [!NOTE]
+> Frozen z_common probes are now canonical after single-subject probe sweep.
+> Default `probe_weight = 0.03`.
+> `0.05` achieved best Top-10 but must be cross-fold validated.
+> Training-time probe accuracy logging remains a known bug.
 
-GATE: PASS
-```
+### Single-Subject Probe Sweep Results (sub-01, runs 01_40, val_runs=8)
+| probe weight |    Top-10 |      MRR |  collapse |
+| -----------: | --------: | -------: | --------: |
+|         0.00 |     13.7% |     7.9% |     0.677 |
+|         0.01 |     18.5% | **9.6%** | **0.978** |
+|   **0.03**   |     20.2% | **9.6%** |     0.862 |
+|         0.05 | **21.0%** |     9.4% |     0.911 |
+|         0.10 |     17.7% |     9.4% |     0.645 |
 
-### Probe Pretraining Results (on z_common, 40 runs)
-| Task | Accuracy | Baseline |
-|---|---|---|
-| class_label | 21.6% | 0.1% |
-| dominant_color | 65.1% | 28.7% |
-| is_animate | 79.4% | 50% |
-| human_visible | 90.1% | 50% |
-| face_visible | 89.3% | 50% |
-| animal_visible | 88.7% | 50% |
-| indoor_outdoor | 72.3% | 33% |
-| soft_texture | 61.2% | 50% |
-| spiky_or_pointed | 58.4% | 50% |
-| furry | 73.8% | 50% |
-
-### Known Issues / In Progress
-- **Probe accuracy during EEG training** was 0.0 throughout due to normalization mismatch: probe pretrained on `F.normalize(z_common)` but EEG training applied probe to raw `pred`. **Fixed in current sprint** — must verify probe_acc rises above 0 after re-run.
-- **Multi-subject audit**: pipeline supports 4 subjects but hasn't been verified to actually load all 4. Subject audit fields added to setup JSON in current sprint.
-- **Probe ablation pending**: need to prove `probe_weight=0.03` improves retrieval vs `probe_weight=0` before making probes canonical.
+### Known Issues / Status
+- **Training-time probe accuracy logging**: remains a known bug (although normalization path mismatch and auto-detection have been implemented in the codebase, the logging output needs validation through the completed fold replication sweep).
+- **Multi-subject audit**: pipeline supports 4 subjects. Audit fields (subjects_loaded, samples_per_subject, subjects_skipped) are printed in the setup block.
+- **Cross-Fold Replication Sweep**: currently running 15 conditions (5 validation folds x 3 probe weights: 0.0, 0.03, 0.05) to verify if `0.05` consistently outperforms `0.03` across different validation runs.
 
 ### Immediate Next Steps
-1. Run `make ablation` on pod — no-probe vs probe=0.03 (key comparison)
-2. Run `python scripts/eval_probe_sanity.py` to verify probe(z_common) matches pretraining accuracy
-3. Verify probe_*_acc rises above 0 after normalization fix
-4. Run `make probe_sweep` if ablation shows probes help
+1. Monitor the fold replication sweep progress.
+2. Sync the fold replication outputs (`summary.csv`) from the remote pod once complete.
+3. If `0.05` is replicated as superior, promote it to the canonical default; otherwise retain `0.03`.
+4. Transition to Phase 10 (Image Reconstruction / Diffusion) once fold replication is finalized.
 
 ---
 
