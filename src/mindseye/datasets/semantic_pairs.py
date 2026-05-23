@@ -40,6 +40,8 @@ class SemanticPairConfig:
     aug_amp_scale: float = 0.10
     aug_time_mask: int = 24
     aug_time_jitter: int = 8
+    is_calibration: bool = False
+
 
 
 class ZunaClipPairDataset(Dataset):
@@ -404,7 +406,17 @@ class ZunaClipPairDataset(Dataset):
                 
             img_attrs = self.vlm_attributes.get(target_img_id, {}) if hasattr(self, "vlm_attributes") else {}
             for attr in ATTRIBUTE_SCHEMAS.keys():
-                val = img_attrs.get(attr, "unclear")
+                if attr in target_row:
+                    val = target_row[attr]
+                else:
+                    val = img_attrs.get(attr, "unclear")
+                
+                if pd.isna(val):
+                    val = "unclear"
+                elif isinstance(val, bool):
+                    val = "yes" if val else "no"
+                else:
+                    val = str(val)
                 probe_targets[attr] = CommonProbeModel.encode_label(attr, val)
                 
         ret: dict[str, torch.Tensor | str | int | dict] = {
@@ -415,9 +427,30 @@ class ZunaClipPairDataset(Dataset):
             "image_id": target_img_id,
             "index": int(idx),
             "subject_id": int(subject_id),
+            "is_calibration": int(getattr(self.config, "is_calibration", False)),
         }
         
         return ret
+
+
+class MixedBalancedDataset(Dataset):
+    """Interleaves natural and calibration dataset samples to ensure balanced sampling (50/50)."""
+    def __init__(self, natural_dataset: Dataset, calibration_dataset: Dataset):
+        self.natural_dataset = natural_dataset
+        self.calibration_dataset = calibration_dataset
+        # We define length as 2 * len(natural_dataset) to cover all natural samples.
+        self.length = 2 * len(natural_dataset)
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int) -> dict:
+        if idx % 2 == 0:
+            nat_idx = (idx // 2) % len(self.natural_dataset)
+            return self.natural_dataset[nat_idx]
+        else:
+            cal_idx = (idx // 2) % len(self.calibration_dataset)
+            return self.calibration_dataset[cal_idx]
 
 
 def split_indices(n_items: int, *, val_fraction: float = 0.15, seed: int = 13) -> tuple[list[int], list[int]]:
@@ -427,3 +460,4 @@ def split_indices(n_items: int, *, val_fraction: float = 0.15, seed: int = 13) -
     perm = torch.randperm(n_items, generator=gen).tolist()
     n_val = max(1, int(round(n_items * val_fraction)))
     return perm[n_val:], perm[:n_val]
+

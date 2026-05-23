@@ -23,6 +23,7 @@ COARSE_ATTRIBUTES = [
     "face_visible",
     "animal_visible",
     "indoor_outdoor",
+    "natural_artificial",
     "dominant_color",
     "soft_texture",
     "spiky_or_pointed",
@@ -52,9 +53,21 @@ def parse_args() -> argparse.Namespace:
         help="Path to vlm_attributes_runs01_40.json",
     )
     p.add_argument(
+        "--common-probe",
+        default=None,
+        help="Path to pretrained common_probe.pt checkpoint for attribute-constrained reranking",
+    )
+    p.add_argument(
         "--output-dir",
         required=True,
         help="Directory to save the evaluation results and retrieval grids",
+    )
+    p.add_argument(
+        "--rerank-mode",
+        type=str,
+        default="cosine_attr_div",
+        choices=["cosine", "attr", "cosine_attr", "cosine_attr_div"],
+        help="Reranking mode to use (default: cosine_attr_div)",
     )
     p.add_argument(
         "--top-k",
@@ -250,6 +263,24 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     
+    probe_model = None
+    if args.common_probe:
+        print(f"Loading Common Probe from {args.common_probe}...")
+        from mindseye.models.common_probe import CommonProbeModel, ATTRIBUTE_SCHEMAS
+        probe_specs_path = Path(args.common_probe).parent / "task_specs.json"
+        if not probe_specs_path.exists():
+            raise FileNotFoundError(f"Active tasks specification not found at {probe_specs_path}")
+        with open(probe_specs_path, "r") as f:
+            task_specs = json.load(f)
+        probe_model = CommonProbeModel(
+            embedding_dim=dataset.embedding_dim,
+            task_specs=task_specs,
+        ).to(device)
+        probe_model.load_state_dict(torch.load(args.common_probe, map_location=device))
+        probe_model.eval()
+        for param in probe_model.parameters():
+            param.requires_grad = False
+    
     # Load target center if available
     target_center = checkpoint.get("target_center")
     if target_center is not None:
@@ -281,6 +312,7 @@ def main() -> None:
     print("Computing predicted EEG embeddings...")
     preds = []
     ground_truth_ids = []
+    predicted_attributes = []
     
     with torch.no_grad():
         for batch in val_loader:
@@ -292,68 +324,137 @@ def main() -> None:
             pred = model(eeg, **kwargs)
             if isinstance(pred, tuple):
                 pred = pred[0]
-            preds.append(pred)
+            preds.append(pred.cpu())
             ground_truth_ids.extend(batch["image_id"])
+            
+            if probe_model is not None:
+                logits_dict = probe_model(F.normalize(pred, dim=-1))
+                batch_size = pred.shape[0]
+                batch_attrs = [{} for _ in range(batch_size)]
+                for attr in COARSE_ATTRIBUTES:
+                    if attr in logits_dict:
+                        preds_idx = logits_dict[attr].argmax(dim=-1).cpu().numpy()
+                        for i in range(batch_size):
+                            batch_attrs[i][attr] = ATTRIBUTE_SCHEMAS[attr][preds_idx[i]]
+                predicted_attributes.extend(batch_attrs)
             
     preds = torch.cat(preds)
     
-    # Center centering correction (to evaluate in the same space as training)
-    # The FAISS index itself was built from raw un-centered embeddings, but if target_center is saved,
-    # we should check if our queries need to be centered or not. Let's see: predicted embeddings are mapped
-    # to target space. The FAISS index searches raw image embeddings, so we search using pred directly.
-    
-    print(f"Querying FAISS index for top-{args.top_k} visual priors...")
-    distances, retrieved_ids = index.search(preds.cpu(), k=args.top_k)
+    # Reranking requires querying more candidates initially (e.g., top-200)
+    coarse_k = 200 if probe_model is not None else args.top_k
+    print(f"Querying FAISS index for top-{coarse_k} visual priors...")
+    distances, retrieved_ids = index.search(preds, k=coarse_k)
     
     # Evaluate CLIP similarity and attribute agreement per trial
     clip_similarities = []
     attribute_matches = {attr: [] for attr in COARSE_ATTRIBUTES}
+    attribute_matches["class_family"] = []
     
     results = []
     
     for i in range(len(val_idx)):
         gt_id = ground_truth_ids[i]
         gt_emb = image_id_to_common[gt_id].float()
-        
-        # Normalize gt embedding
         gt_emb_norm = gt_emb / torch.linalg.norm(gt_emb)
+        gt_attrs = vlm_attributes.get(gt_id, {})
+        gt_wordnet = gt_id.split("_")[0]
         
+        candidates = []
+        for rank_200 in range(coarse_k):
+            ret_id = retrieved_ids[i][rank_200]
+            ret_emb = image_id_to_common[ret_id].float()
+            ret_emb_norm = ret_emb / torch.linalg.norm(ret_emb)
+            sim_gt = float(torch.dot(gt_emb_norm, ret_emb_norm).item())
+            ret_attrs = vlm_attributes.get(ret_id, {})
+            
+            # Feature agreement with PREDICTED attributes
+            attr_agreements = []
+            if predicted_attributes:
+                for attr in COARSE_ATTRIBUTES:
+                    pred_val = predicted_attributes[i].get(attr, "unclear")
+                    ret_val = ret_attrs.get(attr, "unclear")
+                    if pred_val != "unclear" and ret_val != "unclear":
+                        attr_agreements.append(1.0 if pred_val == ret_val else 0.0)
+            attr_score = sum(attr_agreements) / len(attr_agreements) if attr_agreements else 0.0
+            
+            candidates.append({
+                "image_id": ret_id,
+                "pred_cosine": float(distances[i][rank_200]),
+                "sim_gt": sim_gt,
+                "attr_score": attr_score,
+                "ret_attrs": ret_attrs,
+                "original_rank": rank_200,
+            })
+            
+        # Semantic Montage Reranking
+        montage_selected = []
+        selected_classes = set()
+        
+        if probe_model is not None:
+            while len(montage_selected) < args.top_k and candidates:
+                best_score = -999.0
+                best_idx = -1
+                for c_idx, c in enumerate(candidates):
+                    wordnet_class = c["image_id"].split("_")[0]
+                    diversity_reward = 1.0 if wordnet_class not in selected_classes else 0.0
+                    
+                    if args.rerank_mode == "cosine":
+                        score = c["pred_cosine"]
+                    elif args.rerank_mode == "attr":
+                        score = c["attr_score"]
+                    elif args.rerank_mode == "cosine_attr":
+                        score = 0.60 * c["pred_cosine"] + 0.25 * c["attr_score"]
+                    elif args.rerank_mode == "cosine_attr_div":
+                        score = 0.60 * c["pred_cosine"] + 0.25 * c["attr_score"] + 0.15 * diversity_reward
+                    else:
+                        score = c["pred_cosine"]
+                        
+                    if score > best_score:
+                        best_score = score
+                        best_idx = c_idx
+                best_cand = candidates.pop(best_idx)
+                selected_classes.add(best_cand["image_id"].split("_")[0])
+                montage_selected.append(best_cand)
+        else:
+            montage_selected = candidates[:args.top_k]
+            
+        # Overwrite retrieved_ids and distances to reflect the reranked top-K so grids work
+        retrieved_ids[i][:args.top_k] = [c["image_id"] for c in montage_selected]
+        distances[i][:args.top_k] = [c["pred_cosine"] for c in montage_selected]
+            
         trial_clip_sims = []
         trial_attr_matches = {attr: [] for attr in COARSE_ATTRIBUTES}
-        
-        gt_attrs = vlm_attributes.get(gt_id, {})
+        trial_attr_matches["class_family"] = []
         
         retrieved_list = []
         for rank in range(args.top_k):
-            ret_id = retrieved_ids[i][rank]
-            ret_emb = image_id_to_common[ret_id].float()
+            c = montage_selected[rank]
+            ret_id = c["image_id"]
+            ret_attrs = c["ret_attrs"]
             
-            # Normalize retrieved embedding
-            ret_emb_norm = ret_emb / torch.linalg.norm(ret_emb)
+            trial_clip_sims.append(c["sim_gt"])
             
-            # Compute CLIP cosine similarity
-            sim = float(torch.dot(gt_emb_norm, ret_emb_norm).item())
-            trial_clip_sims.append(sim)
-            
-            # Compute Attribute Agreement
-            ret_attrs = vlm_attributes.get(ret_id, {})
+            # Compute Attribute Agreement vs Ground Truth
             for attr in COARSE_ATTRIBUTES:
                 gt_val = gt_attrs.get(attr, "unclear")
                 ret_val = ret_attrs.get(attr, "unclear")
-                is_match = 1.0 if gt_val == ret_val else 0.0
-                trial_attr_matches[attr].append(is_match)
-                
+                trial_attr_matches[attr].append(1.0 if gt_val == ret_val else 0.0)
+            
+            ret_wordnet = ret_id.split("_")[0]
+            trial_attr_matches["class_family"].append(1.0 if gt_wordnet == ret_wordnet else 0.0)
+            
             retrieved_list.append({
                 "rank": rank + 1,
                 "image_id": ret_id,
-                "score": float(distances[i][rank]),
-                "clip_similarity": sim,
+                "score": c.get("pred_cosine", 0.0),
+                "clip_similarity": c["sim_gt"],
                 "attributes": {attr: ret_attrs.get(attr, "unclear") for attr in COARSE_ATTRIBUTES}
             })
             
         clip_similarities.append(trial_clip_sims)
         for attr in COARSE_ATTRIBUTES:
             attribute_matches[attr].append(trial_attr_matches[attr])
+        attribute_matches["class_family"].append(trial_attr_matches["class_family"])
             
         results.append({
             "trial_index": int(val_idx[i]),
@@ -367,7 +468,7 @@ def main() -> None:
     
     top1_sim = clip_similarities[:, 0].mean()
     top5_sim = clip_similarities[:, :5].mean(axis=1).mean()
-    top10_sim = clip_similarities[:, :10].mean(axis=1).mean()
+    top10_sim = clip_similarities[:, :10].mean(axis=1).mean() if args.top_k >= 10 else 0.0
     
     attr_top1 = {}
     attr_top5 = {}
@@ -377,20 +478,23 @@ def main() -> None:
     overall_top5_match = []
     overall_top10_match = []
     
-    for attr in COARSE_ATTRIBUTES:
+    ALL_EVAL_ATTRS = COARSE_ATTRIBUTES + ["class_family"]
+    
+    for attr in ALL_EVAL_ATTRS:
         matches = np.array(attribute_matches[attr])  # [N, top_k]
         
         attr_top1[attr] = matches[:, 0].mean()
         attr_top5[attr] = matches[:, :5].mean(axis=1).mean()
-        attr_top10[attr] = matches[:, :10].mean(axis=1).mean()
+        if args.top_k >= 10:
+            attr_top10[attr] = matches[:, :10].mean(axis=1).mean()
+            overall_top10_match.append(matches[:, :10].mean(axis=1))
         
         overall_top1_match.append(matches[:, 0])
         overall_top5_match.append(matches[:, :5].mean(axis=1))
-        overall_top10_match.append(matches[:, :10].mean(axis=1))
         
     mean_top1_attr = np.mean(overall_top1_match)
     mean_top5_attr = np.mean(overall_top5_match)
-    mean_top10_attr = np.mean(overall_top10_match)
+    mean_top10_attr = np.mean(overall_top10_match) if args.top_k >= 10 else 0.0
     
     summary_metrics = {
         "clip_similarity": {
@@ -402,9 +506,9 @@ def main() -> None:
             "top1_mean": float(mean_top1_attr),
             "top5_mean": float(mean_top5_attr),
             "top10_mean": float(mean_top10_attr),
-            "per_attribute_top1": {a: float(attr_top1[a]) for a in COARSE_ATTRIBUTES},
-            "per_attribute_top5": {a: float(attr_top5[a]) for a in COARSE_ATTRIBUTES},
-            "per_attribute_top10": {a: float(attr_top10[a]) for a in COARSE_ATTRIBUTES}
+            "per_attribute_top1": {a: float(attr_top1[a]) for a in ALL_EVAL_ATTRS},
+            "per_attribute_top5": {a: float(attr_top5[a]) for a in ALL_EVAL_ATTRS},
+            "per_attribute_top10": {a: float(attr_top10.get(a, 0.0)) for a in ALL_EVAL_ATTRS}
         }
     }
     
@@ -413,13 +517,13 @@ def main() -> None:
     print("\nCLIP Cosine Similarity:")
     print(f"  Top-1:  {top1_sim:.4f}")
     print(f"  Top-5:  {top5_sim:.4f}")
-    print(f"  Top-10: {top10_sim:.4f}")
+    if args.top_k >= 10: print(f"  Top-10: {top10_sim:.4f}")
     print("\nMean Attribute Agreement:")
     print(f"  Top-1:  {mean_top1_attr:.4f}")
     print(f"  Top-5:  {mean_top5_attr:.4f}")
-    print(f"  Top-10: {mean_top10_attr:.4f}")
+    if args.top_k >= 10: print(f"  Top-10: {mean_top10_attr:.4f}")
     print("\nPer-Attribute Top-1 Agreement:")
-    for a in COARSE_ATTRIBUTES:
+    for a in ALL_EVAL_ATTRS:
         print(f"  {a:<20}: {attr_top1[a]:.4f}")
     print("====================================================")
     
@@ -434,6 +538,23 @@ def main() -> None:
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
     print(f"Successfully saved evaluation report to: {report_path}")
+    
+    # Save conditioning object for downstream diffusion
+    conditioning_priors = {
+        "z_pred_common": preds,
+        "predicted_attributes": predicted_attributes,
+        "trials": []
+    }
+    for r in results:
+        conditioning_priors["trials"].append({
+            "trial_index": r["trial_index"],
+            "ground_truth_image_id": r["ground_truth_image_id"],
+            "top_k_priors": [item["image_id"] for item in r["retrieved_results"]],
+            "prior_scores": [item["score"] for item in r["retrieved_results"]],
+        })
+    cond_path = output_dir / "conditioning_priors.pt"
+    torch.save(conditioning_priors, cond_path)
+    print(f"Successfully saved conditioning priors to: {cond_path}")
     
     # Generate visual retrieval grids
     print(f"Generating visual retrieval grids for first {args.num_grid_examples} validation trials...")

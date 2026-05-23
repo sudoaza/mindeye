@@ -77,11 +77,38 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--probe-weight",
         type=float,
-        default=0.04,
-        help="Weight for the auxiliary probe loss",
+        default=0.05,
+        help="Weight for the auxiliary probe loss on natural images",
+    )
+    p.add_argument(
+        "--calibration-weight",
+        type=float,
+        default=0.05,
+        help="Weight for the auxiliary probe loss on visual calibration stimuli",
+    )
+    p.add_argument(
+        "--calibration-metadata",
+        default=None,
+        help="Path to calibration metadata CSV file",
+    )
+    p.add_argument(
+        "--calibration-epochs-dir",
+        default=None,
+        help="Path to calibration epochs directory",
+    )
+    p.add_argument(
+        "--calibration-epochs-dir-raw",
+        default=None,
+        help="Path to calibration raw epochs directory",
+    )
+    p.add_argument(
+        "--calibration-epochs-dir-resample",
+        default=None,
+        help="Path to calibration resampled epochs directory",
     )
     p.add_argument("--output-dir", default=None,
                    help="Base output directory. Defaults to outputs/runs/")
+
     p.add_argument("--slug", default=None,
                    help="Optional slug appended to the run directory name")
     p.add_argument("--window-mode", choices=("crop", "full5s", "full5s_backaligned", "tight1s"), default="crop",
@@ -176,7 +203,19 @@ def _batch_to_device(
     }
     if "probe_targets" in batch:
         ret["probe_targets"] = {k: v.to(device).long() for k, v in batch["probe_targets"].items()}
+    if "is_calibration" in batch:
+        if isinstance(batch["is_calibration"], torch.Tensor):
+            ret["is_calibration"] = batch["is_calibration"].to(device).bool()
+        else:
+            # Handle non-tensor values
+            ret["is_calibration"] = torch.tensor(batch["is_calibration"], device=device).bool()
+    if "subject_id" in batch:
+        if isinstance(batch["subject_id"], torch.Tensor):
+            ret["subject_id"] = batch["subject_id"].to(device).long()
+        else:
+            ret["subject_id"] = torch.tensor(batch["subject_id"], device=device).long()
     return ret
+
 
 
 def _loss_fn(pred, target, *, loss_name: str, temperature: float):
@@ -378,18 +417,71 @@ def main() -> None:
             )
         )
 
+    calib_dataset = None
+    calib_config = None
+    if args.calibration_metadata and (args.calibration_epochs_dir or args.calibration_epochs_dir_raw or args.calibration_epochs_dir_resample):
+        calib_config = SemanticPairConfig(
+            metadata_csv=args.calibration_metadata,
+            epochs_dir=args.calibration_epochs_dir,
+            epochs_dir_raw=args.calibration_epochs_dir_raw,
+            epochs_dir_resample=args.calibration_epochs_dir_resample,
+            common_embeddings_pt=args.common_embeddings,
+            vlm_attributes_json=None,
+            input_domain=args.input_domain,
+            target_mode="real",
+            window_mode=args.window_mode,
+            target_space=args.target_space,
+            add_event_marker=args.add_event_marker,
+            augment_eeg=False,
+            is_calibration=True,
+        )
+        calib_dataset = ZunaClipPairDataset(calib_config)
+        print(f"[Dataset] Loaded calibration dataset: {len(calib_dataset)} samples")
+
+    calib_train_dataset = calib_dataset
+    if args.augment_eeg and calib_dataset is not None:
+        calib_train_dataset = ZunaClipPairDataset(
+            SemanticPairConfig(
+                **{**calib_config.__dict__,
+                   "augment_eeg": True,
+                   "aug_channel_dropout": args.aug_channel_dropout,
+                   "aug_noise_std": args.aug_noise_std,
+                   "aug_amp_scale": args.aug_amp_scale,
+                   "aug_time_mask": args.aug_time_mask,
+                   "aug_time_jitter": args.aug_time_jitter}
+            )
+        )
+
     if args.split_mode == "run":
         train_idx, val_idx = _split_by_run(dataset, _parse_val_runs(args.val_runs))
     else:
         train_idx, val_idx = split_indices(len(dataset), val_fraction=args.val_fraction, seed=args.seed)
 
-    train_loader = DataLoader(
-        Subset(train_dataset, train_idx),
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=args.loss == "contrastive",
-    )
-    val_loader = DataLoader(Subset(dataset, val_idx), batch_size=args.batch_size, shuffle=False)
+    calib_val_loader = None
+    if calib_dataset is not None:
+        from mindseye.datasets.semantic_pairs import MixedBalancedDataset
+        calib_train_idx, calib_val_idx = split_indices(len(calib_dataset), val_fraction=args.val_fraction, seed=args.seed)
+        train_mixed = MixedBalancedDataset(
+            Subset(train_dataset, train_idx),
+            Subset(calib_train_dataset, calib_train_idx)
+        )
+        train_loader = DataLoader(
+            train_mixed,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=args.loss == "contrastive",
+        )
+        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=args.batch_size, shuffle=False)
+        calib_val_loader = DataLoader(Subset(calib_dataset, calib_val_idx), batch_size=args.batch_size, shuffle=False)
+    else:
+        train_loader = DataLoader(
+            Subset(train_dataset, train_idx),
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=args.loss == "contrastive",
+        )
+        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=args.batch_size, shuffle=False)
+
 
     # Compute target center over the training split
     print("Computing mean target embedding vector over the training set...")
@@ -591,9 +683,17 @@ def main() -> None:
             log_fields.append(f"probe_{task}_acc")
             if task == "class_label":
                 log_fields.append("probe_class_label_top10_acc")
+                
+    if calib_val_loader is not None and active_tasks:
+        for task in active_tasks:
+            log_fields.append(f"calib_probe_{task}_acc")
+            if task == "class_label":
+                log_fields.append("calib_probe_class_label_top10_acc")
+
 
     with open(log_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=log_fields).writeheader()
+
 
     for epoch in range(1, args.epochs + 1):
         # Adjust learning rate with linear warmup + cosine annealing
@@ -640,15 +740,18 @@ def main() -> None:
                 
                 probe_loss = 0.0
                 has_active = False
+                is_calib = batch_data.get("is_calibration", torch.zeros(len(pred), device=device, dtype=torch.bool))
                 for task in active_tasks:
                     task_targets = batch_data["probe_targets"][task]
                     if (task_targets != IGNORE_INDEX).any():
-                        task_loss = F.cross_entropy(logits_dict[task], task_targets, ignore_index=IGNORE_INDEX)
-                        probe_loss += task_loss
+                        sample_loss = F.cross_entropy(logits_dict[task], task_targets, ignore_index=IGNORE_INDEX, reduction="none")
+                        sample_weight = torch.where(is_calib, args.calibration_weight, args.probe_weight)
+                        probe_loss += (sample_loss * sample_weight).mean()
                         has_active = True
                 
                 if has_active:
-                    loss = loss + args.probe_weight * probe_loss
+                    loss = loss + probe_loss
+
                 
             loss.backward()
             optimizer.step()
@@ -658,6 +761,14 @@ def main() -> None:
                        temperature=args.temperature, target_space=args.target_space,
                        probe_model=probe_model, active_tasks=active_tasks,
                        target_center=target_center)
+        
+        calib_val = None
+        if calib_val_loader is not None:
+            calib_val = evaluate(model, calib_val_loader, device, loss_name=args.loss,
+                                 temperature=args.temperature, target_space=args.target_space,
+                                 probe_model=probe_model, active_tasks=active_tasks,
+                                 target_center=target_center)
+                                 
         score = float(val["mrr"] + 0.25 * val["top10"])
         if val["collapse_score"] < 0.1:
             score = -1.0
@@ -677,6 +788,12 @@ def main() -> None:
         for k, v in val.items():
             if k.startswith("probe_"):
                 row[k] = v
+                
+        if calib_val is not None:
+            for k, v in calib_val.items():
+                if k.startswith("probe_"):
+                    row[k.replace("probe_", "calib_probe_")] = v
+
                 
         history.append(row)
         print(json.dumps(row))
@@ -728,7 +845,18 @@ def main() -> None:
                              temperature=args.temperature, target_space=args.target_space,
                              probe_model=probe_model, active_tasks=active_tasks,
                              target_center=target_center_eval)
+                             
+    if calib_val_loader is not None:
+        final_calib_metrics = evaluate(model, calib_val_loader, device, loss_name=args.loss,
+                                       temperature=args.temperature, target_space=args.target_space,
+                                       probe_model=probe_model, active_tasks=active_tasks,
+                                       target_center=target_center_eval)
+        for k, v in final_calib_metrics.items():
+            if k.startswith("probe_"):
+                final_metrics[k.replace("probe_", "calib_probe_")] = v
+                
     final_metrics["best_epoch"] = int(ckpt["epoch"])
+
     final_metrics["best_score"] = float(best_score)
     final_metrics["best_mrr"] = float(best_mrr) if best_mrr is not None else None
     final_metrics["best_top10"] = float(best_top10) if best_top10 is not None else None

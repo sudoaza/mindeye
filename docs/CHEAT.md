@@ -14,6 +14,8 @@
 
 ---
 
+IMPORTANT: Do all work in the remote pod, dev system has no GPU.
+
 ## RunPod Management
 
 ### List Pods

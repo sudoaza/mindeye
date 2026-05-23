@@ -216,7 +216,15 @@ frozen_probe(normalize(z_pred_common))   (semantic regularizer, 10 tasks)
 - [x] **Subject audit**: verify all 4 subjects actually load via subject audit fields in setup JSON.
 - [x] **Cross-fold validation**: validate gate holds with different val-run splits.
 
-### Phase 10: Image Reconstruction / Diffusion (Current)
+### Phase 10: Image Reconstruction / Diffusion ✅
 - [x] **Prerequisite**: probe ablation must confirm probes help or are neutral.
 - [x] **Prerequisite**: multi-subject generalization verified.
-- [ ] Hook `z_pred_common` to SDXL-Turbo / SD3 img2img via retrieval grounding.
+- [x] Hook `z_pred_common` to Stable Diffusion img2img via retrieval grounding (Phase 10A).
+- [x] Implement Attribute-Constrained Semantic Montage Reranking to diversify and semantically align retrieved priors (Phase 10B).
+
+### Phase 11: Visual Calibration Battery & Frozen Diffusion Demo ✅
+- [x] **Visual calibration stimulus generation**: generated 636 calibration trials covering shapes (matched area), colors, textures, and animacy/faces.
+- [x] **Embed calibration stimuli**: mapped calibration targets into canonical `z_common` manifold and updated `common_embeddings.pt`.
+- [x] **Dataloader mixing**: implemented `MixedBalancedDataset` to interleave natural and calibration trials (50/50).
+- [x] **Calibrated loss scaling**: updated `train_eeg_clip.py` with custom sample weight routing and separate validation metrics.
+- [x] **Frozen diffusion demo**: implemented and executed `demo_diffusion.py` with Mode A (text-only semantic steering) and Mode B (prior-guided img2img) outputs properly watermarked.

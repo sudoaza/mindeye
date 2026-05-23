@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from typing import Dict
 
-# Mapping of all 18 attributes to their expected class choices.
+# Mapping of all attributes to their expected class choices.
 ATTRIBUTE_SCHEMAS = {
     "is_animate": ["no", "yes"],
     "human_visible": ["no", "yes"],
@@ -24,6 +24,18 @@ ATTRIBUTE_SCHEMAS = {
     "tool_like": ["no", "yes"],
     "vehicle_like": ["no", "yes"],
     "food_like": ["no", "yes"],
+    # Phase 11A Visual Calibration axes
+    "warm_vs_cool": ["warm", "cool", "neutral"],
+    "bright_vs_dark": ["bright", "dark", "neutral"],
+    "round_or_curved": ["no", "yes"],
+    "angular_or_geometric": ["no", "yes"],
+    "symmetrical": ["no", "yes"],
+    "single_object": ["no", "yes"],
+    "glossy": ["no", "yes"],
+    "rough": ["no", "yes"],
+    "smooth": ["no", "yes"],
+    "transparent": ["no", "yes"],
+    "organic_texture": ["no", "yes"],
 }
 
 IGNORE_INDEX = -100
