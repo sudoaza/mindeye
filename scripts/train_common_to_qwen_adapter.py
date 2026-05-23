@@ -6,22 +6,22 @@ from PIL import Image
 import argparse
 from tqdm import tqdm
 import pandas as pd
-from diffusers import QwenImagePipeline
-from transformers import AutoProcessor
+from diffusers import QwenImageEditPipeline
 
-# Add src to python path if needed
+# Add src to python path
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 from mindseye.models.common_to_qwen_adapter import CommonToQwenAdapter
 
-class EmbeddingDistillationDataset(Dataset):
-    def __init__(self, metadata_path, stimuli_root, common_embeddings_path, processor):
+class QwenTeacherDataset(Dataset):
+    def __init__(self, metadata_path, stimuli_root, common_embeddings_path, pipe, num_tokens=256, device="cuda"):
         self.metadata = pd.read_csv(metadata_path)
-        # Filter for unique images if it's trial-based metadata
         self.metadata = self.metadata.drop_duplicates(subset=["image_id"]).reset_index(drop=True)
         self.stimuli_root = stimuli_root
         self.common_embeddings = torch.load(common_embeddings_path, map_location="cpu")
-        self.processor = processor
+        self.pipe = pipe
+        self.num_tokens = num_tokens
+        self.device = device
         
     def __len__(self):
         return len(self.metadata)
@@ -29,39 +29,44 @@ class EmbeddingDistillationDataset(Dataset):
     def __getitem__(self, idx):
         row = self.metadata.iloc[idx]
         image_id = row['image_id']
-        # Depending on dataset, image_path might need construction
         if 'image_path' in row:
             image_path = os.path.join(self.stimuli_root, row['image_path'])
         else:
             image_path = os.path.join(self.stimuli_root, f"{image_id}.jpg")
             
         image = Image.open(image_path).convert("RGB")
+        # Resize to fixed size to ensure relatively stable embedding shapes
+        image = image.resize((512, 512))
         
-        # We will resize to a fixed dimension to ensure consistent token count from Qwen2.5-VL
-        image = image.resize((224, 224))
+        # 1. Extract target embeddings through pipeline's native conditioning pathway
+        with torch.no_grad():
+            prompt_embeds, attn_mask = self.pipe._get_qwen_prompt_embeds(
+                prompt="",
+                image=image,
+                device=self.device,
+                dtype=torch.float16
+            )
+            # Remove batch dimension from extraction
+            prompt_embeds = prompt_embeds.squeeze(0).cpu() # [seq_len, dim]
+            attn_mask = attn_mask.squeeze(0).cpu() # [seq_len]
+            
+        # 2. Handle truncation/padding to match fixed num_tokens
+        seq_len = prompt_embeds.shape[0]
+        dim = prompt_embeds.shape[1]
         
-        # Qwen2.5-VL processor expects messages
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": ""} # empty text
-                ]
-            }
-        ]
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=[text], images=[image], padding=True, return_tensors="pt")
-        
-        # Remove batch dim
-        for k, v in inputs.items():
-            if isinstance(v, torch.Tensor):
-                inputs[k] = v.squeeze(0)
-                
-        # Common embedding
+        if seq_len > self.num_tokens:
+            prompt_embeds = prompt_embeds[:self.num_tokens]
+            attn_mask = attn_mask[:self.num_tokens]
+        elif seq_len < self.num_tokens:
+            pad_len = self.num_tokens - seq_len
+            pad_embeds = torch.zeros((pad_len, dim), dtype=prompt_embeds.dtype)
+            prompt_embeds = torch.cat([prompt_embeds, pad_embeds], dim=0)
+            pad_mask = torch.zeros((pad_len,), dtype=attn_mask.dtype)
+            attn_mask = torch.cat([attn_mask, pad_mask], dim=0)
+            
         z_common = self.common_embeddings[image_id]
         
-        return inputs, z_common
+        return z_common, prompt_embeds, attn_mask
 
 def main():
     parser = argparse.ArgumentParser()
@@ -69,8 +74,8 @@ def main():
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--stimuli-root", required=True)
     parser.add_argument("--qwen-model", default="Qwen/Qwen-Image")
-    parser.add_argument("--adapter-mode", default="soft_prompt")
     parser.add_argument("--num-tokens", type=int, default=256)
+    parser.add_argument("--adapter-dim", type=int, default=2048)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -80,92 +85,79 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 1. Load Qwen Processor and Text Encoder
-    print("Loading Qwen text encoder and processor...")
-    pipe = QwenImagePipeline.from_pretrained(
+    # 1. Load pipeline (Teacher model)
+    print(f"Loading teacher model {args.qwen_model}...")
+    pipe = QwenImageEditPipeline.from_pretrained(
         args.qwen_model, 
-        text_encoder_only=True, # Custom flag if diffusers supports it, otherwise load full pipeline
         torch_dtype=torch.float16,
         safety_checker=None
     ).to(args.device)
     
-    text_encoder = pipe.text_encoder
-    for param in text_encoder.parameters():
+    pipe.set_progress_bar_config(disable=True)
+    
+    # Freeze all teacher weights
+    for param in pipe.transformer.parameters():
         param.requires_grad = False
-    text_encoder.eval()
+    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+        for param in pipe.text_encoder.parameters():
+            param.requires_grad = False
+            
+    # 2. Setup dataset and loader
+    print("Preparing dataset (extracting native teacher prompt embeds)...")
+    dataset = QwenTeacherDataset(
+        metadata_path=args.metadata,
+        stimuli_root=args.stimuli_root,
+        common_embeddings_path=args.common_embeddings,
+        pipe=pipe,
+        num_tokens=args.num_tokens,
+        device=args.device
+    )
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
-    # Load processor. Diffusers pipeline might not expose processor directly,
-    # so we load it from the same model ID or the text_encoder's config.
-    try:
-        processor = AutoProcessor.from_pretrained(args.qwen_model)
-    except:
-        # Fallback to the underlying text_encoder model name if nested
-        processor = AutoProcessor.from_pretrained(text_encoder.config._name_or_path)
+    # Discover embedding dim
+    qwen_hidden_dim = pipe.transformer.config.cross_attention_dim if hasattr(pipe.transformer.config, "cross_attention_dim") else 4096
     
-    # 2. Dataset and Dataloader
-    dataset = EmbeddingDistillationDataset(args.metadata, args.stimuli_root, args.common_embeddings, processor)
-    
-    # Use custom collate to handle variable length inputs if any
-    def collate_fn(batch):
-        # batch is list of (inputs_dict, z_common)
-        keys = batch[0][0].keys()
-        batched_inputs = {k: torch.stack([item[0][k] for item in batch]) for k in keys}
-        z_commons = torch.stack([item[1] for item in batch])
-        return batched_inputs, z_commons
-        
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    
-    # 3. Initialize Adapter
-    # We dynamically find the qwen_hidden_dim
-    qwen_hidden_dim = text_encoder.config.hidden_size
-    
-    # Since Qwen2.5-VL outputs a sequence of tokens, we will dynamically set num_tokens 
-    # based on the first batch if args.num_tokens is a placeholder.
-    # Actually, we can just use an adaptive pooling in the adapter or fix num_tokens.
-    # We'll use the user's provided num-tokens.
+    # 3. Setup student adapter
     adapter = CommonToQwenAdapter(
         common_dim=512, 
-        adapter_dim=1024, 
+        adapter_dim=args.adapter_dim, 
         num_tokens=args.num_tokens, 
-        qwen_hidden_dim=qwen_hidden_dim
+        qwen_hidden_dim=qwen_hidden_dim,
+        dropout=0.1
     ).to(args.device)
     
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr)
     
-    # 4. Training Loop (Embedding Distillation)
-    print("Starting embedding distillation training...")
+    # 4. Train loop (MSE + Cosine Loss)
+    print("Starting distillation training...")
     for epoch in range(args.epochs):
         adapter.train()
         total_loss = 0.0
         
-        for batch_inputs, z_common in tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            batch_inputs = {k: v.to(args.device) for k, v in batch_inputs.items()}
+        for z_common, target_embeds, masks in tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}"):
             z_common = z_common.to(args.device, dtype=torch.float32)
+            target_embeds = target_embeds.to(args.device, dtype=torch.float32) # match float32 for loss
+            masks = masks.to(args.device, dtype=torch.float32)
             
-            with torch.no_grad():
-                # Get target embeddings from Qwen text encoder
-                # Depending on Qwen2.5-VL's API:
-                outputs = text_encoder(**batch_inputs, output_hidden_states=True)
-                # Usually we want the last hidden state
-                target_embeds = outputs.hidden_states[-1] if hasattr(outputs, 'hidden_states') else outputs.last_hidden_state
-                # target_embeds shape: [B, seq_len, qwen_hidden_dim]
-                
+            # Predict soft conditioning tokens
             pred_embeds = adapter(z_common) # [B, num_tokens, qwen_hidden_dim]
             
-            # Match tokens via truncation, interpolation, or attention
-            # Since we just want simple MSE, we align sequences.
-            # Easiest way: take the first N vision tokens (or pool).
-            # The prompt text is empty, so most tokens are image patches.
-            seq_len = target_embeds.shape[1]
-            if pred_embeds.shape[1] != seq_len:
-                # Interpolate pred_embeds to match target seq_len, or vice versa
-                # It's better to force pred_embeds to match target_embeds shape
-                # if we want to mimic the target exactly.
-                pred_embeds = pred_embeds.permute(0, 2, 1) # [B, dim, num_tokens]
-                pred_embeds = F.interpolate(pred_embeds, size=seq_len, mode='linear', align_corners=False)
-                pred_embeds = pred_embeds.permute(0, 2, 1) # [B, seq_len, dim]
+            # Masked MSE loss
+            masks_expanded = masks.unsqueeze(-1).expand_as(target_embeds)
+            sum_mask = masks_expanded.sum()
+            
+            # Avoid division by zero
+            if sum_mask > 0:
+                mse_loss = F.mse_loss(pred_embeds * masks_expanded, target_embeds * masks_expanded, reduction='sum') / sum_mask
                 
-            loss = F.mse_loss(pred_embeds, target_embeds.to(torch.float32))
+                # Masked Cosine Similarity loss
+                cos_sim = F.cosine_similarity(pred_embeds, target_embeds, dim=-1) # [B, num_tokens]
+                cosine_loss = 1.0 - ((cos_sim * masks).sum() / masks.sum())
+            else:
+                mse_loss = F.mse_loss(pred_embeds, target_embeds)
+                cosine_loss = 1.0 - F.cosine_similarity(pred_embeds, target_embeds, dim=-1).mean()
+                
+            loss = mse_loss + cosine_loss
             
             optimizer.zero_grad()
             loss.backward()
@@ -173,7 +165,7 @@ def main():
             
             total_loss += loss.item()
             
-        print(f"Epoch {epoch+1} Loss: {total_loss / len(dataloader):.4f}")
+        print(f"Epoch {epoch+1} Loss: {total_loss / len(dataloader):.6f}")
         
         # Save checkpoint
         torch.save(adapter.state_dict(), os.path.join(args.output_dir, f"adapter_epoch_{epoch+1}.pt"))

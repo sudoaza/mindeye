@@ -29,6 +29,10 @@ def main():
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--stimuli-root", required=True)
     parser.add_argument("--qwen-model", default="Qwen/Qwen-Image")
+    parser.add_argument("--num-tokens", type=int, default=256)
+    parser.add_argument("--adapter-dim", type=int, default=2048)
+    parser.add_argument("--watermark", action="store_true", default=True, help="Watermark output images")
+    parser.add_argument("--no-watermark", action="store_false", dest="watermark", help="Disable watermarking")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
     
@@ -40,8 +44,8 @@ def main():
     print("Loading CommonToQwenAdapter...")
     adapter = CommonToQwenAdapter(
         common_dim=512,
-        adapter_dim=1024,
-        num_tokens=16, # Or whatever was trained
+        adapter_dim=args.adapter_dim,
+        num_tokens=args.num_tokens,
         qwen_hidden_dim=backend.qwen_hidden_dim
     ).to("cuda")
     adapter.load_state_dict(torch.load(args.adapter_ckpt, map_location="cuda"))
@@ -51,7 +55,7 @@ def main():
     common_embeddings = torch.load(args.common_embeddings, map_location="cpu")
     metadata = pd.read_csv(args.metadata).drop_duplicates(subset=["image_id"]).reset_index(drop=True)
     
-    # We will just evaluate on the first 5 images for demonstration
+    # Evaluate on the first 5 images
     metadata = metadata.head(5)
     
     all_z = torch.stack(list(common_embeddings.values()))
@@ -80,9 +84,9 @@ def main():
             rand_embeds = adapter(rand_z)
             nn_embeds = adapter(nn_z)
             
-            oracle_gen = backend.generate_from_embeds(oracle_embeds, height=512, width=512)[0]
-            rand_gen = backend.generate_from_embeds(rand_embeds, height=512, width=512)[0]
-            nn_gen = backend.generate_from_embeds(nn_embeds, height=512, width=512)[0]
+            oracle_gen = backend.generate_from_embeds(oracle_embeds, height=512, width=512, watermark=args.watermark)[0]
+            rand_gen = backend.generate_from_embeds(rand_embeds, height=512, width=512, watermark=args.watermark)[0]
+            nn_gen = backend.generate_from_embeds(nn_embeds, height=512, width=512, watermark=args.watermark)[0]
             
         grid = build_grid(target_img, oracle_gen, rand_gen, nn_gen)
         grid_path = os.path.join(args.output_dir, f"grid_{image_id}.jpg")

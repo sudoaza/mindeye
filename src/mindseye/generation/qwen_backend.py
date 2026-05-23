@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from diffusers import QwenImagePipeline
-from PIL import Image
+from diffusers import QwenImageEditPipeline
+from PIL import Image, ImageDraw, ImageFont
 
 class QwenBackend:
     """
@@ -11,16 +11,16 @@ class QwenBackend:
         self.device = device
         self.model_id = model_id
         
-        # Load the pipeline
-        # QwenImage requires transformer, text_encoder, etc. We load it in float16.
-        self.pipe = QwenImagePipeline.from_pretrained(
+        # Load the QwenImageEditPipeline as it supports image-conditioned semantic control
+        self.pipe = QwenImageEditPipeline.from_pretrained(
             model_id, 
             torch_dtype=torch.float16,
             safety_checker=None
         ).to(device)
         
-        # Freeze all components
         self.pipe.set_progress_bar_config(disable=True)
+        
+        # Freeze all components
         for param in self.pipe.transformer.parameters():
             param.requires_grad = False
         if hasattr(self.pipe, "text_encoder") and self.pipe.text_encoder is not None:
@@ -30,13 +30,12 @@ class QwenBackend:
             for param in self.pipe.vae.parameters():
                 param.requires_grad = False
                 
-        # Discover qwen_hidden_dim dynamically from text_encoder or transformer config
+        # Discover qwen_hidden_dim dynamically
         if hasattr(self.pipe.transformer.config, "cross_attention_dim"):
             self.qwen_hidden_dim = self.pipe.transformer.config.cross_attention_dim
         elif hasattr(self.pipe.transformer.config, "joint_attention_dim"):
             self.qwen_hidden_dim = self.pipe.transformer.config.joint_attention_dim
         else:
-            # Fallback to a common dimension for Qwen-Image / MMDiT
             self.qwen_hidden_dim = 4096 
             
     def generate_from_embeds(
@@ -46,7 +45,8 @@ class QwenBackend:
         num_inference_steps: int = 20,
         guidance_scale: float = 7.0,
         height: int = 1024,
-        width: int = 1024
+        width: int = 1024,
+        watermark: bool = True
     ):
         """
         Generates images directly from soft conditioning tokens.
@@ -54,8 +54,8 @@ class QwenBackend:
         Args:
             prompt_embeds: [B, num_tokens, qwen_hidden_dim]
             prompt_embeds_mask: [B, num_tokens]
+            watermark: If True, adds a demo watermark banner at the bottom.
         """
-        # Ensure mask is provided if the pipeline expects it
         if prompt_embeds_mask is None:
             prompt_embeds_mask = torch.ones(
                 (prompt_embeds.shape[0], prompt_embeds.shape[1]),
@@ -63,11 +63,6 @@ class QwenBackend:
                 device=prompt_embeds.device
             )
             
-        # Diffusers pipelines often expect specific kwargs for embeds
-        # The exact kwargs depend on the QwenImagePipeline implementation.
-        # Usually it's `prompt_embeds` and `prompt_attention_mask`.
-        
-        # We wrap in a generic call, inspecting the signature or just passing them.
         outputs = self.pipe(
             prompt_embeds=prompt_embeds,
             prompt_attention_mask=prompt_embeds_mask,
@@ -78,4 +73,29 @@ class QwenBackend:
             output_type="pil"
         )
         
-        return outputs.images
+        images = outputs.images
+        
+        if watermark:
+            watermarked_images = []
+            for img in images:
+                img = img.copy()
+                draw = ImageDraw.Draw(img)
+                # Simple black bar at the bottom with white text
+                w, h = img.size
+                bar_h = 30
+                draw.rectangle([(0, h - bar_h), (w, h)], fill="black")
+                
+                # Draw text
+                text = "MindEye Qwen demo — not validated reconstruction"
+                try:
+                    # Try using default font or load simple one
+                    font = ImageFont.load_default()
+                except:
+                    font = None
+                
+                # Center text
+                draw.text((10, h - bar_h + 8), text, fill="white", font=font)
+                watermarked_images.append(img)
+            return watermarked_images
+            
+        return images

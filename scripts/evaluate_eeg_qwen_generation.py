@@ -30,22 +30,23 @@ def main():
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--stimuli-root", required=True)
     parser.add_argument("--qwen-model", default="Qwen/Qwen-Image")
+    parser.add_argument("--num-tokens", type=int, default=256)
+    parser.add_argument("--adapter-dim", type=int, default=2048)
+    parser.add_argument("--watermark", action="store_true", default=True, help="Watermark output images")
+    parser.add_argument("--no-watermark", action="store_false", dest="watermark", help="Disable watermarking")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Normally we would load the EEG encoder here and predict z_pred_common.
-    # For this evaluation script scaffold, we assume z_pred_common can be loaded
-    # or computed. We will mock the eeg outputs if we are just demonstrating the scaffold.
-    # Assuming standard MindEye model loading:
-    print("Loading CommonToQwenAdapter...")
+    print("Loading Qwen Backend...")
     backend = QwenBackend(model_id=args.qwen_model, device="cuda")
     
+    print("Loading CommonToQwenAdapter...")
     adapter = CommonToQwenAdapter(
         common_dim=512,
-        adapter_dim=1024,
-        num_tokens=16,
+        adapter_dim=args.adapter_dim,
+        num_tokens=args.num_tokens,
         qwen_hidden_dim=backend.qwen_hidden_dim
     ).to("cuda")
     adapter.load_state_dict(torch.load(args.adapter_ckpt, map_location="cuda"))
@@ -77,10 +78,10 @@ def main():
             shuffled_eeg_embeds = adapter(shuffled_eeg_z)
             rand_embeds = adapter(rand_z)
             
-            oracle_gen = backend.generate_from_embeds(oracle_embeds, height=512, width=512)[0]
-            real_eeg_gen = backend.generate_from_embeds(real_eeg_embeds, height=512, width=512)[0]
-            shuffled_eeg_gen = backend.generate_from_embeds(shuffled_eeg_embeds, height=512, width=512)[0]
-            rand_gen = backend.generate_from_embeds(rand_embeds, height=512, width=512)[0]
+            oracle_gen = backend.generate_from_embeds(oracle_embeds, height=512, width=512, watermark=args.watermark)[0]
+            real_eeg_gen = backend.generate_from_embeds(real_eeg_embeds, height=512, width=512, watermark=args.watermark)[0]
+            shuffled_eeg_gen = backend.generate_from_embeds(shuffled_eeg_embeds, height=512, width=512, watermark=args.watermark)[0]
+            rand_gen = backend.generate_from_embeds(rand_embeds, height=512, width=512, watermark=args.watermark)[0]
             
         grid = build_grid(target_img, oracle_gen, real_eeg_gen, shuffled_eeg_gen, rand_gen)
         grid_path = os.path.join(args.output_dir, f"eeg_grid_{image_id}.jpg")
