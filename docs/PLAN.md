@@ -106,21 +106,25 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 
 ---
 
-## Current Status: Phase 9 — z_common Canonical Latent + Probe Ablation ✅
+## Current Status: Phase 12 — z_common → Qwen-Image Adapter 🚧
 
 ### Architecture (canonical, do not deviate)
 ```
-image/VLM/attributes → z_common          (frozen CLIP + VLM fused embedding)
-EEG  → z_pred_common                     (trained encoder output)
-frozen_probe(normalize(z_pred_common))   (semantic regularizer, 10 tasks)
+image/VLM/attributes → z_common               (frozen CLIP + VLM fused embedding)
+EEG  → z_pred_common                          (trained encoder output)
+frozen_probe(normalize(z_pred_common))         (semantic regularizer, 10 tasks)
+
+Phase 12 addition:
+z_common → CommonToQwenAdapter → prompt_embeds (learned soft tokens)
+prompt_embeds → frozen QwenImageEditPipeline → image
 ```
 
 > [!NOTE]
-> Frozen z_common probes are now canonical after single-subject probe sweep and cross-fold replication validation.
-> Default `probe_weight = 0.05` (updated from 0.03 after cross-fold validation).
-> Training-time probe accuracy logging has been resolved via normalization fix.
+> Frozen z_common probes canonical. Default `probe_weight = 0.05`. Phase 12
+> implements direct visual generation via learned conditioning tokens without
+> any text bottleneck or prompt engineering.
 
-### Single-Subject Probe Sweep Results (sub-01, runs 01_40, val_runs=8)
+### Phase 9 Probe Sweep Results (sub-01, runs 01_40, val_runs=8)
 | probe weight |    Top-10 |      MRR |  collapse |
 | -----------: | --------: | -------: | --------: |
 |         0.00 |     13.7% |     7.9% |     0.677 |
@@ -129,20 +133,29 @@ frozen_probe(normalize(z_pred_common))   (semantic regularizer, 10 tasks)
 |   **0.05**   | **21.0%** |     9.4% |     0.911 |
 |         0.10 |     17.7% |     9.4% |     0.645 |
 
-### Cross-Fold Replication Sweep Results (Mean ± Std over Folds 8, 16, 24, 32)
+### Cross-Fold Replication Results (Mean ± Std over Folds 8, 16, 24, 32)
 | probe weight | Mean Top-10 | Mean MRR | Mean Collapse | Status |
 | -----------: | ----------: | -------: | ------------: | :----- |
 |         0.00 | 18.03% ± 3.6% | 8.95% ± 0.8% | 0.86 ± 0.13 | Baseline |
 |         0.03 | 19.64% ± 2.6% | 8.83% ± 1.1% | 0.67 ± 0.07 | Promising |
 |   **0.05**   | **20.64%** ± 2.3% | **9.14%** ± 1.0% | 0.60 ± 0.16 | **Canonical Default** |
 
-### Known Issues / Status
-- **Training-time probe accuracy logging**: Probe evaluation on validation sets returns correct non-zero values (e.g. `probe_is_animate_acc` ~70-80% during epoch logging) matching the normalization fix.
-- **Cross-Fold Replication Sweep**: Completed successfully. `probe_weight = 0.05` consistently out-performs `0.03` and `0.00` on average Top-10 accuracy and MRR.
-- **Promotion to default**: Set the default `--probe-weight` in `train_eeg_clip.py` to `0.05`.
+### Phase 12 Implementation Status
+- [x] `src/mindseye/models/common_to_qwen_adapter.py` — adapter module
+- [x] `src/mindseye/generation/qwen_backend.py` — QwenImageEditPipeline wrapper
+- [x] `scripts/train_common_to_qwen_adapter.py` — training via teacher distillation
+- [x] `scripts/evaluate_common_qwen_adapter.py` — oracle z_common evaluation grid
+- [x] `scripts/evaluate_eeg_qwen_generation.py` — EEG z_pred_common evaluation
+- [x] `scripts/verify_qwen.py` — 3-check verification smoke test
+- [ ] **Check A**: Confirm `_get_qwen_prompt_embeds()` extraction works and dimensions match adapter output
+- [ ] **Check B**: Confirm frozen pipeline generates valid images from extracted teacher embeds
+- [ ] **Check C**: Overfit adapter on single image — must converge before full training
+- [ ] **Full training**: Train adapter on oracle `z_common` once smoke tests pass
 
 ### Immediate Next Steps
-1. Transition to Phase 10 (Image Reconstruction / Diffusion) using grounded visual priors retrieval.
+1. Run `verify_qwen.py` on the pod to pass Checks A, B, and C.
+2. Once all 3 checks pass: run `train_common_to_qwen_adapter.py`.
+3. Evaluate oracle generation quality vs random baseline.
 
 ---
 
@@ -227,4 +240,11 @@ frozen_probe(normalize(z_pred_common))   (semantic regularizer, 10 tasks)
 - [x] **Embed calibration stimuli**: mapped calibration targets into canonical `z_common` manifold and updated `common_embeddings.pt`.
 - [x] **Dataloader mixing**: implemented `MixedBalancedDataset` to interleave natural and calibration trials (50/50).
 - [x] **Calibrated loss scaling**: updated `train_eeg_clip.py` with custom sample weight routing and separate validation metrics.
-- [x] **Frozen diffusion demo**: implemented and executed `demo_diffusion.py` with Mode A (text-only semantic steering) and Mode B (prior-guided img2img) outputs properly watermarked.
+- [x] **Frozen diffusion demo**: implemented and executed `demo_diffusion.py` with Mode A (text-only semantic steering) and Mode B (prior-guided img2img) outputs.
+
+### Phase 12: Direct z_common → Qwen-Image Generation 🚧
+- [x] Scaffold: `CommonToQwenAdapter`, `QwenBackend`, train/eval/verify scripts.
+- [x] Architecture locked: teacher targets extracted via `_get_qwen_prompt_embeds()` (NOT arbitrary VLM hidden states).
+- [ ] **Pending**: Pass 3-check verification on pod (Check A: embed extraction, Check B: generation, Check C: single-image overfit).
+- [ ] **Pending**: Full adapter training on oracle `z_common`.
+- [ ] **Pending**: Stage 2 — plug in `z_pred_common` and evaluate against shuffled/random controls.
