@@ -106,56 +106,49 @@ The project must remain **ZUNA-first**. The primary training source is **NOD-EEG
 
 ---
 
-## Current Status: Phase 12 — z_common → Qwen-Image Adapter 🚧
+## Current Status: Phase 13 — decode_unit Canonical Pipeline ✅
 
 ### Architecture (canonical, do not deviate)
 ```
-image/VLM/attributes → z_common               (frozen CLIP + VLM fused embedding)
-EEG  → z_pred_common                          (trained encoder output)
-frozen_probe(normalize(z_pred_common))         (semantic regularizer, 10 tasks)
+image → CLIP image encoder → decode_unit embedding (1024-dim, unnormalized)
+EEG   → temporal_attn_small → z_pred_decode_unit
+frozen_probe(normalize(z_pred)) → 10 semantic tasks (class_label 40.3%)
 
-Phase 12 addition:
-z_common → CommonToQwenAdapter → prompt_embeds (learned soft tokens)
-prompt_embeds → frozen QwenImagePipeline → image
+Generation:
+  z_pred_decode_unit → soft-kNN retrieve → target_raw embedding → Stable unCLIP
 ```
 
-> [!NOTE]
-> Frozen z_common probes canonical. Default `probe_weight = 0.05`. Phase 12
-> implements direct visual generation via learned conditioning tokens without
-> any text bottleneck or prompt engineering.
+### Phase 13 Canonical Model (12B_probe_001)
+```
+Architecture  : temporal_attn_small
+Target space  : decode_unit
+Loss          : contrastive (InfoNCE, T=0.07)
+Probe         : frozen decode-probe v2, probe_weight=0.01, probe_start_epoch=5
+Grad clipping : clip_grad_norm_(model, 1.0)
+Best epoch    : 13 / 30
 
-### Phase 9 Probe Sweep Results (sub-01, runs 01_40, val_runs=8)
-| probe weight |    Top-10 |      MRR |  collapse |
-| -----------: | --------: | -------: | --------: |
-|         0.00 |     13.7% |     7.9% |     0.677 |
-|         0.01 |     18.5% | **9.6%** | **0.978** |
-|         0.03 |     20.2% | **9.6%** |     0.862 |
-|   **0.05**   | **21.0%** |     9.4% |     0.911 |
-|         0.10 |     17.7% |     9.4% |     0.645 |
+Metrics:
+  within-val Top-10  : 0.04195  (2.5× random)
+  full_bank Top-10   : 0.00671  (2.68× random, primary gate metric)
+  full_bank MRR      : 0.00318
+  collapse score     : 0.847
+```
 
-### Cross-Fold Replication Results (Mean ± Std over Folds 8, 16, 24, 32)
-| probe weight | Mean Top-10 | Mean MRR | Mean Collapse | Status |
-| -----------: | ----------: | -------: | ------------: | :----- |
-|         0.00 | 18.03% ± 3.6% | 8.95% ± 0.8% | 0.86 ± 0.13 | Baseline |
-|         0.03 | 19.64% ± 2.6% | 8.83% ± 1.1% | 0.67 ± 0.07 | Promising |
-|   **0.05**   | **20.64%** ± 2.3% | **9.14%** ± 1.0% | 0.60 ± 0.16 | **Canonical Default** |
+### Phase 13 Gate Result
+| Condition | Result |
+|---|---|
+| `full_bank_top10 > A_real_repro` (4.0×) | ✅ PASS |
+| `full_bank_mrr ≥ A_real_repro` | ✅ PASS |
+| `real > shuffled` (4.0×) | ✅ PASS |
+| `real > random mean` (+2.45σ) | ✅ PASS |
+| `collapse > 0.1` | ✅ PASS |
 
-### Phase 12 Implementation Status
-- [x] `src/mindseye/models/common_to_qwen_adapter.py` — adapter module
-- [x] `src/mindseye/generation/qwen_backend.py` — QwenImagePipeline wrapper + `extract_teacher_embeds()`
-- [x] `scripts/train_common_to_qwen_adapter.py` — training via teacher distillation
-- [x] `scripts/evaluate_common_qwen_adapter.py` — oracle z_common evaluation grid
-- [x] `scripts/evaluate_eeg_qwen_generation.py` — EEG z_pred_common evaluation
-- [x] `scripts/verify_qwen.py` — 3-check verification smoke test
-- [x] **Check A**: Confirm `extract_teacher_embeds()` works and dimensions match adapter output
-- [x] **Check B**: Confirm frozen pipeline generates valid images from extracted teacher embeds (fixed float16/bfloat16 precision crash)
-- [x] **Check C**: Overfit adapter on single image — must converge before full training (passed overfitting tests)
-- [ ] **Full training**: Train adapter on oracle `z_common` once smoke tests pass
+### Key Finding: full_bank is the honest retrieval metric
+> A_real_repro (no probe) achieved within-val Top-10 = 0.042 but full_bank Top-10 = 0.00168 (BELOW random 0.0025). The probe forces global embedding alignment. Within-val is diagnostic only.
 
 ### Immediate Next Steps
-1. Run `train_common_to_qwen_adapter.py` on the GPU pod to complete teacher distillation training on the oracle `z_common` embeddings.
-2. Run `evaluate_common_qwen_adapter.py` to evaluate oracle generation quality against random control baselines.
-3. Plug in `z_pred_common` (from EEG) to run the Stage 2 reconstruction and evaluate against shuffled/random controls using `evaluate_eeg_qwen_generation.py`.
+1. Multi-subject: add sub-02, sub-03, sub-04 with 12B_probe_001 config.
+2. Generation grid: oracle / 12B_probe_001 kNN / shuffled kNN / random kNN (k=5, T=0.05).
 
 ---
 
@@ -242,10 +235,15 @@ prompt_embeds → frozen QwenImagePipeline → image
 - [x] **Calibrated loss scaling**: updated `train_eeg_clip.py` with custom sample weight routing and separate validation metrics.
 - [x] **Frozen diffusion demo**: implemented and executed `demo_diffusion.py` with Mode A (text-only semantic steering) and Mode B (prior-guided img2img) outputs.
 
-### Phase 12: Direct z_common → Qwen-Image Generation 🚧
-- [x] Scaffold: `CommonToQwenAdapter`, `QwenBackend`, train/eval/verify scripts.
-- [x] Architecture locked: teacher targets extracted via `backend.extract_teacher_embeds()` (VLM hidden states, CPU).
-- [x] Pipeline refactored: `QwenImagePipeline` (text-to-image) replaces `QwenImageEditPipeline`; no 3-D VAE encoding, no dummy latents.
-- [x] Pass 3-check verification on pod (Check A: embed extraction, Check B: generation, Check C: single-image overfit).
-- [ ] **Pending**: Full adapter training on oracle `z_common`.
-- [ ] **Pending**: Stage 2 — plug in `z_pred_common` and evaluate against shuffled/random controls.
+### Phase 13: decode_unit Canonical Pipeline ✅
+- [x] Architect-mandated code fixes: target_space logging, full-bank retrieval, decode wrapper --mode, --probe-start-epoch, task-normalized probe loss, grad clipping.
+- [x] Decode probe v2 retrained cleanly (lr=1e-4, task-normalized loss, grad clip, 50 epochs, 0 NaN).
+- [x] Experiment matrix: A_real_repro, 12B_probe_0005, **12B_probe_001** (winner), 12B_probe_002.
+- [x] Gate: all 4 conditions pass for 12B_probe_001 (full_bank_top10 = 2.68× random, +2.45σ vs random controls).
+- [x] **Key finding**: within-val Top-10 inflates signal 2–4×. Full-bank is the honest metric. A_real_repro (no probe) is BELOW random on full-bank despite good within-val numbers.
+- [x] **Canonical model promoted**: 12B_probe_001 (probe_weight=0.01, probe_start_epoch=5).
+
+### Phase 14: Multi-subject + Generation Grid (Next)
+- [ ] Add sub-02, sub-03, sub-04 with 12B_probe_001 config.
+- [ ] Generation grid: oracle / kNN-real / kNN-shuffled / kNN-random (k=5, T=0.05).
+- [ ] Full-bank metric as primary gate for all future runs.

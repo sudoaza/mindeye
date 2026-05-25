@@ -96,19 +96,33 @@ make probe_sweep # Sweep probe weights 0 / 0.01 / 0.03 / 0.05 / 0.10
 make simulate    # EPOC-14 low-channel simulation
 ```
 
-### Phase 12A (CLIP-Native Diffusion Decoder) — run on pod manually
+### Phase 12A / 13 (Decode-Unit unCLIP Branch) — run on pod manually
 ```bash
-# Step 0: Extract z_decode_common targets
-PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache python scripts/build_decode_common_embeddings.py
+# Step 0: Extract z_decode_common targets (one-time)
+python scripts/build_decode_common_embeddings.py
 
-# Step 1: Train EEG -> z_decode_common
-PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache nohup python scripts/train_eeg_decode_common.py \
+# Step 1: Retrain decode probe on decode_unit space (one-time)
+python scripts/pretrain_common_probe.py \
+  --target-key decode_unit \
+  --common-embeddings data/processed/clip_embeddings/decode_common_embeddings.pt \
   --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
-  --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40 \
-  --epochs 15 > eeg_decode.log 2>&1 &
+  --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
+  --output-dir outputs/decode_probe_v2 \
+  --epochs 50 --lr 1e-4
 
-# Step 2: Evaluate generations (Oracle, EEG, Shuffled, Random)
-PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache python scripts/evaluate_clip_native_decoder.py \
+# Step 2: Train EEG -> decode_unit (canonical Phase 13 config)
+# Uses --mode contrastive_only, probe_weight=0.01, probe_start_epoch=5
+python scripts/train_eeg_decode_common.py \
+  --mode contrastive_only \
+  --common-probe outputs/decode_probe_v2/common_probe.pt \
+  --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
+  --probe-weight 0.01 \
+  --probe-start-epoch 5 \
+  --epochs 30 \
+  --slug 13_probe001
+
+# Step 3: Evaluate generations (Oracle, EEG kNN, Shuffled, Random)
+python scripts/evaluate_clip_native_decoder.py \
   --run-dir outputs/runs/<YOUR_RUN_DIR>
 ```
 
@@ -142,11 +156,12 @@ pkill -f 'python.*run_baseline_matrix' # Kill matrix run
 | Per-run metrics | `outputs/runs/<timestamp>_<slug>/metrics.json` |
 | Per-epoch CSV | `outputs/runs/<timestamp>_<slug>/train_log.csv` |
 | Matrix summary | `outputs/baseline_matrix/<timestamp>_matrix/matrix_summary.csv` |
-| Probe model | `outputs/common_probe/common_probe.pt` |
+| Probe model (decode space v2) | `outputs/decode_probe_v2/common_probe.pt` |
+| Probe model (old z_common)    | `outputs/common_probe/common_probe.pt` |
 
-**Key `metrics.json` fields**: `top1`, `top5`, `top10`, `mrr`, `median_rank`, `mean_diag_cosine`, `collapse_score`, `best_epoch`.
+**Key `metrics.json` fields**: `top1`, `top5`, `top10`, `mrr`, `median_rank`, `mean_diag_cosine`, `collapse_score`, `best_epoch`, `full_bank_top10`, `full_bank_mrr`.
 
-> `collapse_score` must be **> 0.1** to pass baseline gates (guards against dimensional collapse). Healthy runs typically score > 1.0.
+> **Primary gate metric is `full_bank_top10`** (predictions ranked against all 4000 images, expected random = 0.0025). `within_val_top10` inflates signal by ~20–4× and is diagnostic only. `collapse_score` must be **> 0.1** to pass baseline gates.
 
 ---
 
@@ -181,8 +196,7 @@ pkill -f 'python.*run_baseline_matrix' # Kill matrix run
 - **Venv corruption on pod**: If a venv was created on the pod and then the container stopped/restarted, the venv may have zero-byte binaries (`python3` is 0 bytes, 000 permissions). Delete and recreate, or just use system Python with `PYTHONPATH=src`.
 - **Multiple debug commands**: Gather all needed info in one SSH call rather than running separate commands for each check. SSH connection overhead is significant.
 
-### Phase 12A / CLIP-Native Diffusion Infrastructure
-
+- **Within-val vs full-bank retrieval gap**: `within_val_top10` compares EEG predictions against only the val batch (n≈596). This inflates numbers 2–4× vs. the honest `full_bank_top10` metric (predictions vs all 4000 image embeddings). Always use `full_bank_top10` and `full_bank_mrr` as primary gate metrics. A model can achieve within-val Top-10 = 0.042 while being BELOW random on full-bank (as A_real_repro demonstrated).
 - **Target extraction compatibility**: Use `StableUnCLIPImg2ImgPipeline` instead of `StableUnCLIPPipeline` for image-to-image extraction.
 - **Unnormalized targets**: When building `z_decode_common`, use `extract_teacher_embeds(normalize=False)`. Unnormalized embeds retain essential structural information for image reconstruction; L2-normalized embeddings fall back to random-level chance.
 - **Relative evaluation gating**: Absolute cosine scores vary. Always evaluate relative performance against random embedding baselines: `Oracle Cosine > Random Cosine + 0.05`.
