@@ -163,6 +163,9 @@ def parse_args() -> argparse.Namespace:
                    help="Number of epochs without improvement before early stopping (autostop)")
     p.add_argument("--aux-start-epoch", type=int, default=1,
                    help="Epoch to start applying auxiliary multitask loss (for delayed starts)")
+    p.add_argument("--probe-start-epoch", type=int, default=1,
+                   help="Epoch to start applying frozen probe loss. Default 1 (from start). "
+                        "Set to e.g. 5 to let InfoNCE geometry form first before semantic clustering.")
     p.add_argument("--aux-warmup-epochs", type=int, default=20,
                    help="Number of epochs to linearly warmup the auxiliary multitask weights (ramps from 0 to 1)")
     p.add_argument("--warmup-epochs", type=int, default=5,
@@ -683,6 +686,7 @@ def main() -> None:
         "dual_head": args.dual_head,
         "use_fixed_mean_norm": args.use_fixed_mean_norm,
         "mean_train_norm": mean_train_norm,
+        "probe_start_epoch": args.probe_start_epoch,
         "model": args.model,
         "hidden_dim": hidden_dim,
         "n_layers": n_layers,
@@ -813,29 +817,31 @@ def main() -> None:
                     
                 loss = _loss_fn(pred_for_loss, target_for_loss, loss_name=args.loss, temperature=args.temperature)
             
-            # Auxiliary probe loss
-            if probe_model is not None and "probe_targets" in batch_data:
+            # Auxiliary probe loss — activate only after probe_start_epoch
+            if (probe_model is not None
+                    and "probe_targets" in batch_data
+                    and epoch >= args.probe_start_epoch):
                 import torch.nn.functional as F
                 from mindseye.models.common_probe import IGNORE_INDEX
                 # Probe was pretrained on F.normalize(z_common); normalize pred to match.
                 logits_dict = probe_model(F.normalize(pred, dim=-1))
-                
-                probe_loss = 0.0
-                has_active = False
+
+                task_losses = []
                 is_calib = batch_data.get("is_calibration", torch.zeros(len(pred), device=device, dtype=torch.bool))
                 for task in active_tasks:
                     task_targets = batch_data["probe_targets"][task]
                     if (task_targets != IGNORE_INDEX).any():
                         sample_loss = F.cross_entropy(logits_dict[task], task_targets, ignore_index=IGNORE_INDEX, reduction="none")
                         sample_weight = torch.where(is_calib, args.calibration_weight, args.probe_weight)
-                        probe_loss += (sample_loss * sample_weight).mean()
-                        has_active = True
-                
-                if has_active:
+                        task_losses.append((sample_loss * sample_weight).mean())
+
+                if task_losses:
+                    # Mean over active tasks — prevents loss magnitude from scaling with task count
+                    probe_loss = torch.stack(task_losses).mean()
                     loss = loss + probe_loss
 
-                
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_losses.append(float(loss.item()))
 
