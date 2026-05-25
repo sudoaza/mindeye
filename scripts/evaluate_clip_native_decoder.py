@@ -170,9 +170,9 @@ def main():
         img_id = batch_image_ids[i] if i < len(batch_image_ids) else ""
         stim_path = stimuli_dir / f"{img_id}.JPEG"
         if stim_path.exists():
-            stim_img = Image.open(stim_path).convert("RGB").resize((512, 512))
+            stim_img = Image.open(stim_path).convert("RGB").resize((768, 768))
         else:
-            stim_img = Image.new("RGB", (512, 512), (30, 30, 30))  # dark placeholder
+            stim_img = Image.new("RGB", (768, 768), (30, 30, 30))  # dark placeholder
         all_tensors.append(TF.to_tensor(stim_img))
         # Columns 2-5: oracle, real EEG kNN, shuffled kNN, random kNN
         all_tensors.append(TF.to_tensor(oracle_imgs[i]))
