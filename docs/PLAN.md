@@ -116,7 +116,7 @@ frozen_probe(normalize(z_pred_common))         (semantic regularizer, 10 tasks)
 
 Phase 12 addition:
 z_common → CommonToQwenAdapter → prompt_embeds (learned soft tokens)
-prompt_embeds → frozen QwenImageEditPipeline → image
+prompt_embeds → frozen QwenImagePipeline → image
 ```
 
 > [!NOTE]
@@ -142,20 +142,20 @@ prompt_embeds → frozen QwenImageEditPipeline → image
 
 ### Phase 12 Implementation Status
 - [x] `src/mindseye/models/common_to_qwen_adapter.py` — adapter module
-- [x] `src/mindseye/generation/qwen_backend.py` — QwenImageEditPipeline wrapper
+- [x] `src/mindseye/generation/qwen_backend.py` — QwenImagePipeline wrapper + `extract_teacher_embeds()`
 - [x] `scripts/train_common_to_qwen_adapter.py` — training via teacher distillation
 - [x] `scripts/evaluate_common_qwen_adapter.py` — oracle z_common evaluation grid
 - [x] `scripts/evaluate_eeg_qwen_generation.py` — EEG z_pred_common evaluation
 - [x] `scripts/verify_qwen.py` — 3-check verification smoke test
-- [ ] **Check A**: Confirm `_get_qwen_prompt_embeds()` extraction works and dimensions match adapter output
-- [ ] **Check B**: Confirm frozen pipeline generates valid images from extracted teacher embeds
-- [ ] **Check C**: Overfit adapter on single image — must converge before full training
+- [x] **Check A**: Confirm `extract_teacher_embeds()` works and dimensions match adapter output
+- [x] **Check B**: Confirm frozen pipeline generates valid images from extracted teacher embeds (fixed float16/bfloat16 precision crash)
+- [x] **Check C**: Overfit adapter on single image — must converge before full training (passed overfitting tests)
 - [ ] **Full training**: Train adapter on oracle `z_common` once smoke tests pass
 
 ### Immediate Next Steps
-1. Run `verify_qwen.py` on the pod to pass Checks A, B, and C.
-2. Once all 3 checks pass: run `train_common_to_qwen_adapter.py`.
-3. Evaluate oracle generation quality vs random baseline.
+1. Run `train_common_to_qwen_adapter.py` on the GPU pod to complete teacher distillation training on the oracle `z_common` embeddings.
+2. Run `evaluate_common_qwen_adapter.py` to evaluate oracle generation quality against random control baselines.
+3. Plug in `z_pred_common` (from EEG) to run the Stage 2 reconstruction and evaluate against shuffled/random controls using `evaluate_eeg_qwen_generation.py`.
 
 ---
 
@@ -244,7 +244,8 @@ prompt_embeds → frozen QwenImageEditPipeline → image
 
 ### Phase 12: Direct z_common → Qwen-Image Generation 🚧
 - [x] Scaffold: `CommonToQwenAdapter`, `QwenBackend`, train/eval/verify scripts.
-- [x] Architecture locked: teacher targets extracted via `_get_qwen_prompt_embeds()` (NOT arbitrary VLM hidden states).
-- [ ] **Pending**: Pass 3-check verification on pod (Check A: embed extraction, Check B: generation, Check C: single-image overfit).
+- [x] Architecture locked: teacher targets extracted via `backend.extract_teacher_embeds()` (VLM hidden states, CPU).
+- [x] Pipeline refactored: `QwenImagePipeline` (text-to-image) replaces `QwenImageEditPipeline`; no 3-D VAE encoding, no dummy latents.
+- [x] Pass 3-check verification on pod (Check A: embed extraction, Check B: generation, Check C: single-image overfit).
 - [ ] **Pending**: Full adapter training on oracle `z_common`.
 - [ ] **Pending**: Stage 2 — plug in `z_pred_common` and evaluate against shuffled/random controls.

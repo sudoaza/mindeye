@@ -96,22 +96,20 @@ make probe_sweep # Sweep probe weights 0 / 0.01 / 0.03 / 0.05 / 0.10
 make simulate    # EPOC-14 low-channel simulation
 ```
 
-### Phase 12 (Qwen-Image generation) — run on pod manually
+### Phase 12A (CLIP-Native Diffusion Decoder) — run on pod manually
 ```bash
-# Step 0: Verify Qwen pipeline works (mandatory before training)
-PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache nohup python scripts/verify_qwen.py > verify_qwen.log 2>&1 &
+# Step 0: Extract z_decode_common targets
+PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache python scripts/build_decode_common_embeddings.py
 
-# Step 1: Train adapter (oracle z_common → prompt_embeds distillation)
-PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache nohup python scripts/train_common_to_qwen_adapter.py \
-  --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
-  --image-dir data/processed/stimuli \
-  --output-dir outputs/qwen_adapter \
-  --epochs 20 > qwen_train.log 2>&1 &
+# Step 1: Train EEG -> z_decode_common
+PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache nohup python scripts/train_eeg_decode_common.py \
+  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
+  --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40 \
+  --epochs 15 > eeg_decode.log 2>&1 &
 
-# Step 2: Evaluate oracle quality
-PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache python scripts/evaluate_common_qwen_adapter.py \
-  --adapter-path outputs/qwen_adapter/best_adapter.pt \
-  --common-embeddings data/processed/clip_embeddings/common_embeddings.pt
+# Step 2: Evaluate generations (Oracle, EEG, Shuffled, Random)
+PYTHONPATH=src TMPDIR=/workspace/tmp HF_HOME=/workspace/hf_cache python scripts/evaluate_clip_native_decoder.py \
+  --run-dir outputs/runs/<YOUR_RUN_DIR>
 ```
 
 On the pod, prefix with `export PYTHONPATH=src &&` when running scripts directly:
@@ -183,24 +181,8 @@ pkill -f 'python.*run_baseline_matrix' # Kill matrix run
 - **Venv corruption on pod**: If a venv was created on the pod and then the container stopped/restarted, the venv may have zero-byte binaries (`python3` is 0 bytes, 000 permissions). Delete and recreate, or just use system Python with `PYTHONPATH=src`.
 - **Multiple debug commands**: Gather all needed info in one SSH call rather than running separate commands for each check. SSH connection overhead is significant.
 
-### Phase 12 / Large Model Infrastructure (Qwen-Image)
+### Phase 12A / CLIP-Native Diffusion Infrastructure
 
-- **Root disk fills up**: The `/` partition on RunPod pods has only ~3–5GB free. Any writes to `/tmp` (Python's default tempfile location) or HuggingFace cache (`~/.cache/huggingface`) will crash with no-space errors. **Always set before running any Qwen script:**
-  ```bash
-  export TMPDIR=/workspace/tmp
-  export HF_HOME=/workspace/hf_cache
-  mkdir -p /workspace/tmp /workspace/offload
-  ```
-- **Qwen model loading time**: The Qwen-Image model (~7B params, multiple GB shards) takes **3–4 minutes to load** from `/workspace/hf_cache` into quantized VRAM even when already downloaded. This is per-script-run. Do not mistake slow loading for a hang; check the log.
-- **Memory budgeting is required**: Naive loading of Qwen-Image exceeds both GPU VRAM (16GB) and container RAM (50GB). Always pass:
-  ```python
-  max_memory = {0: "12GiB", "cpu": "25GiB"}
-  offload_folder = "/workspace/offload"
-  device_map = "balanced"
-  ```
-- **Teacher target extraction**: Use `pipe._get_qwen_prompt_embeds(prompt="", image=target_image, device=...)` to get the ground-truth `(prompt_embeds, prompt_embeds_mask)` for distillation. **Do NOT** extract arbitrary Qwen2.5-VL hidden states and treat them as `prompt_embeds` — the conditioning space won't match and the model won't generate meaningful images.
-- **3-check verification before training**: Never start full adapter training without passing all three checks:
-  1. **Check A** — embedding extraction shape matches adapter output.
-  2. **Check B** — teacher `prompt_embeds` (extracted above) drive non-degenerate generation.
-  3. **Check C** — adapter overfits on a single image. If it can't overfit one sample, don't train the full dataset.
-- **Efficiency**: Qwen model is large — design scripts to load it once and batch all inference/generation calls in a single run rather than relying on repeated separate calls.
+- **Target extraction compatibility**: Use `StableUnCLIPImg2ImgPipeline` instead of `StableUnCLIPPipeline` for image-to-image extraction.
+- **Unnormalized targets**: When building `z_decode_common`, use `extract_teacher_embeds(normalize=False)`. Unnormalized embeds retain essential structural information for image reconstruction; L2-normalized embeddings fall back to random-level chance.
+- **Relative evaluation gating**: Absolute cosine scores vary. Always evaluate relative performance against random embedding baselines: `Oracle Cosine > Random Cosine + 0.05`.

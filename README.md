@@ -3,10 +3,8 @@
 ## Project Thesis
 EEG-driven image generation using ZUNA as the signal normalization layer. The core objective is to map real continuous EEG, cleaned by ZUNA, into the multimodal latent space (`z_common`) to reconstruct what a subject is seeing.
 
-## Current Status: Phase 3 (Baseline Matrix & Multimodal Fusion) 🚧
-**MindEye v0.2-dev**: We are currently in the baseline generation and testing phase. We have established the pipeline for downloading NOD-EEG, processing via ZUNA, extracting back-aligned semantic epochs, and fusing CLIP image/text embeddings into a common target space. We strictly require that our ZUNA-cleaned EEG epochs retrieve the correct visual/semantic targets above shuffled controls before introducing frozen diffusion.
-
-*Note: The EEG-to-image system is NOT complete. We are currently hardening the ZUNA-aligned EEG→Common Space retrieval scaffold.*
+## Current Status: Phase 12A (CLIP-Native Diffusion Decoder) 🚧
+**MindEye v0.2-dev**: We have successfully completed the baseline evaluation matrix, retrieval index setup, and frozen diffusion image reconstruction. The pipeline now enforces a single canonical `z_common` target space with multi-subject FiLM scale/shift adapters and multi-task frozen probe heads. We are currently in Phase 12A, extracting target embeddings via a CLIP-Native decoder (`sd2-community/stable-diffusion-2-1-unclip`) to enable direct, unprompted image generation from decoded EEG embeddings.
 
 ## Project Structure
 * `configs/`: Configuration files for datasets, ZUNA pipeline, and training.
