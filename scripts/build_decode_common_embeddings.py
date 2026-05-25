@@ -32,7 +32,9 @@ def main():
     image_paths = sorted(list(image_dir.rglob("*.png")) + list(image_dir.rglob("*.jpg")) + list(image_dir.rglob("*.JPEG")))
     print(f"Found {len(image_paths)} images in {image_dir}")
     
-    image_id_to_common = {}
+    image_id_to_decode_raw = {}
+    image_id_to_decode_unit = {}
+    image_id_to_decode_norm = {}
     
     # Process in batches
     with torch.inference_mode():
@@ -40,28 +42,35 @@ def main():
             batch_paths = image_paths[i:i+args.batch_size]
             images = [Image.open(p).convert("RGB") for p in batch_paths]
             
-            # Use normalize=False because Gate 1 showed raw embeddings work, normalized fall to chance.
-            embeds = backend.extract_teacher_embeds(images, normalize=False)
+            # Extract raw (unnormalized) embeddings
+            embeds_raw = backend.extract_teacher_embeds(images, normalize=False)
+            embeds_unit = F.normalize(embeds_raw, dim=-1)
+            embeds_norm = torch.linalg.vector_norm(embeds_raw, dim=-1)
             
-            for path, embed in zip(batch_paths, embeds):
+            for path, raw, unit, norm in zip(batch_paths, embeds_raw, embeds_unit, embeds_norm):
                 img_id = path.stem
                 # Move to CPU to save memory
-                image_id_to_common[img_id] = embed.cpu()
+                image_id_to_decode_raw[img_id] = raw.cpu()
+                image_id_to_decode_unit[img_id] = unit.cpu()
+                image_id_to_decode_norm[img_id] = norm.cpu()
                 
             print(f"Processed {i+len(batch_paths)}/{len(image_paths)} images...")
 
     out_dict = {
         "model": backend.model_id,
         "space": "decode_common",
-        "normalization": "unnormalized",
-        "image_id_to_common": image_id_to_common
+        "normalization": "split",
+        "image_id_to_common": image_id_to_decode_unit, # backward compatibility
+        "image_id_to_decode_raw": image_id_to_decode_raw,
+        "image_id_to_decode_unit": image_id_to_decode_unit,
+        "image_id_to_decode_norm": image_id_to_decode_norm
     }
     
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(out_dict, out_path)
     
-    print(f"Saved {len(image_id_to_common)} embeddings to {out_path}")
+    print(f"Saved {len(image_id_to_decode_raw)} embeddings (raw, unit, norm) to {out_path}")
 
 if __name__ == "__main__":
     main()

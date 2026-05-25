@@ -11,7 +11,7 @@ import torchvision.transforms.functional as TF
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mindseye.generation.clip_native_backend import ClipNativeDecoderBackend
-from mindseye.models.eeg_encoder import EEGClipEncoder
+from mindseye.models.eeg_encoder import EEGClipEncoder, TemporalAttnEncoder, DualHeadTemporalAttnEncoder
 from mindseye.datasets.semantic_pairs import ZunaClipPairDataset, SemanticPairConfig
 
 def parse_args():
@@ -34,14 +34,37 @@ def main():
         config = json.load(f)["setup"]
         
     print(f"Loading EEG Encoder from {run_dir}...")
-    model = EEGClipEncoder(
-        n_channels=config["eeg_shape"][0],
-        n_times=config["eeg_shape"][1],
-        embedding_dim=config["embedding_dim"],
-        hidden_dim=config["hidden_dim"],
-        dropout=config["dropout"],
-        stem_dropout1d=config["stem_dropout1d"],
-    ).to(device)
+    model_name = config.get("model", "cnn")
+    if model_name in {"temporal_attn", "temporal_attn_small"}:
+        if config.get("dual_head", False):
+            model = DualHeadTemporalAttnEncoder(
+                n_channels=config["eeg_shape"][0],
+                embedding_dim=config["embedding_dim"],
+                hidden_dim=config["hidden_dim"],
+                n_layers=config.get("n_layers", 2 if model_name == "temporal_attn_small" else 4),
+                n_heads=config.get("n_heads", 4 if model_name == "temporal_attn_small" else 8),
+                dropout=config["dropout"],
+                stem_dropout1d=config["stem_dropout1d"],
+            ).to(device)
+        else:
+            model = TemporalAttnEncoder(
+                n_channels=config["eeg_shape"][0],
+                embedding_dim=config["embedding_dim"],
+                hidden_dim=config["hidden_dim"],
+                n_layers=config.get("n_layers", 2 if model_name == "temporal_attn_small" else 4),
+                n_heads=config.get("n_heads", 4 if model_name == "temporal_attn_small" else 8),
+                dropout=config["dropout"],
+                stem_dropout1d=config["stem_dropout1d"],
+            ).to(device)
+    else:
+        model = EEGClipEncoder(
+            n_channels=config["eeg_shape"][0],
+            n_times=config["eeg_shape"][1],
+            embedding_dim=config["embedding_dim"],
+            hidden_dim=config["hidden_dim"],
+            dropout=config["dropout"],
+            stem_dropout1d=config["stem_dropout1d"],
+        ).to(device)
     
     checkpoint_path = run_dir / "best.pt"
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -68,28 +91,41 @@ def main():
     sample_indices = val_indices[:args.num_samples]
     
     batch_eeg = []
-    batch_target = []
+    batch_target_raw = []
     for idx in sample_indices:
         item = dataset[idx]
         batch_eeg.append(item["eeg"])
-        batch_target.append(item["target"])
+        # For oracle unCLIP generation, we must use raw embeddings
+        batch_target_raw.append(item.get("target_raw", item["target"]))
         
     batch_eeg = torch.stack(batch_eeg).to(device)
-    batch_target = torch.stack(batch_target).to(device)
+    oracle_embeds = torch.stack(batch_target_raw).to(device)
     
     print("Loading ClipNativeDecoderBackend...")
     backend = ClipNativeDecoderBackend(device=device)
     
     with torch.inference_mode():
-        # Oracle embeddings
-        oracle_embeds = batch_target
-        
         # Real EEG predicted embeddings
-        real_eeg_embeds = model(batch_eeg)
-        
-        # Shuffled EEG predicted embeddings (mismatched stimuli)
-        shuffled_eeg = torch.roll(batch_eeg, shifts=1, dims=0)
-        shuffled_embeds = model(shuffled_eeg)
+        if config.get("dual_head", False):
+            # For dual head model, predicted raw embedding = pred_unit * pred_norm
+            pred_unit, pred_norm = model(batch_eeg, return_norm=True)
+            if config.get("use_fixed_mean_norm", False):
+                mean_norm = config.get("mean_train_norm", 1.0)
+                real_eeg_embeds = pred_unit * mean_norm
+            else:
+                real_eeg_embeds = pred_unit * pred_norm
+            
+            shuffled_eeg = torch.roll(batch_eeg, shifts=1, dims=0)
+            shuff_unit, shuff_norm = model(shuffled_eeg, return_norm=True)
+            if config.get("use_fixed_mean_norm", False):
+                shuffled_embeds = shuff_unit * mean_norm
+            else:
+                shuffled_embeds = shuff_unit * shuff_norm
+        else:
+            # If standard model, use output directly
+            real_eeg_embeds = model(batch_eeg)
+            shuffled_eeg = torch.roll(batch_eeg, shifts=1, dims=0)
+            shuffled_embeds = model(shuffled_eeg)
         
         # Random embeddings
         random_embeds = torch.randn_like(oracle_embeds)

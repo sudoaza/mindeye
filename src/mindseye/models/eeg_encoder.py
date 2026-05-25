@@ -224,3 +224,86 @@ def retrieval_topk(
     out["collapse_score"] = pred_std / max(tgt_std, 1e-8)
 
     return out
+
+
+class DualHeadTemporalAttnEncoder(nn.Module):
+    """
+    Dual-head Temporal Attention Encoder.
+    Outputs L2-normalized unit embeddings (z_pred_unit) and raw embedding norm (pred_norm).
+    """
+
+    def __init__(
+        self,
+        *,
+        n_channels: int = 62,
+        embedding_dim: int = 512,
+        hidden_dim: int = 256,
+        n_layers: int = 4,
+        n_heads: int = 8,
+        dropout: float = 0.2,
+        stem_dropout1d: float = 0.15,
+    ):
+        super().__init__()
+        self.n_channels = n_channels
+        self.stem = nn.Sequential(
+            nn.Conv1d(n_channels, 128, kernel_size=7, stride=4, padding=3),
+            _group_norm(128),
+            nn.GELU(),
+            nn.Dropout1d(stem_dropout1d),
+            nn.Conv1d(128, hidden_dim, kernel_size=5, stride=2, padding=2),
+            _group_norm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout1d(stem_dropout1d),
+        )
+        
+        self.max_tokens = 256
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_tokens, hidden_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.pooler = AttentionPooler(hidden_dim, heads=n_heads)
+        
+        # Dual Heads
+        self.unit_head = nn.Linear(hidden_dim, embedding_dim)
+        self.norm_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, eeg: torch.Tensor, return_features: bool = False, return_norm: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # eeg: [B, C, T]
+        x = self.stem(eeg)  # [B, D, T']
+        x = x.transpose(1, 2)  # [B, T', D]
+        
+        t = x.shape[1]
+        if t > self.max_tokens:
+            raise ValueError(f"Token length {t} exceeds max_tokens={self.max_tokens}")
+        x = x + self.pos_embed[:, :t, :]
+
+        x = self.transformer(x)
+        features = self.pooler(x)
+        
+        # L2-normalized unit vector
+        z_pred_unit = F.normalize(self.unit_head(features), dim=-1)
+        
+        # Predicted norm (must be positive, use softplus)
+        pred_norm = F.softplus(self.norm_head(features)) + 1e-6
+        
+        if return_norm:
+            if return_features:
+                return z_pred_unit, pred_norm, features
+            return z_pred_unit, pred_norm
+            
+        if return_features:
+            return z_pred_unit, features
+        return z_pred_unit
+

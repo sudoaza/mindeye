@@ -15,7 +15,7 @@ from mindseye.models.common_probe import CommonProbeModel, ATTRIBUTE_SCHEMAS, IG
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
 WindowMode = Literal["crop", "full5s", "full5s_backaligned"]
-TargetSpace = Literal["image", "semantic", "common", "label"]
+TargetSpace = Literal["image", "semantic", "common", "label", "decode_raw", "decode_unit", "decode_norm"]
 
 
 @dataclass(frozen=True)
@@ -131,9 +131,14 @@ class ZunaClipPairDataset(Dataset):
         
         target_key = f"image_id_to_{config.target_space}"
         if target_key not in table:
-            raise ValueError(f"Target space '{config.target_space}' not found in {self.common_embeddings_pt}")
+            if "image_id_to_decode_unit" in table:
+                target_key = "image_id_to_decode_unit"
+            else:
+                raise ValueError(f"Target space '{config.target_space}' not found in {self.common_embeddings_pt}")
             
         self.image_id_to_target = table[target_key]
+        self.image_id_to_decode_raw = table.get("image_id_to_decode_raw", None)
+        self.image_id_to_decode_norm = table.get("image_id_to_decode_norm", None)
         
         if "class" in self.metadata.columns:
             unique_classes = sorted(self.metadata["class"].dropna().unique().tolist())
@@ -373,6 +378,41 @@ class ZunaClipPairDataset(Dataset):
         
         return F.normalize(self.image_id_to_target[img_id].float(), dim=-1)
 
+    def _get_targets_raw(self, idx: int) -> torch.Tensor | None:
+        if self.image_id_to_decode_raw is None:
+            return None
+        mode = self.config.target_mode
+        if mode == "shuffled":
+            idx = self._target_perm[idx]
+        elif mode == "random":
+            first_key = next(iter(self.image_id_to_decode_raw.keys()))
+            shape = self.image_id_to_decode_raw[first_key].shape
+            return torch.zeros(shape)
+        elif mode == "sameclass":
+            idx = self._sameclass_targets[idx]
+        
+        row = self.metadata.iloc[idx]
+        img_id = str(row["image_id"])
+        return self.image_id_to_decode_raw[img_id].float()
+
+    def _get_targets_norm(self, idx: int) -> torch.Tensor | None:
+        if self.image_id_to_decode_norm is None:
+            return None
+        mode = self.config.target_mode
+        if mode == "shuffled":
+            idx = self._target_perm[idx]
+        elif mode == "random":
+            return torch.tensor(0.0)
+        elif mode == "sameclass":
+            idx = self._sameclass_targets[idx]
+        
+        row = self.metadata.iloc[idx]
+        img_id = str(row["image_id"])
+        val = self.image_id_to_decode_norm[img_id]
+        if isinstance(val, (int, float)):
+            return torch.tensor(val)
+        return torch.tensor(val).float()
+
     def __len__(self) -> int:
         return len(self.metadata)
 
@@ -430,6 +470,11 @@ class ZunaClipPairDataset(Dataset):
             "is_calibration": int(getattr(self.config, "is_calibration", False)),
         }
         
+        if self.image_id_to_decode_raw is not None:
+            ret["target_raw"] = self._get_targets_raw(idx)
+        if self.image_id_to_decode_norm is not None:
+            ret["target_norm"] = self._get_targets_norm(idx)
+            
         return ret
 
 

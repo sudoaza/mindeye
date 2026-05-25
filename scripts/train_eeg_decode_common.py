@@ -8,6 +8,11 @@ def main():
         sys.executable, "scripts/train_eeg_clip.py",
         "--common-embeddings", "data/processed/clip_embeddings/decode_common_embeddings.pt",
         "--loss", "contrastive",
+        "--model", "temporal_attn_small",
+        "--target-space", "decode_unit",
+        "--add-event-marker",
+        "--augment-eeg",
+        "--dual-head",
         "--metadata", "data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv",
         "--epochs-dir", "data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40",
         "--window-mode", "tight1s"

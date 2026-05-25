@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     # --target-space is kept as a hidden ablation flag; canonical path always uses 'common'.
     p.add_argument(
         "--target-space",
-        choices=("common", "semantic", "image", "label"),
+        choices=("common", "semantic", "image", "label", "decode_unit", "decode_raw", "decode_norm"),
         default="common",
         help=argparse.SUPPRESS,
     )
@@ -140,6 +140,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--loss", choices=("contrastive", "cosine_mse"), default="contrastive")
+    p.add_argument("--dual-head", action="store_true",
+                   help="Use dual-head architecture to predict unit embedding and raw embedding norm separately")
+    p.add_argument("--use-fixed-mean-norm", action="store_true",
+                   help="Fix raw embedding reconstruction prediction to use training dataset mean norm instead of learned norm")
     p.add_argument("--temperature", type=float, default=0.07,
                    help="InfoNCE temperature for --loss contrastive")
     p.add_argument("--split-mode", choices=("random", "run"), default="random",
@@ -201,6 +205,10 @@ def _batch_to_device(
         "eeg": batch["eeg"].to(device).float(),
         "target": batch["target_common"].to(device).float() if "target_common" in batch else batch["target"].to(device).float()
     }
+    if "target_raw" in batch:
+        ret["target_raw"] = batch["target_raw"].to(device).float()
+    if "target_norm" in batch:
+        ret["target_norm"] = batch["target_norm"].to(device).float()
     if "probe_targets" in batch:
         ret["probe_targets"] = {k: v.to(device).long() for k, v in batch["probe_targets"].items()}
     if "is_calibration" in batch:
@@ -530,7 +538,13 @@ def main() -> None:
         print(f"[Model] model: {args.model} (preset={preset}) hidden_dim={hidden_dim} "
               f"n_layers={n_layers} n_heads={n_heads} dropout={dropout}")
     elif args.model in {"temporal_attn", "temporal_attn_small"}:
-        from mindseye.models.eeg_encoder import TemporalAttnEncoder
+        if args.dual_head:
+            from mindseye.models.eeg_encoder import DualHeadTemporalAttnEncoder
+            model_class = DualHeadTemporalAttnEncoder
+        else:
+            from mindseye.models.eeg_encoder import TemporalAttnEncoder
+            model_class = TemporalAttnEncoder
+            
         if args.model == "temporal_attn_small":
             hidden_dim = args.hidden_dim or 128
             n_layers = args.n_layers or 2
@@ -541,7 +555,7 @@ def main() -> None:
             n_layers = args.n_layers or 4
             n_heads = args.n_heads or 8
             dropout = args.dropout if args.dropout is not None else 0.2
-        model = TemporalAttnEncoder(
+        model = model_class(
             n_channels=n_channels,
             embedding_dim=dataset.embedding_dim,
             hidden_dim=hidden_dim,
@@ -551,7 +565,7 @@ def main() -> None:
             stem_dropout1d=args.stem_dropout1d,
         ).to(device)
         model.n_channels = n_channels
-        print(f"[Model] model: {args.model} hidden_dim={hidden_dim} n_layers={n_layers} n_heads={n_heads} dropout={dropout}")
+        print(f"[Model] model: {args.model} dual_head={args.dual_head} hidden_dim={hidden_dim} n_layers={n_layers} n_heads={n_heads} dropout={dropout}")
     else:
         hidden_dim = args.hidden_dim or 256
         dropout = args.dropout if args.dropout is not None else 0.2
@@ -618,6 +632,17 @@ def main() -> None:
     ] if "," in str(args.metadata) else []
     subjects_skipped = [s for s in subjects_requested if not any(s in sl for sl in subjects_loaded)]
 
+    mean_train_norm = 1.0
+    if args.dual_head and hasattr(dataset, "image_id_to_decode_norm") and dataset.image_id_to_decode_norm is not None:
+        norms = []
+        for idx in train_idx:
+            row = dataset.metadata.iloc[idx]
+            img_id = str(row["image_id"])
+            norm_val = dataset.image_id_to_decode_norm.get(img_id, 1.0)
+            norms.append(float(norm_val))
+        mean_train_norm = sum(norms) / len(norms) if norms else 1.0
+        print(f"[Dual-Head] Mean target norm in training set: {mean_train_norm:.4f}")
+
     setup = {
         "items": len(dataset),
         "train_items": len(train_idx),
@@ -634,6 +659,9 @@ def main() -> None:
         "target_mode": args.target_mode,
         "window_mode": args.window_mode,
         "target_space": "common",
+        "dual_head": args.dual_head,
+        "use_fixed_mean_norm": args.use_fixed_mean_norm,
+        "mean_train_norm": mean_train_norm,
         "model": args.model,
         "hidden_dim": hidden_dim,
         "n_layers": n_layers,
@@ -719,17 +747,39 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             subject_id = batch_data.get("subject_id", None)
             kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
-            pred = model(batch_data["eeg"], **kwargs)
             
-            # Primary contrastive loss
-            if target_center is not None:
-                pred_for_loss = torch.nn.functional.normalize(pred - target_center, dim=-1)
-                target_for_loss = torch.nn.functional.normalize(batch_data["target"] - target_center, dim=-1)
-            else:
-                pred_for_loss = pred
-                target_for_loss = batch_data["target"]
+            if args.dual_head:
+                from mindseye.models.eeg_encoder import clip_contrastive_loss
+                import torch.nn.functional as F
+                pred, pred_norm = model(batch_data["eeg"], return_norm=True)
                 
-            loss = _loss_fn(pred_for_loss, target_for_loss, loss_name=args.loss, temperature=args.temperature)
+                # Primary contrastive loss on decode_unit target space
+                loss = clip_contrastive_loss(pred, batch_data["target"], temperature=args.temperature)
+                
+                # For zuna_random, disable raw/norm MSE.
+                if args.target_mode != "random" and "target_raw" in batch_data and "target_norm" in batch_data:
+                    if args.use_fixed_mean_norm:
+                        z_pred_raw = pred * mean_train_norm
+                        loss_raw = F.mse_loss(z_pred_raw, batch_data["target_raw"])
+                        loss = loss + 0.25 * loss_raw
+                    else:
+                        z_pred_raw = pred * pred_norm
+                        loss_raw = F.mse_loss(z_pred_raw, batch_data["target_raw"])
+                        # Normalize norm MSE by dividing by mean_train_norm^2 to prevent dimensional scaling mismatch
+                        loss_norm = F.mse_loss(pred_norm.squeeze(-1) / mean_train_norm, batch_data["target_norm"] / mean_train_norm)
+                        loss = loss + 0.25 * loss_raw + 0.05 * loss_norm
+            else:
+                pred = model(batch_data["eeg"], **kwargs)
+                
+                # Primary contrastive loss
+                if target_center is not None:
+                    pred_for_loss = torch.nn.functional.normalize(pred - target_center, dim=-1)
+                    target_for_loss = torch.nn.functional.normalize(batch_data["target"] - target_center, dim=-1)
+                else:
+                    pred_for_loss = pred
+                    target_for_loss = batch_data["target"]
+                    
+                loss = _loss_fn(pred_for_loss, target_for_loss, loss_name=args.loss, temperature=args.temperature)
             
             # Auxiliary probe loss
             if probe_model is not None and "probe_targets" in batch_data:
