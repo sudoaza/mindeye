@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     p.add_argument("--batch-size", type=int, default=64, help="Batch size")
-    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    p.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
     p.add_argument("--val-fraction", type=float, default=0.15, help="Fraction for validation split")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--device", default=None, help="cuda, cpu, or auto")
@@ -185,11 +185,18 @@ def main() -> None:
             logits_dict = model(batch_embeds)
             
             loss = 0.0
+            n_active = 0
             for task in tasks:
                 task_targets = train_targets[task][batch_indices].to(device)
-                loss += F.cross_entropy(logits_dict[task], task_targets, ignore_index=IGNORE_INDEX)
-                
+                task_loss = F.cross_entropy(logits_dict[task], task_targets, ignore_index=IGNORE_INDEX)
+                if not torch.isnan(task_loss):
+                    loss = loss + task_loss
+                    n_active += 1
+            # Normalize by number of active tasks to prevent loss magnitude scaling with task count
+            if n_active > 0:
+                loss = loss / n_active
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             epoch_loss += loss.item() * len(batch_embeds)
             

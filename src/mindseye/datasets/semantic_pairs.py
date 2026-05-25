@@ -117,9 +117,9 @@ class ZunaClipPairDataset(Dataset):
         # Use first valid epochs_dir as default for backwards compatibility
         self.epochs_dir = valid_ep_dirs[0] if valid_ep_dirs else Path(".")
 
-        if config.target_space != "common":
+        if config.target_space not in ("common", "decode_unit"):
             import warnings
-            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common' is canonical.")
+            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common' and 'decode_unit' are canonical.")
 
         table = torch.load(self.common_embeddings_pt, map_location="cpu")
         
