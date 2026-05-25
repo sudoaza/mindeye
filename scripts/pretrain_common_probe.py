@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-fraction", type=float, default=0.15, help="Fraction for validation split")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--device", default=None, help="cuda, cpu, or auto")
+    p.add_argument(
+        "--target-key",
+        default="common",
+        help="Key to read from the embeddings .pt file: 'common' (default) or 'decode_unit'",
+    )
     return p.parse_args()
 
 def split_paths(path_str) -> list[str]:
@@ -95,10 +100,13 @@ def main() -> None:
         raise FileNotFoundError(f"Common embeddings file not found: {embeddings_path}")
     embeddings_table = torch.load(embeddings_path, map_location="cpu")
     
-    image_id_to_target = embeddings_table["image_id_to_common"]
+    target_key = f"image_id_to_{args.target_key}"
+    if target_key not in embeddings_table:
+        available = [k for k in embeddings_table.keys() if k.startswith("image_id_to_")]
+        raise KeyError(f"Key '{target_key}' not found in embeddings. Available: {available}")
+    image_id_to_target = embeddings_table[target_key]
     embedding_dim = next(iter(image_id_to_target.values())).shape[-1]
-    print(f"Loaded common embeddings for {len(image_id_to_target)} images (dimension={embedding_dim}).")
-    
+    print(f"Loaded '{target_key}' embeddings for {len(image_id_to_target)} images (dimension={embedding_dim}).")
     # 3. Load VLM attributes
     vlm_path = Path(args.vlm_attributes)
     if not vlm_path.exists():

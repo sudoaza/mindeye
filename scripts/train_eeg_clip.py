@@ -280,7 +280,7 @@ def _save_env(run_dir: Path, args: argparse.Namespace, setup: dict) -> None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str = "common", probe_model=None, active_tasks=None, target_center=None) -> dict[str, float]:
+def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str = "common", probe_model=None, active_tasks=None, target_center=None, full_bank: "torch.Tensor | None" = None) -> dict[str, float]:
     from mindseye.models.eeg_encoder import retrieval_topk
     import torch
     import torch.nn.functional as F
@@ -339,11 +339,32 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
         .item()
     )
 
-    # Expected random baselines
+    # Expected random baselines (within-val)
     n = metrics["n"]
     for k in (1, 5, 10):
         metrics[f"random_top{k}_expected"] = min(k, n) / n
-        
+
+    # Full-bank retrieval: val predictions vs ALL image embeddings
+    if full_bank is not None:
+        full_bank_n = full_bank.shape[0]
+        fb = torch.nn.functional.normalize(full_bank.cpu(), dim=-1)
+        # Retrieve rank of the correct target for each val prediction
+        # pred_t_eval is already normalized
+        fb_logits = pred_t_eval.cpu() @ fb.T  # [val_n, full_bank_n]
+        # For each val item, find its target in the full bank by cosine similarity
+        # We assume diagonal identity: val item i corresponds to target_t_eval[i]
+        # Find the index in full_bank closest to each val target
+        tgt_fb_logits = target_t_eval.cpu() @ fb.T  # [val_n, full_bank_n]
+        correct_idx = tgt_fb_logits.argmax(dim=-1)   # nearest bank entry for each val target
+        # Now rank each pred against the full bank
+        fb_sorted = fb_logits.argsort(dim=-1, descending=True)  # [val_n, full_bank_n]
+        fb_rank = (fb_sorted == correct_idx[:, None]).nonzero(as_tuple=False)[:, 1].float()
+        for k in (1, 5, 10):
+            metrics[f"full_bank_top{k}"] = (fb_rank < k).float().mean().item()
+            metrics[f"full_bank_random_top{k}_expected"] = min(k, full_bank_n) / full_bank_n
+        metrics["full_bank_mrr"] = (1.0 / (fb_rank + 1.0)).mean().item()
+        metrics["full_bank_n"] = full_bank_n
+
     if probe_model and active_tasks and probe_preds_dict:
         from mindseye.models.common_probe import IGNORE_INDEX
         for task in active_tasks:
@@ -390,7 +411,7 @@ def main() -> None:
             args.vlm_attributes = str(candidate)
             print(f"[Dataset] Auto-detected vlm_attributes at {args.vlm_attributes}")
             
-    if args.target_space != "common":
+    if args.target_space not in ("common", "decode_unit"):
         print("[WARN] Non-canonical target_space used for ablation only.")
 
     dataset_config = SemanticPairConfig(
@@ -658,7 +679,7 @@ def main() -> None:
         "input_domain": args.input_domain,
         "target_mode": args.target_mode,
         "window_mode": args.window_mode,
-        "target_space": "common",
+        "target_space": args.target_space,
         "dual_head": args.dual_head,
         "use_fixed_mean_norm": args.use_fixed_mean_norm,
         "mean_train_norm": mean_train_norm,
@@ -704,20 +725,31 @@ def main() -> None:
     import csv
     log_path = run_dir / "train_log.csv"
     log_fields = ["epoch", "train_loss", "val_loss", "val_score",
-                  "top1", "top5", "top10", "mrr", "median_rank", "mean_diag_cosine", "collapse_score"]
-                  
+                  "top1", "top5", "top10", "mrr", "median_rank", "mean_diag_cosine", "collapse_score",
+                  "full_bank_top1", "full_bank_top5", "full_bank_top10", "full_bank_mrr"]
+
     if active_tasks:
         for task in active_tasks:
             log_fields.append(f"probe_{task}_acc")
             if task == "class_label":
                 log_fields.append("probe_class_label_top10_acc")
-                
+
     if calib_val_loader is not None and active_tasks:
         for task in active_tasks:
             log_fields.append(f"calib_probe_{task}_acc")
             if task == "class_label":
                 log_fields.append("calib_probe_class_label_top10_acc")
 
+    # Build full-bank tensor once (all image embeddings in decode_unit space)
+    full_bank_tensor = None
+    if hasattr(dataset, "image_id_to_target") and dataset.image_id_to_target is not None:
+        import torch as _torch
+        import torch.nn.functional as _F
+        all_ids = sorted(dataset.image_id_to_target.keys())
+        full_bank_tensor = _torch.stack([
+            _F.normalize(dataset.image_id_to_target[i].float(), dim=-1) for i in all_ids
+        ])
+        print(f"[FullBank] Built retrieval bank: {full_bank_tensor.shape[0]} embeddings")
 
     with open(log_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=log_fields).writeheader()
@@ -810,7 +842,7 @@ def main() -> None:
         val = evaluate(model, val_loader, device, loss_name=args.loss,
                        temperature=args.temperature, target_space=args.target_space,
                        probe_model=probe_model, active_tasks=active_tasks,
-                       target_center=target_center)
+                       target_center=target_center, full_bank=full_bank_tensor)
         
         calib_val = None
         if calib_val_loader is not None:
@@ -894,7 +926,7 @@ def main() -> None:
     final_metrics = evaluate(model, val_loader, device, loss_name=args.loss,
                              temperature=args.temperature, target_space=args.target_space,
                              probe_model=probe_model, active_tasks=active_tasks,
-                             target_center=target_center_eval)
+                             target_center=target_center_eval, full_bank=full_bank_tensor)
                              
     if calib_val_loader is not None:
         final_calib_metrics = evaluate(model, calib_val_loader, device, loss_name=args.loss,
