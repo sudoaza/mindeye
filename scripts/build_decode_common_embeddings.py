@@ -40,14 +40,34 @@ def main():
     with torch.inference_mode():
         for i in range(0, len(image_paths), args.batch_size):
             batch_paths = image_paths[i:i+args.batch_size]
-            images = [Image.open(p).convert("RGB") for p in batch_paths]
             
+            images = []
+            valid_paths = []
+            for p in batch_paths:
+                try:
+                    img = Image.open(p)
+                    # convert to RGB and call load() to force reading pixel data
+                    img = img.convert("RGB")
+                    img.load()
+                    images.append(img)
+                    valid_paths.append(p)
+                except Exception as e:
+                    print(f"Warning: Failed to load image {p}: {e}")
+                    try:
+                        p.unlink()
+                        print(f"Deleted corrupt file: {p}")
+                    except Exception as unlink_err:
+                        print(f"Failed to delete corrupt file {p}: {unlink_err}")
+            
+            if not images:
+                continue
+                
             # Extract raw (unnormalized) embeddings
             embeds_raw = backend.extract_teacher_embeds(images, normalize=False)
             embeds_unit = F.normalize(embeds_raw, dim=-1)
             embeds_norm = torch.linalg.vector_norm(embeds_raw, dim=-1)
             
-            for path, raw, unit, norm in zip(batch_paths, embeds_raw, embeds_unit, embeds_norm):
+            for path, raw, unit, norm in zip(valid_paths, embeds_raw, embeds_unit, embeds_norm):
                 img_id = path.stem
                 # Move to CPU to save memory
                 image_id_to_decode_raw[img_id] = raw.cpu()
