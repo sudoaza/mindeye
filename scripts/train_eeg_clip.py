@@ -185,6 +185,8 @@ def parse_args() -> argparse.Namespace:
                    help="Disable subject-specific projection heads (ablation: shared head only)")
     p.add_argument("--head-reg-weight", type=float, default=0.0,
                    help="Weight for head regularization loss ||W_subject - W_shared||^2")
+    p.add_argument("--no-target-centering", action="store_true",
+                   help="Disable training-set mean subtraction (centering) for contrastive targets")
     args = p.parse_args()
     if args.model in {"temporal_attn_small", "spatial_temporal_small", "spatial_temporal"} and args.weight_decay == 1e-4:
         args.weight_decay = 1e-2
@@ -314,8 +316,12 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
             kwargs = {"subject_id": subject_id} if getattr(model, "subject_embed", None) is not None else {}
             pred = model(batch_data["eeg"], **kwargs)
             if probe_model and active_tasks and "probe_targets" in batch_data:
-                # Probe was pretrained on F.normalize(z_common); normalize pred to match.
-                a_preds = probe_model(F.normalize(pred, dim=-1))
+                # Use same normalized representation space as training
+                if target_center is not None:
+                    probe_in = F.normalize(pred - target_center, dim=-1)
+                else:
+                    probe_in = F.normalize(pred, dim=-1)
+                a_preds = probe_model(probe_in)
                 
             preds.append(pred.cpu())
             targets.append(batch_data["target"].cpu())
@@ -530,15 +536,19 @@ def main() -> None:
         val_loader = DataLoader(Subset(dataset, val_idx), batch_size=args.batch_size, shuffle=False)
 
 
-    # Compute target center over the training split
-    print("Computing mean target embedding vector over the training set...")
-    with torch.inference_mode():
-        all_train_targets = []
-        for idx in train_idx:
-            all_train_targets.append(dataset._get_targets(idx))
-        target_center = torch.stack(all_train_targets).mean(dim=0).to(device)
-        tc_norm = float(torch.linalg.norm(target_center).item())
-        print(f"Target center vector computed. Norm: {tc_norm:.4f}")
+    if args.no_target_centering:
+        target_center = None
+        print("Training-set target centering is disabled (--no-target-centering).")
+    else:
+        # Compute target center over the training split
+        print("Computing mean target embedding vector over the training set...")
+        with torch.inference_mode():
+            all_train_targets = []
+            for idx in train_idx:
+                all_train_targets.append(dataset._get_targets(idx))
+            target_center = torch.stack(all_train_targets).mean(dim=0).to(device)
+            tc_norm = float(torch.linalg.norm(target_center).item())
+            print(f"Target center vector computed. Norm: {tc_norm:.4f}")
 
     n_channels, n_times = dataset.eeg_shape
     print(f"\n[Dataset] window_mode: {args.window_mode}")
@@ -873,8 +883,8 @@ def main() -> None:
                     pred_for_loss = torch.nn.functional.normalize(pred - target_center, dim=-1)
                     target_for_loss = torch.nn.functional.normalize(batch_data["target"] - target_center, dim=-1)
                 else:
-                    pred_for_loss = pred
-                    target_for_loss = batch_data["target"]
+                    pred_for_loss = torch.nn.functional.normalize(pred, dim=-1)
+                    target_for_loss = torch.nn.functional.normalize(batch_data["target"], dim=-1)
                     
                 loss = _loss_fn(pred_for_loss, target_for_loss, loss_name=args.loss, temperature=args.temperature)
             
@@ -884,8 +894,8 @@ def main() -> None:
                     and epoch >= args.probe_start_epoch):
                 import torch.nn.functional as F
                 from mindseye.models.common_probe import IGNORE_INDEX
-                # Probe was pretrained on F.normalize(z_common); normalize pred to match.
-                logits_dict = probe_model(F.normalize(pred, dim=-1))
+                # Use same normalized representation space as contrastive InfoNCE
+                logits_dict = probe_model(pred_for_loss)
 
                 task_losses = []
                 is_calib = batch_data.get("is_calibration", torch.zeros(len(pred), device=device, dtype=torch.bool))

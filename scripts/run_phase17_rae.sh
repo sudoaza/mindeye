@@ -33,14 +33,19 @@ python3 scripts/train_eeg_clip.py \
     --common-probe outputs/rae_probe/common_probe.pt \
     --probe-weight 0.01 \
     --probe-start-epoch 5 \
-    --head-reg-weight 0.01
+    --head-reg-weight 0.01 \
+    --no-target-centering
 
 echo "Training complete. Extracting test metrics..."
 
+# Dynamically resolve the newly created run directory
+RUN_DIR=$(find outputs -maxdepth 1 -name "*_${SLUG}" -type d | sort | tail -n 1)
+echo "Resolved training run directory: $RUN_DIR"
+
 # Run evaluation script with RAE-native metric computation and retrieval
 python3 scripts/evaluate_rae_generation.py \
-    --run-dir outputs/$SLUG \
-    --num-samples 100 \
+    --run-dir "$RUN_DIR" \
+    --num-samples 500 \
     --batch-size 25 \
     --k 5 \
     --target-key image_id_to_rae_centered_unit \

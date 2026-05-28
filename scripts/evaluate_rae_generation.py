@@ -168,6 +168,39 @@ def run_paired_bootstrap_multitask(real_matches, baseline_matches, num_iteration
         "p_value_empirical": p_val
     }
 
+def apply_rae_target_transform(global_vec, bank_metadata, target_key):
+    device = global_vec.device
+    is_1d = (global_vec.ndim == 1)
+    if is_1d:
+        global_vec = global_vec.unsqueeze(0)
+        
+    if "centered" in target_key or "whitened" in target_key:
+        if "rae_center_mean" not in bank_metadata:
+            raise KeyError("bank_metadata is missing 'rae_center_mean'. Did you run add_rae_transforms.py?")
+        rae_center_mean = bank_metadata["rae_center_mean"].to(device)
+        v_centered = global_vec - rae_center_mean
+    else:
+        v_centered = global_vec
+        
+    if "whitened" in target_key:
+        if "rae_pca_components" not in bank_metadata or "rae_pca_eigenvalues" not in bank_metadata:
+            raise KeyError("bank_metadata is missing whitening parameters.")
+        rae_pca_components = bank_metadata["rae_pca_components"].to(device)
+        rae_pca_eigenvalues = bank_metadata["rae_pca_eigenvalues"].to(device)
+        whitening_eps = bank_metadata.get("whitening_eps", 1e-5)
+        
+        v_whitened = torch.matmul(v_centered, rae_pca_components)
+        v_transformed = v_whitened / torch.sqrt(rae_pca_eigenvalues + whitening_eps)
+    else:
+        v_transformed = v_centered
+        
+    v_transformed_unit = F.normalize(v_transformed, dim=-1)
+    
+    if is_1d:
+        v_transformed_unit = v_transformed_unit.squeeze(0)
+        
+    return v_transformed_unit
+
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -238,8 +271,17 @@ def main():
             stem_dropout1d=config["stem_dropout1d"],
         ).to(device)
         
-    model.load_state_dict(torch.load(run_dir / "best.pt", map_location=device)["model_state"])
+    checkpoint = torch.load(run_dir / "best.pt", map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
     model.eval()
+    
+    target_center_eval = checkpoint.get("target_center", None)
+    if target_center_eval is not None:
+        target_center_eval = target_center_eval.to(device)
+        print("Detected target_center in checkpoint. Centering will be applied to predictions.")
+    else:
+        target_center_eval = None
+        print("No target_center detected in checkpoint. Skipping centering.")
     
     # Load dataset
     common_pt = root_config.get("common_embeddings", config.get("common_embeddings", "data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt"))
@@ -334,13 +376,19 @@ def main():
         shuffled_subjects = torch.roll(val_subjects, shifts=1, dims=0)
         shuffled_kwargs = {"subject_id": shuffled_subjects} if getattr(model, "subject_embed", None) is not None else {}
         
-        pred_unit = model(val_eeg, **kwargs)
-        pred_unit = F.normalize(pred_unit, dim=-1)
-        
+        pred_raw = model(val_eeg, **kwargs)
+        if target_center_eval is not None:
+            pred_unit = F.normalize(pred_raw - target_center_eval, dim=-1)
+        else:
+            pred_unit = F.normalize(pred_raw, dim=-1)
+            
         shuffled_eeg = torch.roll(val_eeg, shifts=1, dims=0)
-        shuff_unit = model(shuffled_eeg, **shuffled_kwargs)
-        shuff_unit = F.normalize(shuff_unit, dim=-1)
-        
+        shuff_raw = model(shuffled_eeg, **shuffled_kwargs)
+        if target_center_eval is not None:
+            shuff_unit = F.normalize(shuff_raw - target_center_eval, dim=-1)
+        else:
+            shuff_unit = F.normalize(shuff_raw, dim=-1)
+            
         random_unit = F.normalize(torch.randn_like(pred_unit), dim=-1)
 
     # --- 1. RAE-native Full-bank Retrieval (Top-10 and MRR) ---
@@ -412,7 +460,7 @@ def main():
             # Extract RAE global embeddings from generated images to evaluate RAE-native cosine
             # (Use PIL images batch)
             gen_rae = rae_backend.extract_rae_latent(gen_images)
-            gen_rae_unit = gen_rae["unit"].float()  # [B, 768]
+            gen_rae_unit = apply_rae_target_transform(gen_rae["global"].float(), table, args.target_key)
             
             # Compare with true target RAE unit
             for idx_in_batch in range(len(gen_images)):
