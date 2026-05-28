@@ -1062,13 +1062,14 @@ def main() -> None:
                        target_center=target_center, full_bank=full_bank_tensor,
                        code_shape=getattr(dataset, '_rae_code_shape', None))
         
+        calib_val = None
         if calib_val_loader is not None:
             calib_val = evaluate(model, calib_val_loader, device, loss_name=args.loss,
                                  temperature=args.temperature, target_space=args.target_space,
                                  probe_model=probe_model, active_tasks=active_tasks,
                                  target_center=target_center,
                                  code_shape=getattr(dataset, '_rae_code_shape', None))
-                                 
+
         score = float(val["mrr"] + 0.25 * val["top10"])
         if val["collapse_score"] < 0.1:
             score = -1.0
