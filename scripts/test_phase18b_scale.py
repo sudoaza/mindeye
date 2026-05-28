@@ -160,9 +160,10 @@ def main():
         target_space=root_cfg.get("target_space") or "rae_code",
         target_key=root_cfg.get("target_key") or "image_id_to_rae_code",
         window_mode=root_cfg.get("window_mode") or "tight1s",
-        add_event_marker=bool(root_cfg.get("add_event_marker") or True),
+        # add_event_marker: default False — training did not use --add-event-marker
+        add_event_marker=bool(root_cfg.get("add_event_marker") or cfg.get("add_event_marker") or False),
         augment_eeg=False,
-        subject_list=list(root_cfg.get("subjects_loaded") or []) or None,
+        subject_list=list(root_cfg.get("subjects_loaded") or cfg.get("subjects_loaded") or []),
     )
     dataset = ZunaClipPairDataset(ds_config)
     code_shape = getattr(dataset, "_rae_code_shape", (768, 3, 3))
