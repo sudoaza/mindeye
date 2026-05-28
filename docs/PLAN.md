@@ -300,44 +300,39 @@ only needs to predict the lower-dim code.
   - Root cause of 0.003 gap: EEG code has correct bulk direction (cosine 0.608) but insufficient per-channel/per-site fidelity for the 3×3 bottleneck → expand path.
   - Increasing bottleneck oracle ceiling is the lever (4×4 > 3×3).
 
-### Phase 18C: EEG → spatial_768x4x4 Code + Probe ← **CURRENT**
+### Phase 18C & 18C-v2: EEG → spatial_768x4x4 Code + Probe
 
-Rationale: 4×4 oracle cosine = 0.833 vs 3×3 = 0.802. More spatial information per code
-gives EEG encoder a higher ceiling. Probe gives semantic anchor to prevent directional drift.
+Rationale: 4×4 oracle cosine = 0.833 vs 3×3 = 0.802. More spatial information per code gives EEG encoder a higher ceiling. Probe gives semantic anchor to prevent directional drift.
 
 - [x] Extracted `rae_bottleneck_codes_4x4.pt` (12,288-dim codes) for 15,891 images.
-- [x] Trained RAE-code probe on `mean_pool([768,4,4]) → [768] → normalize` (11 active tasks beat baseline;
-  class_label 60.1%, animal_visible 98.2%, human_visible 94.2%, dominant_color 53.9%).
-- [ ] Train EEG: `spatial_cosine` + `probe_weight=0.01`, `probe_start_epoch=5`, 100 epochs / patience 20.
-- [ ] Evaluate: expanded_token_cosine EEG vs shuffled gap (target: clearly above +0.003).
-- [ ] Visual grid: 6 rows (target / oracle / bn_oracle_4x4 / EEG / shuffled / random).
-
-**Key question**: Does 4×4 + probe produce `expanded_token_cosine_eeg - shuffled > 0.01`?
+- [x] Trained RAE-code probe on `mean_pool([768,4,4]) → [768] → normalize` (11 active tasks beat baseline; class_label 60.1%, animal_visible 98.2%, human_visible 94.2%, dominant_color 53.9%).
+- [x] **Phase 18C (Cold Start)**: Trained EEG encoder from scratch.
+  - Spatial cosine: 0.5835; scale inflation: 4.83×.
+  - Expanded token cosine: 0.2920 vs shuffled 0.2897 (gap +0.0023, overlapping CIs).
+- [x] **Phase 18C-v2 (Warm Start)**: Initialized from Phase 16c best.pt. Deployed probe logging fix.
+  - Spatial cosine: 0.5850; scale inflation: 3.31×.
+  - Expanded token cosine: **0.2955** vs shuffled **0.2884** (gap **+0.0071**, non-overlapping 95% CIs).
+  - Probe metrics: Captured `animal_visible` (74.3% vs 59.1% baseline) and `dominant_color` (31.4% vs 27.4%), while `class_label` remains at chance (0.13%).
+- [x] Visual grids generated for both runs.
 
 ---
 
 ## 🗺️ Future Work
 
-### Phase 18D (if 18C shows gap > 0.01): Full Pipeline Evaluation
-- [ ] Generate images for 50+ held-out stimuli; compute semantic similarity vs ground truth.
-- [ ] If gap ≥ 0.02: proceed to Phase 19 (EEG-conditioned image synthesis end-to-end).
-- [ ] If gap < 0.01: try 5×5 bottleneck or direct `[768, 16, 16]` token regression.
-
-### VLM Attribute Backfill (Low Priority, Not Blocking 18C)
-- [ ] 11 Phase 11A attributes (`warm_vs_cool`, `bright_vs_dark`, `round_or_curved`,
-  `angular_or_geometric`, `symmetrical`, `single_object`, `glossy`, `rough`, `smooth`,
-  `transparent`, `organic_texture`) exist in `ATTRIBUTE_SCHEMAS` but were **never annotated** in
-  `vlm_attributes_runs01_40.json` — they were schema additions after the annotation run.
-- [ ] Re-run VLM annotation over all 15,891 image IDs with the extended attribute prompt.
-- [ ] Merge with existing annotations; re-train probe to use all 29 tasks.
+### Phase 18D: Loss Tuning & Capacity Scaling (Current Target)
+- [ ] **Ablate MSE Loss**: Train with pure cosine loss (MSE coeff = 0.0) to resolve scale inflation, or implement a dedicated norm-matching constraint.
+- [ ] **Scale Spatial Grid**: Test `spatial_768x5x5` codes to increase the oracle ceiling beyond 0.85.
+- [ ] **Direct Token Regression**: Attempt direct regression of `[768, 16, 16]` space using convolutional priors on the projection head.
+- [ ] **Backfill VLM Attributes**: Re-annotate remaining 11 attributes to expand probe to 29 tasks and increase coverage.
 
 ### Phase 7 (Deferred): BReAD-style Retrieval Branch
 - [ ] Add `src/mindseye/embeddings/faiss_index.py`, `scripts/build_retrieval_index.py`.
-- [ ] Implement after EEG→RAE code achieves meaningful expanded_token_cosine gap.
+- [ ] Implement after EEG→RAE code achieves expanded_token_cosine gap ≥ 0.02.
 
 ### Phase 8 (Deferred): Frozen Diffusion img2img
-- [ ] Not before EEG→RAE code shows visual separability from shuffled in generation grid.
 - [ ] Pipeline: EEG code → expand → RAE decode → SDXL-Turbo img2img refinement.
+- [ ] Implement after EEG→RAE reconstructions show clear shape/layout separability from shuffled in visual grids.
 
 ### Phase 9 (Deferred): Alljoined / ENIGMA Comparison
 - [ ] Domain adaptation / consumer-grade robustness after core pipeline matures.
+
