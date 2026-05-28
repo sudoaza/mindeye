@@ -758,16 +758,20 @@ def main() -> None:
         with open(probe_specs_path, "r") as f:
             active_task_specs = json.load(f)
 
+        # Infer probe embedding_dim from saved checkpoint (not dataset.embedding_dim).
+        # For rae_code mode the probe is trained on mean_pool([C,H,W]) = [C=768], not flat codes.
+        _probe_sd = torch.load(args.common_probe, map_location="cpu")
+        _probe_emb_dim = _probe_sd["trunk.0.weight"].shape[0]  # LayerNorm weight has shape [D]
         probe_model = CommonProbeModel(
-            embedding_dim=dataset.embedding_dim,
+            embedding_dim=_probe_emb_dim,
             task_specs=active_task_specs
         ).to(device)
-        probe_model.load_state_dict(torch.load(args.common_probe, map_location=device))
+        probe_model.load_state_dict(_probe_sd)
         probe_model.eval()
         for p in probe_model.parameters():
             p.requires_grad = False
         active_tasks = list(active_task_specs.keys())
-        print(f"[Model] Loaded frozen CommonProbeModel with {len(active_tasks)} active tasks from {args.common_probe}")
+        print(f"[Model] Loaded frozen CommonProbeModel (emb_dim={_probe_emb_dim}) with {len(active_tasks)} active tasks from {args.common_probe}")
     loaded_keys_count = 0
     skipped_keys_count = 0
     skipped_keys_first50 = []
@@ -820,7 +824,15 @@ def main() -> None:
         kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
         pred = model(batch_data["eeg"], **kwargs)
         if probe_model is not None:
-            _ = probe_model(pred)
+            _cs = getattr(dataset, '_rae_code_shape', None)
+            if _cs is not None and len(_cs) == 3:
+                _c, _h, _w = _cs
+                _probe_warmup_in = torch.nn.functional.normalize(
+                    pred.reshape(pred.shape[0], _c, _h, _w).mean(dim=[-1, -2]), dim=-1
+                )
+            else:
+                _probe_warmup_in = pred
+            _ = probe_model(_probe_warmup_in)
 
     # Subject audit
     subjects_loaded = list(getattr(dataset, "unique_subjects", []))
