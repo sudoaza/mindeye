@@ -259,3 +259,55 @@ pkill -f 'python.*run_baseline_matrix' # Kill matrix run
 - **Attribute Probe Mismatch**: Never feed RAE-space target vectors into `outputs/decode_probe_v2/common_probe.pt` (which was trained on Stable unCLIP decode_unit space). Use the RAE-native probe `outputs/rae_probe/common_probe.pt`.
 - **Target Centering in Evaluation**: Generated images must be encoded using the RAE backend, subtracted by the training set mean (`rae_center_mean`), and then L2-normalized. Raw unit comparison will hide retrieval performance.
 - **Option B Coordinate Alignment**: Make sure `pred_for_loss` is defined as `normalize(pred - target_center)` during training, and the auxiliary probe model gets `pred_for_loss` as input (instead of uncentered prediction).
+
+### Phase 18A (RAE Token Bottleneck Autoencoder)
+
+The bottleneck decouples EEG↔RAE into two independent systems:
+1. **Image-only bridge**: compress [768,16,16] RAE tokens → [C,4,4] code → expand back → decode image.
+2. **EEG→code**: EEG encoder predicts the compact code (Phase 18B, not yet started).
+
+```bash
+# Step 0: Train the bottleneck (on pod, tokens already in RAE bank)
+python scripts/train_rae_token_bottleneck.py \
+    --rae-bank data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
+    --arch conv_256x4x4 \
+    --epochs 50 \
+    --batch-size 64 \
+    --lr 1e-3 \
+    --output-dir outputs/rae_bottleneck/conv_256x4x4 \
+    --device cuda
+
+# To run all three archs in sequence (background):
+for arch in spatial_768x4x4 conv_256x4x4 conv_128x4x4; do
+    python scripts/train_rae_token_bottleneck.py \
+        --rae-bank data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
+        --arch $arch \
+        --epochs 50 \
+        --output-dir outputs/rae_bottleneck/$arch \
+        --device cuda
+done
+
+# Step 1: Check gate metrics from outputs/rae_bottleneck/<arch>/metrics.json
+#   gate_token_cosine_pass: true   (mean_token_cosine > 0.90)
+#   gate_collapse_pass:     true   (pct_collapsed_channels < 5%)
+
+# Step 2: Extract codes for all images (after bottleneck is validated)
+python scripts/build_rae_bottleneck_codes.py \
+    --rae-bank data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
+    --checkpoint outputs/rae_bottleneck/conv_256x4x4/best.pt \
+    --output data/processed/rae_embeddings/rae_bottleneck_codes_conv256.pt \
+    --device cuda
+```
+
+**Gate criteria (must pass before Phase 18B):**
+- `mean_token_cosine > 0.90` — bottleneck faithfully reconstructs token geometry
+- `pct_collapsed_channels < 5%` — no mode collapse in the code
+- If `conv_256x4x4` fails, try `conv_128x4x4` before falling back to `spatial_768x4x4` (upper bound).
+
+**Architecture summary:**
+| Arch | Code shape | Values | Notes |
+|---|---|---|---|
+| `spatial_768x4x4` | [768,4,4] | 12288 | No params — reconstruction upper bound |
+| `conv_256x4x4` | [256,4,4] | 4096 | Primary target for EEG regression |
+| `conv_128x4x4` | [128,4,4] | 2048 | Leaner — test compression tolerance |
+
