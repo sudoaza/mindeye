@@ -82,16 +82,35 @@ def pil_grid(tensors: list[torch.Tensor], nrow: int) -> Image.Image:
     return TF.to_pil_image(grid.clamp(0, 1))
 
 
-def run_bootstrap_ci(values: list[float], num_iterations: int = 1000, ci: int = 95) -> dict:
+def run_bootstrap_ci(values: list[float], num_iterations: int = 10000, ci: int = 95) -> dict:
     if not values:
         return {"mean": 0.0, "ci_lower": 0.0, "ci_upper": 0.0}
     arr = np.array(values)
-    boot = [np.mean(np.random.choice(arr, len(arr))) for _ in range(num_iterations)]
+    n = len(arr)
+    idx = np.random.randint(0, n, size=(num_iterations, n))
+    boot = arr[idx].mean(axis=1)
     lo = (100 - ci) / 2
     return {
         "mean": float(arr.mean()),
         "ci_lower": float(np.percentile(boot, lo)),
         "ci_upper": float(np.percentile(boot, 100 - lo)),
+    }
+
+
+def run_paired_bootstrap(list_a: list[float], list_b: list[float], num_iterations: int = 10000, ci: int = 95) -> dict:
+    if not list_a or not list_b or len(list_a) != len(list_b):
+        return {"mean": 0.0, "ci_lower": 0.0, "ci_upper": 0.0}
+    arr_a = np.array(list_a)
+    arr_b = np.array(list_b)
+    deltas = arr_a - arr_b
+    n = len(deltas)
+    idx = np.random.randint(0, n, size=(num_iterations, n))
+    boot_means = deltas[idx].mean(axis=1)
+    lo = (100 - ci) / 2
+    return {
+        "mean": float(deltas.mean()),
+        "ci_lower": float(np.percentile(boot_means, lo)),
+        "ci_upper": float(np.percentile(boot_means, 100 - lo)),
     }
 
 
@@ -133,6 +152,7 @@ def load_eeg_model(run_dir: Path, embedding_dim: int, n_channels: int, n_times: 
             n_times=n_times,
             embedding_dim=embedding_dim,
             hidden_dim=hidden_dim,
+            normalize_output=False,
         )
 
     ckpt = torch.load(run_dir / "best.pt", map_location=device)
@@ -426,6 +446,22 @@ def main():
     for k, v in et_summary.items():
         print(f"  {k}: mean={v['mean']:.4f} [{v['ci_lower']:.4f}, {v['ci_upper']:.4f}]")
 
+    # Paired Bootstrap
+    paired_delta_mean = 0.0
+    paired_delta_ci_lower = 0.0
+    paired_delta_ci_upper = 0.0
+    if expanded_token_cosines["eeg"] and expanded_token_cosines["shuffled"]:
+        paired_res = run_paired_bootstrap(
+            expanded_token_cosines["eeg"],
+            expanded_token_cosines["shuffled"],
+            num_iterations=10000
+        )
+        paired_delta_mean = paired_res["mean"]
+        paired_delta_ci_lower = paired_res["ci_lower"]
+        paired_delta_ci_upper = paired_res["ci_upper"]
+        print(f"\n[Paired Bootstrap (EEG - Shuffled)]")
+        print(f"  delta_mean: {paired_delta_mean:.5f} [{paired_delta_ci_lower:.5f}, {paired_delta_ci_upper:.5f}]")
+
     # ------------------------------------------------------------------
     # Visual grid (6 rows: target | oracle | bn_oracle | eeg | shuffled | random)
     # ------------------------------------------------------------------
@@ -457,6 +493,9 @@ def main():
         "distribution_diagnostics": diag,
         "full_bank_retrieval": retrieval,
         "expanded_token_cosines": et_summary,
+        "paired_delta_mean": paired_delta_mean,
+        "paired_delta_ci_lower": paired_delta_ci_lower,
+        "paired_delta_ci_upper": paired_delta_ci_upper,
     }
     metrics_path = out_dir / "generation_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))

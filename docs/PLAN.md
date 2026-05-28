@@ -300,7 +300,7 @@ only needs to predict the lower-dim code.
   - Root cause of 0.003 gap: EEG code has correct bulk direction (cosine 0.608) but insufficient per-channel/per-site fidelity for the 3×3 bottleneck → expand path.
   - Increasing bottleneck oracle ceiling is the lever (4×4 > 3×3).
 
-### Phase 18C & 18C-v2: EEG → spatial_768x4x4 Code + Probe
+### Phase 18C & 18C-v2: EEG → spatial_768x4x4 Code + Probe ✅
 
 Rationale: 4×4 oracle cosine = 0.833 vs 3×3 = 0.802. More spatial information per code gives EEG encoder a higher ceiling. Probe gives semantic anchor to prevent directional drift.
 
@@ -315,12 +315,24 @@ Rationale: 4×4 oracle cosine = 0.833 vs 3×3 = 0.802. More spatial information 
   - Probe metrics: Captured `animal_visible` (74.3% vs 59.1% baseline) and `dominant_color` (31.4% vs 27.4%), while `class_label` remains at chance (0.13%).
 - [x] Visual grids generated for both runs.
 
+### Phase 18D: Loss Cleanup & Paired Bootstrap (Complete) ✅
+
+Rationale: Suppress scale inflation using target-anchored site norm loss (`--loss spatial_cosine_norm`) and implement a 10,000-iteration paired bootstrap significance test.
+
+- [x] Fix `normalize_output` initialization bug in training and evaluation pipelines.
+- [x] Implement relative spatial site norm matching loss anchored to target scale (`scale = target_site_norm.mean().detach() + 1e-6`).
+- [x] Log raw/relative norm statistics every epoch.
+- [x] Implement paired bootstrap resampling deltas (`delta_i = eeg_cos_i - shuffled_cos_i`) over 10,000 iterations.
+- [x] Results:
+  - **Scale inflation resolved**: `pred_code_std` = 1.03 vs 0.93 target (ratio **1.10x** vs 3.31x in 18C-v2).
+  - **No expansion gap**: Expanded token cosine EEG vs Shuffled shows **0.2922** vs **0.2922** (gap = **0.00000**, 95% CI `[-0.00004, 0.00004]`).
+  - **Conclusion**: Distribution alignment works, but the predicted EEG codes lack the high-fidelity features required to survive the frozen non-linear expansion mapping. A stronger mapping or capacity increase is required.
+
 ---
 
 ## 🗺️ Future Work
 
-### Phase 18D: Loss Tuning & Capacity Scaling (Current Target)
-- [ ] **Ablate MSE Loss**: Train with pure cosine loss (MSE coeff = 0.0) to resolve scale inflation, or implement a dedicated norm-matching constraint.
+### Phase 18E: RAE Capacity Scaling & Direct Regress
 - [ ] **Scale Spatial Grid**: Test `spatial_768x5x5` codes to increase the oracle ceiling beyond 0.85.
 - [ ] **Direct Token Regression**: Attempt direct regression of `[768, 16, 16]` space using convolutional priors on the projection head.
 - [ ] **Backfill VLM Attributes**: Re-annotate remaining 11 attributes to expand probe to 29 tasks and increase coverage.

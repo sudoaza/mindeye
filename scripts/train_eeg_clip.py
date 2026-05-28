@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--loss", choices=("contrastive", "cosine_mse", "spatial_cosine"), default="contrastive")
+    p.add_argument("--loss", choices=("contrastive", "cosine_mse", "spatial_cosine", "spatial_cosine_norm"), default="contrastive")
     p.add_argument("--dual-head", action="store_true",
                    help="Use dual-head architecture to predict unit embedding and raw embedding norm separately")
     p.add_argument("--use-fixed-mean-norm", action="store_true",
@@ -250,6 +250,8 @@ def _loss_fn(pred, target, *, loss_name: str, temperature: float, code_shape: tu
         return clip_contrastive_loss(pred, target, temperature=temperature)
     if loss_name == "spatial_cosine":
         return _spatial_cosine_loss(pred, target, code_shape=code_shape)
+    if loss_name == "spatial_cosine_norm":
+        return _spatial_cosine_norm_loss(pred, target, code_shape=code_shape)
     from mindseye.models.eeg_encoder import cosine_mse_loss
     return cosine_mse_loss(pred, target)
 
@@ -275,6 +277,44 @@ def _spatial_cosine_loss(pred: "torch.Tensor", target: "torch.Tensor", code_shap
     cos_loss = (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
     mse_loss = F.mse_loss(pred, target)
     return cos_loss + 0.25 * mse_loss
+
+
+def _spatial_cosine_norm_loss(pred: "torch.Tensor", target: "torch.Tensor", code_shape: tuple | None = None) -> "torch.Tensor":
+    """Spatial cosine norm loss for rae_code targets.
+
+    If code_shape (C, H, W) is provided, computes:
+    loss_cos = 1 - mean(cosine_similarity) along channels at each [H, W] site.
+    loss_norm = F.mse_loss(pred_site_norm / scale, target_site_norm / scale)
+    where scale = target_site_norm.mean().detach() + 1e-6.
+    returns loss_cos + 0.05 * loss_norm.
+    """
+    import torch.nn.functional as F
+    if code_shape is not None and len(code_shape) == 3:
+        c, h, w = code_shape
+        pred_s = pred.reshape(-1, c, h, w)
+        tgt_s = target.reshape(-1, c, h, w)
+        cos = F.cosine_similarity(pred_s, tgt_s, dim=1)  # [B, H, W]
+        loss_cos = (1.0 - cos).mean()
+        
+        pred_site_norm = pred_s.norm(dim=1)
+        target_site_norm = tgt_s.norm(dim=1).detach()
+        scale = target_site_norm.mean().detach() + 1e-6
+        loss_norm = F.mse_loss(
+            pred_site_norm / scale,
+            target_site_norm / scale
+        )
+        return loss_cos + 0.05 * loss_norm
+    else:
+        # Fallback to flat if no code_shape is provided
+        loss_cos = (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
+        pred_norm = pred.norm(dim=-1)
+        target_norm = target.norm(dim=-1).detach()
+        scale = target_norm.mean().detach() + 1e-6
+        loss_norm = F.mse_loss(
+            pred_norm / scale,
+            target_norm / scale
+        )
+        return loss_cos + 0.05 * loss_norm
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +413,10 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
     # rae_code mode: use raw spatial cosine loss, skip unit normalization
     # -----------------------------------------------------------------------
     if target_space == "rae_code":
-        loss = float(_spatial_cosine_loss(pred_t, target_t, code_shape=code_shape).item())
+        if loss_name == "spatial_cosine_norm":
+            loss = float(_spatial_cosine_norm_loss(pred_t, target_t, code_shape=code_shape).item())
+        else:
+            loss = float(_spatial_cosine_loss(pred_t, target_t, code_shape=code_shape).item())
         metrics = {"loss": loss, "n": int(pred_t.shape[0])}
 
         # Code distribution diagnostics
@@ -389,6 +432,9 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
         metrics["target_code_mean"] = tgt_mean
         metrics["target_code_std"] = tgt_std
         metrics["target_code_norm"] = tgt_norm
+        
+        # Calculate ratio pred_code_std / target_code_std
+        metrics["pred_code_std_ratio"] = pred_std / (tgt_std + 1e-6)
 
         # Per-position cosine and per-channel collapse%
         if code_shape is not None and len(code_shape) == 3:
@@ -397,6 +443,24 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
             tgt_s = target_t.reshape(-1, c, h, w)
             pos_cos = F.cosine_similarity(pred_s, tgt_s, dim=1).mean().item()  # mean over [B,H,W]
             metrics["val_spatial_cosine"] = float(pos_cos)
+            
+            # Site-wise norm diagnostics
+            pred_site_norms = pred_s.norm(dim=1)  # [B, H, W]
+            tgt_site_norms = tgt_s.norm(dim=1)    # [B, H, W]
+            
+            pred_site_norm_mean = float(pred_site_norms.mean().item())
+            tgt_site_norm_mean = float(tgt_site_norms.mean().item())
+            pred_site_norm_std = float(pred_site_norms.std().item())
+            tgt_site_norm_std = float(tgt_site_norms.std().item())
+            
+            metrics["pred_site_norm_mean"] = pred_site_norm_mean
+            metrics["target_site_norm_mean"] = tgt_site_norm_mean
+            metrics["pred_site_norm_mean_ratio"] = pred_site_norm_mean / (tgt_site_norm_mean + 1e-6)
+            
+            metrics["pred_site_norm_std"] = pred_site_norm_std
+            metrics["target_site_norm_std"] = tgt_site_norm_std
+            metrics["pred_site_norm_std_ratio"] = pred_site_norm_std / (tgt_site_norm_std + 1e-6)
+
             # Per-channel collapse: channels where pred std < 0.2 * target std
             eps = 1e-6
             pred_ch_std = pred_s.std(dim=[0, 2, 3])  # [C]
@@ -408,6 +472,14 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
             metrics["val_spatial_cosine"] = float(
                 F.cosine_similarity(pred_t, target_t, dim=-1).mean().item()
             )
+            # Dummies for missing dimensions
+            metrics["pred_site_norm_mean"] = 0.0
+            metrics["target_site_norm_mean"] = 0.0
+            metrics["pred_site_norm_mean_ratio"] = 0.0
+            metrics["pred_site_norm_std"] = 0.0
+            metrics["target_site_norm_std"] = 0.0
+            metrics["pred_site_norm_std_ratio"] = 0.0
+            metrics["pred_collapsed_channels_pct"] = 0.0
 
         # Collapse score: use spatial cosine as proxy (higher = better)
         metrics["collapse_score"] = max(0.0, float(metrics["val_spatial_cosine"]))
@@ -704,6 +776,7 @@ def main() -> None:
             embedding_dim=dataset.embedding_dim,
             ch_names=getattr(dataset, "ch_names", None),
             num_subjects=len(getattr(dataset, "unique_subjects", ["unknown"])),
+            normalize_output=(args.target_space != "rae_code"),
             **overrides,
         ).to(device)
         hidden_dim = model.hidden_dim
@@ -743,6 +816,7 @@ def main() -> None:
             no_film=args.no_film,
             no_subject_heads=args.no_subject_heads,
             head_reg_weight=args.head_reg_weight,
+            normalize_output=(args.target_space != "rae_code"),
         ).to(device)
         model.n_channels = n_channels
         print(f"[Model] model: {args.model} dual_head={args.dual_head} hidden_dim={hidden_dim} n_layers={n_layers} n_heads={n_heads} dropout={dropout} "
@@ -759,6 +833,7 @@ def main() -> None:
             hidden_dim=hidden_dim,
             dropout=dropout,
             stem_dropout1d=args.stem_dropout1d,
+            normalize_output=(args.target_space != "rae_code"),
         ).to(device)
         model.n_channels = n_channels
         print(f"[Model] model: cnn hidden_dim={hidden_dim} dropout={dropout}")
@@ -965,6 +1040,16 @@ def main() -> None:
                   "top1", "top5", "top10", "mrr", "median_rank", "mean_diag_cosine", "collapse_score",
                   "full_bank_top1", "full_bank_top5", "full_bank_top10", "full_bank_mrr"]
 
+    if args.target_space == "rae_code":
+        log_fields.extend([
+            "pred_code_mean", "target_code_mean",
+            "pred_code_std", "target_code_std", "pred_code_std_ratio",
+            "pred_code_norm", "target_code_norm",
+            "pred_site_norm_mean", "target_site_norm_mean", "pred_site_norm_mean_ratio",
+            "pred_site_norm_std", "target_site_norm_std", "pred_site_norm_std_ratio",
+            "val_spatial_cosine", "pred_collapsed_channels_pct"
+        ])
+
     if active_tasks:
         for task in active_tasks:
             log_fields.append(f"probe_{task}_acc")
@@ -1048,10 +1133,13 @@ def main() -> None:
                     pred_for_loss = torch.nn.functional.normalize(pred, dim=-1)
                     target_for_loss = torch.nn.functional.normalize(batch_data["target"], dim=-1)
 
-                if args.loss == "spatial_cosine":
+                if args.loss in ("spatial_cosine", "spatial_cosine_norm"):
                     # For rae_code: use raw unnormalized predictions vs raw targets
                     code_shape = getattr(dataset, '_rae_code_shape', None)
-                    loss = _spatial_cosine_loss(pred, batch_data["target"], code_shape=code_shape)
+                    if args.loss == "spatial_cosine":
+                        loss = _spatial_cosine_loss(pred, batch_data["target"], code_shape=code_shape)
+                    else:
+                        loss = _spatial_cosine_norm_loss(pred, batch_data["target"], code_shape=code_shape)
                     # Probe input: mean-pool spatial → [B, C] → normalize (scale-invariant representation)
                     if probe_model is not None and code_shape is not None:
                         _c, _h, _w = code_shape
@@ -1070,9 +1158,9 @@ def main() -> None:
                     and epoch >= args.probe_start_epoch):
                 import torch.nn.functional as F
                 from mindseye.models.common_probe import IGNORE_INDEX
-                # For rae_code (spatial_cosine loss), pred_for_probe is already mean-pooled+normalized.
+                # For rae_code (spatial_cosine/spatial_cosine_norm loss), pred_for_probe is already mean-pooled+normalized.
                 # For other target spaces, pred_for_loss is the normalized representation.
-                probe_input = pred_for_probe if (args.loss == "spatial_cosine" and probe_model is not None) else pred_for_loss
+                probe_input = pred_for_probe if (args.loss in ("spatial_cosine", "spatial_cosine_norm") and probe_model is not None) else pred_for_loss
                 logits_dict = probe_model(probe_input)
 
                 task_losses = []
@@ -1132,7 +1220,7 @@ def main() -> None:
             "collapse_score": val["collapse_score"]
         }
         for k, v in val.items():
-            if k.startswith("probe_"):
+            if k.startswith("probe_") or k in log_fields:
                 row[k] = v
                 
         if calib_val is not None:
