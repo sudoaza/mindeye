@@ -15,7 +15,7 @@ from mindseye.models.common_probe import CommonProbeModel, ATTRIBUTE_SCHEMAS, IG
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
 WindowMode = Literal["crop", "full5s", "full5s_backaligned"]
-TargetSpace = Literal["image", "semantic", "common", "label", "decode_raw", "decode_unit", "decode_norm", "rae_unit", "rae_centered_unit", "rae_whitened_unit"]
+TargetSpace = Literal["image", "semantic", "common", "label", "decode_raw", "decode_unit", "decode_norm", "rae_unit", "rae_centered_unit", "rae_whitened_unit", "rae_code"]
 
 
 @dataclass(frozen=True)
@@ -119,9 +119,9 @@ class ZunaClipPairDataset(Dataset):
         # Use first valid epochs_dir as default for backwards compatibility
         self.epochs_dir = valid_ep_dirs[0] if valid_ep_dirs else Path(".")
 
-        if config.target_space not in ("common", "decode_unit", "rae_unit", "rae_centered_unit", "rae_whitened_unit"):
+        if config.target_space not in ("common", "decode_unit", "rae_unit", "rae_centered_unit", "rae_whitened_unit", "rae_code"):
             import warnings
-            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common', 'decode_unit', 'rae_unit', 'rae_centered_unit', and 'rae_whitened_unit' are canonical.")
+            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common', 'decode_unit', 'rae_unit', 'rae_centered_unit', 'rae_whitened_unit', and 'rae_code' are canonical.")
 
         table = torch.load(self.common_embeddings_pt, map_location="cpu")
         
@@ -148,6 +148,15 @@ class ZunaClipPairDataset(Dataset):
             self.image_id_to_decode_raw = table.get("image_id_to_decode_raw", None)
             self.image_id_to_decode_norm = table.get("image_id_to_decode_norm", None)
         
+        # For rae_code, targets are spatial tensors [C, H, W]; flatten to 1D so embedding_dim = C*H*W.
+        self._rae_code_mode = (config.target_space == "rae_code")
+        if self._rae_code_mode:
+            first_key = next(iter(self.image_id_to_target.keys()))
+            sample = self.image_id_to_target[first_key]
+            self._rae_code_shape = tuple(sample.shape)  # e.g. (768, 3, 3)
+        else:
+            self._rae_code_shape = None
+        
         if "class" in self.metadata.columns:
             unique_classes = sorted(self.metadata["class"].dropna().unique().tolist())
             self.class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
@@ -158,7 +167,13 @@ class ZunaClipPairDataset(Dataset):
         
         # Pick the embedding dimension from the first item
         first_key = next(iter(self.image_id_to_target.keys()))
-        self.embedding_dim = self.image_id_to_target[first_key].shape[-1]
+        sample_target = self.image_id_to_target[first_key]
+        if self._rae_code_mode:
+            # Flatten spatial code to 1D: embedding_dim = C * H * W
+            import math as _math
+            self.embedding_dim = _math.prod(sample_target.shape)
+        else:
+            self.embedding_dim = sample_target.shape[-1]
         
         initial_n = len(self.metadata)
         self.metadata["image_id_str"] = self.metadata["image_id"].astype(str)
@@ -404,8 +419,13 @@ class ZunaClipPairDataset(Dataset):
         
         row = self.metadata.iloc[idx]
         img_id = str(row["image_id"])
-        
-        return F.normalize(self.image_id_to_target[img_id].float(), dim=-1)
+        raw = self.image_id_to_target[img_id].float()
+
+        if self._rae_code_mode:
+            # Return raw unnormalized flattened code — expander expects original distribution.
+            return raw.reshape(-1)
+
+        return F.normalize(raw, dim=-1)
 
     def _get_targets_raw(self, idx: int) -> torch.Tensor | None:
         if self.image_id_to_decode_raw is None:

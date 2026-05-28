@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     # --target-space is kept as a hidden ablation flag; canonical path always uses 'common'.
     p.add_argument(
         "--target-space",
-        choices=("common", "semantic", "image", "label", "decode_unit", "decode_raw", "decode_norm", "rae_unit", "rae_centered_unit", "rae_whitened_unit"),
+        choices=("common", "semantic", "image", "label", "decode_unit", "decode_raw", "decode_norm", "rae_unit", "rae_centered_unit", "rae_whitened_unit", "rae_code"),
         default="common",
         help=argparse.SUPPRESS,
     )
@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--loss", choices=("contrastive", "cosine_mse"), default="contrastive")
+    p.add_argument("--loss", choices=("contrastive", "cosine_mse", "spatial_cosine"), default="contrastive")
     p.add_argument("--dual-head", action="store_true",
                    help="Use dual-head architecture to predict unit embedding and raw embedding norm separately")
     p.add_argument("--use-fixed-mean-norm", action="store_true",
@@ -244,12 +244,37 @@ def _batch_to_device(
 
 
 
-def _loss_fn(pred, target, *, loss_name: str, temperature: float):
+def _loss_fn(pred, target, *, loss_name: str, temperature: float, code_shape: tuple | None = None):
     if loss_name == "contrastive":
         from mindseye.models.eeg_encoder import clip_contrastive_loss
         return clip_contrastive_loss(pred, target, temperature=temperature)
+    if loss_name == "spatial_cosine":
+        return _spatial_cosine_loss(pred, target, code_shape=code_shape)
     from mindseye.models.eeg_encoder import cosine_mse_loss
     return cosine_mse_loss(pred, target)
+
+
+def _spatial_cosine_loss(pred: "torch.Tensor", target: "torch.Tensor", code_shape: tuple | None = None) -> "torch.Tensor":
+    """Spatial cosine loss for rae_code targets.
+
+    If code_shape (C, H, W) is provided, reshapes pred/target to [B, C, H, W] and computes
+    channel-vector cosine at each spatial position, then adds a small MSE term.
+    Falls back to plain cosine+MSE on flat vectors when code_shape is None.
+    """
+    import torch.nn.functional as F
+    if code_shape is not None and len(code_shape) == 3:
+        c, h, w = code_shape
+        pred_s = pred.reshape(-1, c, h, w)
+        tgt_s = target.reshape(-1, c, h, w)
+        cos = F.cosine_similarity(pred_s, tgt_s, dim=1)  # [B, H, W]
+        cos_loss = (1.0 - cos).mean()
+        mse_loss = F.mse_loss(pred, target)
+        return cos_loss + 0.25 * mse_loss
+    # Fallback: flat cosine + MSE
+    import torch
+    cos_loss = (1.0 - F.cosine_similarity(pred, target, dim=-1)).mean()
+    mse_loss = F.mse_loss(pred, target)
+    return cos_loss + 0.25 * mse_loss
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +328,7 @@ def _save_env(run_dir: Path, args: argparse.Namespace, setup: dict) -> None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str = "common", probe_model=None, active_tasks=None, target_center=None, full_bank: "torch.Tensor | None" = None) -> dict[str, float]:
+def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str = "common", probe_model=None, active_tasks=None, target_center=None, full_bank: "torch.Tensor | None" = None, code_shape: tuple | None = None) -> dict[str, float]:
     from mindseye.models.eeg_encoder import retrieval_topk
     import torch
     import torch.nn.functional as F
@@ -338,7 +363,80 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
 
     pred_t = torch.cat(preds)
     target_t = torch.cat(targets)
-    
+
+    # -----------------------------------------------------------------------
+    # rae_code mode: use raw spatial cosine loss, skip unit normalization
+    # -----------------------------------------------------------------------
+    if target_space == "rae_code":
+        loss = float(_spatial_cosine_loss(pred_t, target_t, code_shape=code_shape).item())
+        metrics = {"loss": loss, "n": int(pred_t.shape[0])}
+
+        # Code distribution diagnostics
+        pred_mean = float(pred_t.mean().item())
+        pred_std = float(pred_t.std().item())
+        pred_norm = float(pred_t.norm(dim=-1).mean().item())
+        tgt_mean = float(target_t.mean().item())
+        tgt_std = float(target_t.std().item())
+        tgt_norm = float(target_t.norm(dim=-1).mean().item())
+        metrics["pred_code_mean"] = pred_mean
+        metrics["pred_code_std"] = pred_std
+        metrics["pred_code_norm"] = pred_norm
+        metrics["target_code_mean"] = tgt_mean
+        metrics["target_code_std"] = tgt_std
+        metrics["target_code_norm"] = tgt_norm
+
+        # Per-position cosine and per-channel collapse%
+        if code_shape is not None and len(code_shape) == 3:
+            c, h, w = code_shape
+            pred_s = pred_t.reshape(-1, c, h, w)
+            tgt_s = target_t.reshape(-1, c, h, w)
+            pos_cos = F.cosine_similarity(pred_s, tgt_s, dim=1).mean().item()  # mean over [B,H,W]
+            metrics["val_spatial_cosine"] = float(pos_cos)
+            # Per-channel collapse: channels where pred std < 0.2 * target std
+            eps = 1e-6
+            pred_ch_std = pred_s.std(dim=[0, 2, 3])  # [C]
+            tgt_ch_std = tgt_s.std(dim=[0, 2, 3])    # [C]
+            ratio = pred_ch_std / (tgt_ch_std + eps)
+            collapsed_pct = float((ratio < 0.2).float().mean().item()) * 100.0
+            metrics["pred_collapsed_channels_pct"] = collapsed_pct
+        else:
+            metrics["val_spatial_cosine"] = float(
+                F.cosine_similarity(pred_t, target_t, dim=-1).mean().item()
+            )
+
+        # Collapse score: use spatial cosine as proxy (higher = better)
+        metrics["collapse_score"] = max(0.0, float(metrics["val_spatial_cosine"]))
+        # Full-bank retrieval (secondary — raw code space)
+        if full_bank is not None:
+            full_bank_n = full_bank.shape[0]
+            # Normalize for retrieval
+            pred_norm_fb = F.normalize(pred_t.cpu(), dim=-1)
+            tgt_norm_fb = F.normalize(target_t.cpu(), dim=-1)
+            fb_norm = F.normalize(full_bank.cpu(), dim=-1)
+            fb_logits = pred_norm_fb @ fb_norm.T
+            tgt_fb_logits = tgt_norm_fb @ fb_norm.T
+            correct_idx = tgt_fb_logits.argmax(dim=-1)
+            fb_sorted = fb_logits.argsort(dim=-1, descending=True)
+            fb_rank = (fb_sorted == correct_idx[:, None]).nonzero(as_tuple=False)[:, 1].float()
+            for k in (1, 5, 10):
+                metrics[f"full_bank_top{k}"] = (fb_rank < k).float().mean().item()
+                metrics[f"full_bank_random_top{k}_expected"] = min(k, full_bank_n) / full_bank_n
+            metrics["full_bank_mrr"] = (1.0 / (fb_rank + 1.0)).mean().item()
+            metrics["full_bank_n"] = full_bank_n
+        # Set dummy retrieval fields so downstream code that reads them does not KeyError
+        metrics.setdefault("top1", 0.0)
+        metrics.setdefault("top5", 0.0)
+        metrics.setdefault("top10", 0.0)
+        metrics.setdefault("mrr", float(metrics["val_spatial_cosine"]))
+        metrics.setdefault("median_rank", 0.0)
+        metrics.setdefault("mean_diag_cosine", float(metrics["val_spatial_cosine"]))
+        for k in (1, 5, 10):
+            metrics.setdefault(f"random_top{k}_expected", 0.0)
+        return metrics
+
+    # -----------------------------------------------------------------------
+    # Standard unit-vector mode
+    # -----------------------------------------------------------------------
     if target_center is not None:
         tc = target_center.cpu()
         pred_t_eval = torch.nn.functional.normalize(pred_t - tc, dim=-1)
@@ -437,9 +535,10 @@ def main() -> None:
         if candidate.exists():
             args.vlm_attributes = str(candidate)
             print(f"[Dataset] Auto-detected vlm_attributes at {args.vlm_attributes}")
-            
-    if args.target_space not in ("common", "decode_unit", "rae_unit", "rae_centered_unit", "rae_whitened_unit"):
+
+    if args.target_space not in ("common", "decode_unit", "rae_unit", "rae_centered_unit", "rae_whitened_unit", "rae_code"):
         print("[WARN] Non-canonical target_space used for ablation only.")
+
 
     dataset_config = SemanticPairConfig(
             metadata_csv=args.metadata,
@@ -906,15 +1005,21 @@ def main() -> None:
             else:
                 pred = model(batch_data["eeg"], **kwargs)
                 
-                # Primary contrastive loss
+                # Primary contrastive / regression loss
                 if target_center is not None:
                     pred_for_loss = torch.nn.functional.normalize(pred - target_center, dim=-1)
                     target_for_loss = torch.nn.functional.normalize(batch_data["target"] - target_center, dim=-1)
                 else:
                     pred_for_loss = torch.nn.functional.normalize(pred, dim=-1)
                     target_for_loss = torch.nn.functional.normalize(batch_data["target"], dim=-1)
-                    
-                loss = _loss_fn(pred_for_loss, target_for_loss, loss_name=args.loss, temperature=args.temperature)
+
+                if args.loss == "spatial_cosine":
+                    # For rae_code: use raw unnormalized predictions vs raw targets
+                    code_shape = getattr(dataset, '_rae_code_shape', None)
+                    loss = _spatial_cosine_loss(pred, batch_data["target"], code_shape=code_shape)
+                    pred_for_loss = pred  # no normalization; probe won't be used in this mode
+                else:
+                    loss = _loss_fn(pred_for_loss, target_for_loss, loss_name=args.loss, temperature=args.temperature)
             
             # Auxiliary probe loss — activate only after probe_start_epoch
             if (probe_model is not None
@@ -954,14 +1059,15 @@ def main() -> None:
         val = evaluate(model, val_loader, device, loss_name=args.loss,
                        temperature=args.temperature, target_space=args.target_space,
                        probe_model=probe_model, active_tasks=active_tasks,
-                       target_center=target_center, full_bank=full_bank_tensor)
+                       target_center=target_center, full_bank=full_bank_tensor,
+                       code_shape=getattr(dataset, '_rae_code_shape', None))
         
-        calib_val = None
         if calib_val_loader is not None:
             calib_val = evaluate(model, calib_val_loader, device, loss_name=args.loss,
                                  temperature=args.temperature, target_space=args.target_space,
                                  probe_model=probe_model, active_tasks=active_tasks,
-                                 target_center=target_center)
+                                 target_center=target_center,
+                                 code_shape=getattr(dataset, '_rae_code_shape', None))
                                  
         score = float(val["mrr"] + 0.25 * val["top10"])
         if val["collapse_score"] < 0.1:
@@ -1038,7 +1144,8 @@ def main() -> None:
     final_metrics = evaluate(model, val_loader, device, loss_name=args.loss,
                              temperature=args.temperature, target_space=args.target_space,
                              probe_model=probe_model, active_tasks=active_tasks,
-                             target_center=target_center_eval, full_bank=full_bank_tensor)
+                             target_center=target_center_eval, full_bank=full_bank_tensor,
+                             code_shape=getattr(dataset, '_rae_code_shape', None))
                              
     if calib_val_loader is not None:
         final_calib_metrics = evaluate(model, calib_val_loader, device, loss_name=args.loss,
