@@ -243,7 +243,101 @@ Metrics:
 - [x] **Key finding**: within-val Top-10 inflates signal 2–4×. Full-bank is the honest metric. A_real_repro (no probe) is BELOW random on full-bank despite good within-val numbers.
 - [x] **Canonical model promoted**: 12B_probe_001 (probe_weight=0.01, probe_start_epoch=5).
 
-### Phase 14: Multi-subject + Generation Grid (Next)
-- [ ] Add sub-02, sub-03, sub-04 with 12B_probe_001 config.
-- [ ] Generation grid: oracle / kNN-real / kNN-shuffled / kNN-random (k=5, T=0.05).
-- [ ] Full-bank metric as primary gate for all future runs.
+### Phase 14: Multi-subject CLIP Generation Grid ✅
+- [x] Scale to sub-01 → sub-04 with 12B_probe_001 config (decode_unit + probe).
+- [x] Generation grid: oracle / EEG-kNN / shuffled / random rows, k=5, T=0.05.
+- [x] Full-bank metric primary gate for all future runs.
+- [x] Result: Grid shows meaningful retrieval above shuffled/random controls.
+
+### Phase 15: Multi-Subject Scaling + Subject Adapters ✅
+- [x] 4-subject training (sub-01→04 × 40 runs) with per-subject FiLM adapters.
+- [x] Validated subject audit (all 4 subjects load, per-subject sample counts logged).
+- [x] Ablation: probe-on vs probe-off; probe is beneficial or neutral on full-bank.
+
+### Phase 16: Subject Adapter Ablation ✅
+- [x] Ran subject adapter ablation matrix across multiple weight configurations.
+- [x] Confirmed `temporal_attn_small` with subject FiLM adapters is the canonical encoder.
+
+### Phase 17: RAE Exploration — Replace CLIP Generation Backbone ✅
+
+Motivation: CLIP's 1024-dim global vector is a weak target for image reconstruction. RAE
+(`AutoencoderRAE` w/ DINOv2-base encoder) outputs high-dimensional spatial latents `[768, 16, 16]`
+that the decoder can use to reconstruct images with rich detail.
+
+**Split A: Image RAE tokens → code → reconstruct (frozen)**
+- [x] Phase 17.1: RAE oracle quality — direct `[768, 16, 16]` → decoder → image. Confirmed reconstruction fidelity.
+- [x] Phase 17.2: RAE centered unit (global 768-dim) as EEG target, kNN retrieval → RAE decode.
+- [x] Phase 17.3: RAE centered kNN grid vs CLIP kNN grid — RAE visually cleaner.
+- [x] Key finding: RAE decoder is powerful; the bottleneck is EEG→latent fidelity, not the decoder.
+
+### Phase 18A: RAE Token Bottleneck Training ✅
+
+Goal: learn a compact `code = compress(tokens)` / `tokens ≈ expand(code)` autoencoder so EEG
+only needs to predict the lower-dim code.
+
+- [x] Implemented `_SpatialPoolBottleneck` (AdaptiveAvgPool2d + learned 1×1 refine conv) and conv variants.
+- [x] Trained all spatial grid sizes: 2×2, 3×2, 3×3, 4×3, 4×4 and conv variants.
+- [x] Key results (oracle token cosine / collapse rate):
+  - `spatial_768x4x4`: **0.833**, 0% collapse — **best healthy bottleneck** ✅
+  - `spatial_768x3x3`: 0.802, 0% collapse
+  - `spatial_768x3x2`: 0.766, 0% collapse (below gate)
+  - All conv variants: collapse to >90% (eliminated)
+- [x] Gate: use spatial only; 4×4 (0.833) and 3×3 (0.802) pass.
+
+### Phase 18B: EEG → spatial_768x3x3 Code ✅
+
+**Split B: EEG → compressed RAE code**
+
+- [x] Extracted `rae_bottleneck_codes_3x3.pt` (6912-dim codes) for all 15,865 images.
+- [x] Trained `TemporalAttnEncoder` with `spatial_cosine` loss (no raw MSE, no centering).
+  - Best epoch 87; spatial_cosine = **0.608** in val; 0% channel collapse.
+  - Scale ratio: pred_std = **4.8× target_std** (scale inflation).
+  - Expanded token cosine (EEG vs oracle): **0.293** vs shuffled **0.290** (gap +0.003).
+- [x] **Scale sensitivity test** (inference-time rescale A/B/C + oracle scale factors 0.25→5.0):
+  - All rescale variants give identical expanded_token_cosine (0.293).
+  - Oracle scale factors 0.25–5.0 all give expanded_token_cosine ≈ **0.695** (flat).
+  - **Conclusion: expander is scale-invariant** (1×1 refine conv = channel mixing, not magnitude-sensitive).
+  - Root cause of 0.003 gap: EEG code has correct bulk direction (cosine 0.608) but insufficient per-channel/per-site fidelity for the 3×3 bottleneck → expand path.
+  - Increasing bottleneck oracle ceiling is the lever (4×4 > 3×3).
+
+### Phase 18C: EEG → spatial_768x4x4 Code + Probe ← **CURRENT**
+
+Rationale: 4×4 oracle cosine = 0.833 vs 3×3 = 0.802. More spatial information per code
+gives EEG encoder a higher ceiling. Probe gives semantic anchor to prevent directional drift.
+
+- [x] Extracted `rae_bottleneck_codes_4x4.pt` (12,288-dim codes) for 15,891 images.
+- [x] Trained RAE-code probe on `mean_pool([768,4,4]) → [768] → normalize` (11 active tasks beat baseline;
+  class_label 60.1%, animal_visible 98.2%, human_visible 94.2%, dominant_color 53.9%).
+- [ ] Train EEG: `spatial_cosine` + `probe_weight=0.01`, `probe_start_epoch=5`, 100 epochs / patience 20.
+- [ ] Evaluate: expanded_token_cosine EEG vs shuffled gap (target: clearly above +0.003).
+- [ ] Visual grid: 6 rows (target / oracle / bn_oracle_4x4 / EEG / shuffled / random).
+
+**Key question**: Does 4×4 + probe produce `expanded_token_cosine_eeg - shuffled > 0.01`?
+
+---
+
+## 🗺️ Future Work
+
+### Phase 18D (if 18C shows gap > 0.01): Full Pipeline Evaluation
+- [ ] Generate images for 50+ held-out stimuli; compute semantic similarity vs ground truth.
+- [ ] If gap ≥ 0.02: proceed to Phase 19 (EEG-conditioned image synthesis end-to-end).
+- [ ] If gap < 0.01: try 5×5 bottleneck or direct `[768, 16, 16]` token regression.
+
+### VLM Attribute Backfill (Low Priority, Not Blocking 18C)
+- [ ] 11 Phase 11A attributes (`warm_vs_cool`, `bright_vs_dark`, `round_or_curved`,
+  `angular_or_geometric`, `symmetrical`, `single_object`, `glossy`, `rough`, `smooth`,
+  `transparent`, `organic_texture`) exist in `ATTRIBUTE_SCHEMAS` but were **never annotated** in
+  `vlm_attributes_runs01_40.json` — they were schema additions after the annotation run.
+- [ ] Re-run VLM annotation over all 15,891 image IDs with the extended attribute prompt.
+- [ ] Merge with existing annotations; re-train probe to use all 29 tasks.
+
+### Phase 7 (Deferred): BReAD-style Retrieval Branch
+- [ ] Add `src/mindseye/embeddings/faiss_index.py`, `scripts/build_retrieval_index.py`.
+- [ ] Implement after EEG→RAE code achieves meaningful expanded_token_cosine gap.
+
+### Phase 8 (Deferred): Frozen Diffusion img2img
+- [ ] Not before EEG→RAE code shows visual separability from shuffled in generation grid.
+- [ ] Pipeline: EEG code → expand → RAE decode → SDXL-Turbo img2img refinement.
+
+### Phase 9 (Deferred): Alljoined / ENIGMA Comparison
+- [ ] Domain adaptation / consumer-grade robustness after core pipeline matures.
