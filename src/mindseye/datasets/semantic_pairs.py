@@ -15,7 +15,7 @@ from mindseye.models.common_probe import CommonProbeModel, ATTRIBUTE_SCHEMAS, IG
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
 WindowMode = Literal["crop", "full5s", "full5s_backaligned"]
-TargetSpace = Literal["image", "semantic", "common", "label", "decode_raw", "decode_unit", "decode_norm", "rae_unit"]
+TargetSpace = Literal["image", "semantic", "common", "label", "decode_raw", "decode_unit", "decode_norm", "rae_unit", "rae_centered_unit", "rae_whitened_unit"]
 
 
 @dataclass(frozen=True)
@@ -119,9 +119,9 @@ class ZunaClipPairDataset(Dataset):
         # Use first valid epochs_dir as default for backwards compatibility
         self.epochs_dir = valid_ep_dirs[0] if valid_ep_dirs else Path(".")
 
-        if config.target_space not in ("common", "decode_unit", "rae_unit"):
+        if config.target_space not in ("common", "decode_unit", "rae_unit", "rae_centered_unit", "rae_whitened_unit"):
             import warnings
-            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common', 'decode_unit', and 'rae_unit' are canonical.")
+            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common', 'decode_unit', 'rae_unit', 'rae_centered_unit', and 'rae_whitened_unit' are canonical.")
 
         table = torch.load(self.common_embeddings_pt, map_location="cpu")
         
@@ -140,7 +140,7 @@ class ZunaClipPairDataset(Dataset):
             
         self.image_id_to_target = table[target_key]
         
-        if config.target_space == "rae_unit" or target_key == "image_id_to_rae_unit":
+        if "rae" in (config.target_space or "") or "rae" in (target_key or ""):
             # For RAE, do not load tokens/norms as target_raw/norm to avoid activating raw MSE regression
             self.image_id_to_decode_raw = None
             self.image_id_to_decode_norm = None

@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     # --target-space is kept as a hidden ablation flag; canonical path always uses 'common'.
     p.add_argument(
         "--target-space",
-        choices=("common", "semantic", "image", "label", "decode_unit", "decode_raw", "decode_norm", "rae_unit"),
+        choices=("common", "semantic", "image", "label", "decode_unit", "decode_raw", "decode_norm", "rae_unit", "rae_centered_unit", "rae_whitened_unit"),
         default="common",
         help=argparse.SUPPRESS,
     )
@@ -270,8 +270,13 @@ def _make_run_dir(args: argparse.Namespace) -> Path:
 
 def _save_env(run_dir: Path, args: argparse.Namespace, setup: dict) -> None:
     """Write environment.txt, git_commit.txt, and config.json."""
+    config_dict = {**vars(args)}
+    config_dict["rae_transform"] = setup.get("rae_transform")
+    config_dict["target_centering"] = setup.get("target_centering")
+    if config_dict.get("target_key") == "image_id_to_rae_centered_unit":
+        config_dict["target_space"] = "rae_centered_unit"
     (run_dir / "config.json").write_text(
-        json.dumps({**vars(args), **{"setup": setup}}, indent=2, default=str)
+        json.dumps({**config_dict, **{"setup": setup}}, indent=2, default=str)
     )
     env_lines = [
         f"Hostname: {os.uname().nodename}",
@@ -433,7 +438,7 @@ def main() -> None:
             args.vlm_attributes = str(candidate)
             print(f"[Dataset] Auto-detected vlm_attributes at {args.vlm_attributes}")
             
-    if args.target_space not in ("common", "decode_unit", "rae_unit"):
+    if args.target_space not in ("common", "decode_unit", "rae_unit", "rae_centered_unit", "rae_whitened_unit"):
         print("[WARN] Non-canonical target_space used for ablation only.")
 
     dataset_config = SemanticPairConfig(
@@ -659,6 +664,9 @@ def main() -> None:
             p.requires_grad = False
         active_tasks = list(active_task_specs.keys())
         print(f"[Model] Loaded frozen CommonProbeModel with {len(active_tasks)} active tasks from {args.common_probe}")
+    loaded_keys_count = 0
+    skipped_keys_count = 0
+    skipped_keys_first50 = []
 
     # Warm-start from an existing checkpoint if requested (soft load: adapter keys may be absent)
     if getattr(args, "init_from", None):
@@ -679,6 +687,14 @@ def main() -> None:
                     filtered_state[k] = v
             print(f"[InitFrom] Skipping projection head keys as requested: {skipped}")
             init_state = filtered_state
+            skipped_keys_count = len(skipped)
+            skipped_keys_first50 = skipped[:50]
+        
+        # We want to count how many keys are actually in model and loaded
+        model_keys = set(model.state_dict().keys())
+        init_keys = set(init_state.keys())
+        loaded_keys = model_keys.intersection(init_keys)
+        loaded_keys_count = len(loaded_keys)
 
         missing, unexpected = model.load_state_dict(init_state, strict=False)
         print(f"[InitFrom] Loaded weights from {init_ckpt_path}")
@@ -704,6 +720,11 @@ def main() -> None:
 
     # Subject audit
     subjects_loaded = list(getattr(dataset, "unique_subjects", []))
+    # Standardize loaded subjects to sub-0X form for clean logging and substring checking
+    subjects_loaded = [
+        f"sub-{int(s.split('-')[1]):02d}" if '-' in s and s.split('-')[1].isdigit() else s
+        for s in subjects_loaded
+    ]
     samples_per_subject = (
         dataset.metadata.groupby("subject").size().to_dict()
         if "subject" in dataset.metadata.columns else {}
@@ -712,7 +733,7 @@ def main() -> None:
     subjects_requested = [
         Path(p.strip()).parent.name for p in str(args.metadata).split(",")
     ] if "," in str(args.metadata) else []
-    subjects_skipped = [s for s in subjects_requested if not any(s in sl for sl in subjects_loaded)]
+    subjects_skipped = [s for s in subjects_requested if not any(sl.replace('-', '') in s for sl in subjects_loaded)]
 
     mean_train_norm = 1.0
     if args.dual_head and hasattr(dataset, "image_id_to_decode_norm") and dataset.image_id_to_decode_norm is not None:
@@ -744,6 +765,9 @@ def main() -> None:
         "target_mode": args.target_mode,
         "window_mode": args.window_mode,
         "target_space": args.target_space,
+        "target_key": getattr(args, "target_key", None),
+        "rae_transform": ("centered_unit" if "centered" in (getattr(args, "target_key", "") or "") else ("whitened_unit" if "whitened" in (getattr(args, "target_key", "") or "") else ("raw_unit" if "rae" in (args.target_space or "") else None))),
+        "target_centering": "disabled" if getattr(args, "no_target_centering", False) else "enabled",
         "dual_head": args.dual_head,
         "use_fixed_mean_norm": args.use_fixed_mean_norm,
         "mean_train_norm": mean_train_norm,
@@ -777,6 +801,10 @@ def main() -> None:
         "no_subject_heads": getattr(args, "no_subject_heads", False),
         "head_reg_weight": getattr(args, "head_reg_weight", 0.0),
         "init_from": getattr(args, "init_from", None),
+        "init_skip_heads": getattr(args, "init_skip_heads", False),
+        "loaded_keys_count": loaded_keys_count,
+        "skipped_keys_count": skipped_keys_count,
+        "skipped_keys_first50": skipped_keys_first50,
     }
     print(json.dumps({"setup": setup}, indent=2))
 

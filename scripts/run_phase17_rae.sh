@@ -9,19 +9,18 @@ EPOCHS_DIR="data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40,data/pro
 
 COMMON_EMB="data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt"
 
-SLUG="phase17_rae_centered"
+SLUG="phase17_6_rae_centered_16c_init_augmented"
 
-# Architecture: 16c_film_heads (temporal_attn_small, dual-head false, film true)
+# Architecture: 16c_film_heads with Phase 16 initialization and augment_eeg active
 python3 scripts/train_eeg_clip.py \
     --metadata "$METADATA" \
     --epochs-dir "$EPOCHS_DIR" \
     --common-embeddings "$COMMON_EMB" \
-    --target-space rae_unit \
+    --target-space rae_centered_unit \
     --target-key image_id_to_rae_centered_unit \
     --window-mode tight1s \
-    --add-event-marker \
+    --augment-eeg \
     --model temporal_attn_small \
-    --hidden-dim 256 \
     --epochs 50 \
     --patience 15 \
     --batch-size 128 \
@@ -34,7 +33,10 @@ python3 scripts/train_eeg_clip.py \
     --probe-weight 0.01 \
     --probe-start-epoch 5 \
     --head-reg-weight 0.01 \
-    --no-target-centering
+    --init-from outputs/runs/20260527_083218_zuna_real_16c_film_heads/best.pt \
+    --init-skip-heads \
+    --lr 1e-4 \
+    --device cuda
 
 echo "Training complete. Extracting test metrics..."
 
@@ -52,6 +54,6 @@ python3 scripts/evaluate_rae_generation.py \
     --temperature 0.05 \
     --common-probe outputs/rae_probe/common_probe.pt \
     --stimuli-dir data/raw/nod/stimuli/ImageNet \
-    --output-dir outputs/${SLUG}_eval
+    --output-dir outputs/phase17_6_rae_eval
 
-echo "Phase 17 complete!"
+echo "Phase 17.6 complete!"

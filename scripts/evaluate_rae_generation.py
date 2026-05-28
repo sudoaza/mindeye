@@ -418,10 +418,13 @@ def main():
     # Sum of 1/i for i=1 to N
     mrr_chance = sum(1.0 / i for i in range(1, N_bank + 1)) / N_bank
     
+    fb_random_top10_expected = 10.0 / N_bank
+    fb_top10_enrichment = rae_fb_top10 / fb_random_top10_expected if fb_random_top10_expected > 0 else 0.0
+    
     print(f"Full-Bank Size (N): {N_bank}")
     print(f"Full-Bank Top-1:  {rae_fb_top1:.5f} (Chance: {1/N_bank:.5f})")
     print(f"Full-Bank Top-5:  {rae_fb_top5:.5f} (Chance: {5/N_bank:.5f})")
-    print(f"Full-Bank Top-10: {rae_fb_top10:.5f} (Chance: {10/N_bank:.5f})")
+    print(f"Full-Bank Top-10: {rae_fb_top10:.5f} (Chance: {fb_random_top10_expected:.5f}) | Enrichment: {fb_top10_enrichment:.2f}x")
     print(f"Full-Bank MRR:    {rae_fb_mrr:.5f} (Chance: {mrr_chance:.5f})")
     print(f"Full-Bank Median: {fb_median_rank:.1f} / {N_bank} ({(fb_median_rank/N_bank)*100:.2f}%)")
 
@@ -579,7 +582,8 @@ def main():
             "mrr": rae_fb_mrr,
             "median_rank": fb_median_rank,
             "n_bank": N_bank,
-            "top10_chance": 10 / N_bank
+            "top10_chance": fb_random_top10_expected,
+            "top10_enrichment": fb_top10_enrichment
         },
         "rae_native_generation_cosine": rae_results,
         "rae_native_paired_significance": rae_paired,

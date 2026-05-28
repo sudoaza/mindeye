@@ -124,6 +124,60 @@ python scripts/train_eeg_decode_common.py \
 # Step 3: Evaluate generations (Oracle, EEG kNN, Shuffled, Random)
 python scripts/evaluate_clip_native_decoder.py \
   --run-dir outputs/runs/<YOUR_RUN_DIR>
+
+### Phase 17 (DINOv2-RAE Target & Decoder Swap) — run on pod manually
+
+DINOv2-RAE is a 768-D target space. It uses a frozen DINOv2-RAE encoder and a trained decoder. The RAE-native pipeline uses target centering (Option B) to reduce conic crowd density.
+
+# Step 0: Pretrain the RAE-native CommonProbeModel (one-time)
+python scripts/train_rae_probe.py \
+  --target-key image_id_to_rae_centered_unit \
+  --common-embeddings data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
+  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
+  --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
+  --output-dir outputs/rae_probe \
+  --epochs 80 --lr 1e-4
+
+# Step 1: Train EEG -> rae_centered_unit (Option B target centering)
+# Initialized from the Phase 16 16c_film_heads checkpoint, skipping heads
+python scripts/train_eeg_clip.py \
+  --metadata "$METADATA" \
+  --epochs-dir "$EPOCHS_DIR" \
+  --common-embeddings data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
+  --target-space rae_centered_unit \
+  --target-key image_id_to_rae_centered_unit \
+  --window-mode tight1s \
+  --augment-eeg \
+  --model temporal_attn_small \
+  --epochs 50 \
+  --patience 15 \
+  --batch-size 128 \
+  --loss contrastive \
+  --temperature 0.07 \
+  --slug phase17_6_rae_centered_16c_init_augmented \
+  --output-dir outputs \
+  --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
+  --common-probe outputs/rae_probe/common_probe.pt \
+  --probe-weight 0.01 \
+  --probe-start-epoch 5 \
+  --head-reg-weight 0.01 \
+  --init-from outputs/runs/20260527_083218_zuna_real_16c_film_heads/best.pt \
+  --init-skip-heads \
+  --lr 1e-4 \
+  --device cuda
+
+# Step 2: Evaluate generations (Oracle, EEG kNN, Shuffled, Random)
+# Re-encodes generated images, centers, normalizes, and runs bootstrap + RAE probe
+python scripts/evaluate_rae_generation.py \
+  --run-dir outputs/<YOUR_RUN_DIR> \
+  --num-samples 500 \
+  --batch-size 25 \
+  --k 5 \
+  --target-key image_id_to_rae_centered_unit \
+  --temperature 0.05 \
+  --common-probe outputs/rae_probe/common_probe.pt \
+  --stimuli-dir data/raw/nod/stimuli/ImageNet \
+  --output-dir outputs/phase17_6_rae_eval
 ```
 
 On the pod, prefix with `export PYTHONPATH=src &&` when running scripts directly:
@@ -200,3 +254,8 @@ pkill -f 'python.*run_baseline_matrix' # Kill matrix run
 - **Target extraction compatibility**: Use `StableUnCLIPImg2ImgPipeline` instead of `StableUnCLIPPipeline` for image-to-image extraction.
 - **Unnormalized targets**: When building `z_decode_common`, use `extract_teacher_embeds(normalize=False)`. Unnormalized embeds retain essential structural information for image reconstruction; L2-normalized embeddings fall back to random-level chance.
 - **Relative evaluation gating**: Absolute cosine scores vary. Always evaluate relative performance against random embedding baselines: `Oracle Cosine > Random Cosine + 0.05`.
+
+### Phase 17 (DINOv2-RAE)
+- **Attribute Probe Mismatch**: Never feed RAE-space target vectors into `outputs/decode_probe_v2/common_probe.pt` (which was trained on Stable unCLIP decode_unit space). Use the RAE-native probe `outputs/rae_probe/common_probe.pt`.
+- **Target Centering in Evaluation**: Generated images must be encoded using the RAE backend, subtracted by the training set mean (`rae_center_mean`), and then L2-normalized. Raw unit comparison will hide retrieval performance.
+- **Option B Coordinate Alignment**: Make sure `pred_for_loss` is defined as `normalize(pred - target_center)` during training, and the auxiliary probe model gets `pred_for_loss` as input (instead of uncentered prediction).
