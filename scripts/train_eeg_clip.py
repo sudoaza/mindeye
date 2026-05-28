@@ -428,7 +428,7 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
                 metrics[f"full_bank_random_top{k}_expected"] = min(k, full_bank_n) / full_bank_n
             metrics["full_bank_mrr"] = (1.0 / (fb_rank + 1.0)).mean().item()
             metrics["full_bank_n"] = full_bank_n
-        # Set dummy retrieval fields so downstream code that reads them does not KeyError
+        # Set dummy retrieval fields so downstream CSV/logging does not KeyError
         metrics.setdefault("top1", 0.0)
         metrics.setdefault("top5", 0.0)
         metrics.setdefault("top10", 0.0)
@@ -437,6 +437,24 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
         metrics.setdefault("mean_diag_cosine", float(metrics["val_spatial_cosine"]))
         for k in (1, 5, 10):
             metrics.setdefault(f"random_top{k}_expected", 0.0)
+        # Probe accuracy (rae_code path — same logic as standard branch)
+        if probe_model and active_tasks and probe_preds_dict:
+            from mindseye.models.common_probe import IGNORE_INDEX
+            for task in active_tasks:
+                ap = torch.cat(probe_preds_dict[task])
+                at = torch.cat(probe_targets_dict[task])
+                mask = at != IGNORE_INDEX
+                if mask.any():
+                    acc = (ap.argmax(dim=-1)[mask] == at[mask]).float().mean().item()
+                    metrics[f"probe_{task}_acc"] = acc
+                    if task == "class_label":
+                        top10_idx = ap[mask].topk(10, dim=-1).indices
+                        correct_top10 = (top10_idx == at[mask].unsqueeze(-1)).any(dim=-1)
+                        metrics["probe_class_label_top10_acc"] = correct_top10.float().mean().item()
+                else:
+                    metrics[f"probe_{task}_acc"] = 0.0
+                    if task == "class_label":
+                        metrics["probe_class_label_top10_acc"] = 0.0
         return metrics
 
     # -----------------------------------------------------------------------
