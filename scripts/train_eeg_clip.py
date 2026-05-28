@@ -346,8 +346,13 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
             kwargs = {"subject_id": subject_id} if getattr(model, "subject_embed", None) is not None else {}
             pred = model(batch_data["eeg"], **kwargs)
             if probe_model and active_tasks and "probe_targets" in batch_data:
-                # Use same normalized representation space as training
-                if target_center is not None:
+                # For rae_code: probe on mean-pooled spatial code → [B, 768]
+                if code_shape is not None and len(code_shape) == 3:
+                    c, h, w = code_shape
+                    probe_in = F.normalize(
+                        pred.reshape(pred.shape[0], c, h, w).mean(dim=[-1, -2]), dim=-1
+                    )
+                elif target_center is not None:
                     probe_in = F.normalize(pred - target_center, dim=-1)
                 else:
                     probe_in = F.normalize(pred, dim=-1)
@@ -1017,7 +1022,15 @@ def main() -> None:
                     # For rae_code: use raw unnormalized predictions vs raw targets
                     code_shape = getattr(dataset, '_rae_code_shape', None)
                     loss = _spatial_cosine_loss(pred, batch_data["target"], code_shape=code_shape)
-                    pred_for_loss = pred  # no normalization; probe won't be used in this mode
+                    # Probe input: mean-pool spatial → [B, C] → normalize (scale-invariant representation)
+                    if probe_model is not None and code_shape is not None:
+                        _c, _h, _w = code_shape
+                        pred_for_probe = torch.nn.functional.normalize(
+                            pred.reshape(pred.shape[0], _c, _h, _w).mean(dim=[-1, -2]), dim=-1
+                        )
+                    else:
+                        pred_for_probe = pred
+                    pred_for_loss = pred_for_probe
                 else:
                     loss = _loss_fn(pred_for_loss, target_for_loss, loss_name=args.loss, temperature=args.temperature)
             
@@ -1027,8 +1040,10 @@ def main() -> None:
                     and epoch >= args.probe_start_epoch):
                 import torch.nn.functional as F
                 from mindseye.models.common_probe import IGNORE_INDEX
-                # Use same normalized representation space as contrastive InfoNCE
-                logits_dict = probe_model(pred_for_loss)
+                # For rae_code (spatial_cosine loss), pred_for_probe is already mean-pooled+normalized.
+                # For other target spaces, pred_for_loss is the normalized representation.
+                probe_input = pred_for_probe if (args.loss == "spatial_cosine" and probe_model is not None) else pred_for_loss
+                logits_dict = probe_model(probe_input)
 
                 task_losses = []
                 is_calib = batch_data.get("is_calibration", torch.zeros(len(pred), device=device, dtype=torch.bool))

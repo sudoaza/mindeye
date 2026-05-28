@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         default="common",
         help="Key to read from the embeddings .pt file: 'common' (default) or 'decode_unit'",
     )
+    p.add_argument(
+        "--spatial-pool",
+        action="store_true",
+        default=False,
+        help="Mean-pool spatial dims of the embedding before normalizing (for spatial code targets like [C,H,W])",
+    )
     return p.parse_args()
 
 def split_paths(path_str) -> list[str]:
@@ -105,8 +111,14 @@ def main() -> None:
         available = [k for k in embeddings_table.keys() if k.startswith("image_id_to_")]
         raise KeyError(f"Key '{target_key}' not found in embeddings. Available: {available}")
     image_id_to_target = embeddings_table[target_key]
-    embedding_dim = next(iter(image_id_to_target.values())).shape[-1]
-    print(f"Loaded '{target_key}' embeddings for {len(image_id_to_target)} images (dimension={embedding_dim}).")
+    # Determine embedding_dim (after optional spatial pooling)
+    _sample_raw = next(iter(image_id_to_target.values())).float()
+    if args.spatial_pool and _sample_raw.ndim > 1:
+        _sample_pooled = _sample_raw.mean(dim=list(range(1, _sample_raw.ndim)))
+        embedding_dim = _sample_pooled.shape[-1]
+    else:
+        embedding_dim = _sample_raw.shape[-1]
+    print(f"Loaded '{target_key}' embeddings for {len(image_id_to_target)} images (embedding_dim={embedding_dim}, spatial_pool={args.spatial_pool}).")
     # 3. Load VLM attributes
     vlm_path = Path(args.vlm_attributes)
     if not vlm_path.exists():
@@ -138,7 +150,11 @@ def main() -> None:
         targets = {task: [] for task in tasks}
         
         for img_id in image_id_list:
-            embeds.append(F.normalize(image_id_to_target[img_id].float(), dim=-1))
+            emb = image_id_to_target[img_id].float()
+            # Optional: mean-pool spatial dims (e.g. [C, H, W] → [C])
+            if args.spatial_pool and emb.ndim > 1:
+                emb = emb.mean(dim=list(range(1, emb.ndim)))
+            embeds.append(F.normalize(emb, dim=-1))
             
             # class_label target
             cls_val = img_to_class.get(img_id, None)
