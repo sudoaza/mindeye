@@ -72,6 +72,12 @@ def parse_args() -> argparse.Namespace:
         help="Image directory for oracle check (only needed with --oracle-check)",
     )
     p.add_argument("--no-oracle-check", dest="oracle_check", action="store_false")
+    p.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Stop if val_token_cosine has not improved for this many epochs (0 = disabled)",
+    )
     return p.parse_args()
 
 
@@ -226,6 +232,7 @@ def train(args: argparse.Namespace) -> None:
 
     best_val_cos = -1.0
     best_epoch = 0
+    patience_counter = 0
 
     # 4. Train
     for epoch in range(1, args.epochs + 1):
@@ -308,10 +315,17 @@ def train(args: argparse.Namespace) -> None:
             )
 
         # Save best checkpoint (best val token cosine = lowest cos loss)
-        if val_token_cosine > best_val_cos and has_params:
+        improved = val_token_cosine > best_val_cos
+        if improved and has_params:
             best_val_cos = val_token_cosine
             best_epoch = epoch
+            patience_counter = 0
             torch.save({"arch": args.arch, "state_dict": model.state_dict()}, out_dir / "best.pt")
+        elif args.early_stop_patience > 0:
+            patience_counter += 1
+            if patience_counter >= args.early_stop_patience:
+                print(f"Early stopping at epoch {epoch} (no improvement for {args.early_stop_patience} epochs)")
+                break
 
     log_file.close()
 

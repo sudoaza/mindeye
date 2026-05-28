@@ -93,35 +93,43 @@ def relative_std_loss(code: torch.Tensor, target: torch.Tensor, collapse_ratio: 
 class _SpatialPoolBottleneck(nn.Module):
     """Parameter-free adaptive avg-pool compressor + learned bilinear-conv expander.
 
-    Compressor:  F.adaptive_avg_pool2d to (code_size, code_size) — no learned parameters.
-    Expander:    bilinear upsample back to 16×16 + 1×1 conv refinement (learned).
+    Compressor:  F.adaptive_avg_pool2d((h, w)) — no learned parameters.
+    Expander:    F.interpolate back to (16, 16) + 1×1 conv refinement (learned).
 
-    Supports any target code_size. The 1×1 conv is initialized to identity so the
-    model starts as a pure interpolation baseline and can learn corrections.
+    Supports square and rectangular target code sizes.
+    The 1×1 conv is initialized to identity so the model starts as a pure
+    interpolation baseline and can learn corrections.
 
-    Code shape: [B, 768, code_size, code_size]
-    Values:     768 × code_size²
+    Code shape: [B, 768, h, w]
+    Values:     768 × h × w
 
     Examples:
-        code_size=4 → 12,288 values
-        code_size=3 →  6,912 values
-        code_size=2 →  3,072 values
+        (4, 4) → 12,288 values
+        (4, 3) →  9,216 values
+        (3, 3) →  6,912 values
+        (3, 2) →  4,608 values
+        (2, 2) →  3,072 values
     """
 
-    def __init__(self, code_size: int = 4):
+    def __init__(self, code_size):
+        """Args:
+            code_size: int (square) or (h, w) tuple (rectangular)
+        """
         super().__init__()
-        self.code_size = code_size
+        if isinstance(code_size, int):
+            code_size = (code_size, code_size)
+        self.code_h, self.code_w = code_size
         # Learned 1×1 refinement after upsample (~589k params regardless of code_size)
         self.refine = nn.Conv2d(768, 768, kernel_size=1, bias=True)
         nn.init.eye_(self.refine.weight.reshape(768, 768))
         nn.init.zeros_(self.refine.bias)
 
     def compress(self, tokens: torch.Tensor) -> torch.Tensor:
-        """[B, 768, 16, 16] → [B, 768, code_size, code_size]  (parameter-free)"""
-        return F.adaptive_avg_pool2d(tokens, (self.code_size, self.code_size))
+        """[B, 768, 16, 16] → [B, 768, h, w]  (parameter-free)"""
+        return F.adaptive_avg_pool2d(tokens, (self.code_h, self.code_w))
 
     def expand(self, code: torch.Tensor) -> torch.Tensor:
-        """[B, 768, code_size, code_size] → [B, 768, 16, 16]  (learned refinement)"""
+        """[B, 768, h, w] → [B, 768, 16, 16]  (bilinear interp + learned 1×1 refinement)"""
         up = F.interpolate(code, size=(16, 16), mode="bilinear", align_corners=False)
         return self.refine(up)
 
@@ -218,9 +226,11 @@ class _ConvBottleneck(nn.Module):
 # ---------------------------------------------------------------------------
 
 ARCHITECTURES: Dict[str, object] = {
-    "spatial_768x4x4": lambda: _SpatialPoolBottleneck(code_size=4),
-    "spatial_768x3x3": lambda: _SpatialPoolBottleneck(code_size=3),
-    "spatial_768x2x2": lambda: _SpatialPoolBottleneck(code_size=2),
+    "spatial_768x4x4": lambda: _SpatialPoolBottleneck((4, 4)),
+    "spatial_768x4x3": lambda: _SpatialPoolBottleneck((4, 3)),
+    "spatial_768x3x3": lambda: _SpatialPoolBottleneck((3, 3)),
+    "spatial_768x3x2": lambda: _SpatialPoolBottleneck((3, 2)),
+    "spatial_768x2x2": lambda: _SpatialPoolBottleneck((2, 2)),
     "conv_256x4x4":    lambda: _ConvBottleneck(code_channels=256, hidden_channels=512, code_size=4),
     "conv_128x4x4":    lambda: _ConvBottleneck(code_channels=128, hidden_channels=384, code_size=4),
     "conv_256x8x8":    lambda: _ConvBottleneck(code_channels=256, hidden_channels=512, code_size=8),
@@ -228,7 +238,9 @@ ARCHITECTURES: Dict[str, object] = {
 
 CODE_SHAPES: Dict[str, tuple] = {
     "spatial_768x4x4": (768, 4, 4),
+    "spatial_768x4x3": (768, 4, 3),
     "spatial_768x3x3": (768, 3, 3),
+    "spatial_768x3x2": (768, 3, 2),
     "spatial_768x2x2": (768, 2, 2),
     "conv_256x4x4":    (256, 4, 4),
     "conv_128x4x4":    (128, 4, 4),
