@@ -105,13 +105,21 @@ def main() -> None:
     # base tight1s = 62 channels; +1 with event marker = 63.
     ckpt_setup = {}
     add_event_marker = False
+    subjects_loaded = None
     if args.checkpoint:
-        _ckpt_peek = torch.load(args.checkpoint, map_location="cpu")
+        checkpoint_path = Path(args.checkpoint)
+        _ckpt_peek = torch.load(checkpoint_path, map_location="cpu")
         ckpt_setup = _ckpt_peek.get("setup", {})
         del _ckpt_peek
         n_ch = ckpt_setup.get("eeg_shape", [62])[0]
         add_event_marker = n_ch > 62  # 63 = marker added, 62 = base channels
         print(f"Inferred add_event_marker={add_event_marker} from eeg_shape n_channels={n_ch}")
+        
+        config_json_path = checkpoint_path.parent / "config.json"
+        if config_json_path.exists():
+            with open(config_json_path, "r") as f:
+                train_config = json.load(f)
+                subjects_loaded = train_config.get("subjects_loaded") or ckpt_setup.get("subjects_loaded")
 
     if args.vlm_attributes is None and args.common_probe:
         candidate = Path(args.common_probe).parent / "vlm_attributes_runs01_40.json"
@@ -128,6 +136,7 @@ def main() -> None:
         target_mode="real",
         add_event_marker=add_event_marker,
         augment_eeg=False,
+        subject_list=subjects_loaded,
     )
     dataset = ZunaClipPairDataset(config)
 
@@ -180,6 +189,7 @@ def main() -> None:
         if target_center is not None:
             target_center = target_center.to(device)
 
+        num_subjects = len(subjects_loaded) if subjects_loaded else 1
         if model_name in {"temporal_attn", "temporal_attn_small"}:
             from mindseye.models.eeg_encoder import TemporalAttnEncoder
             model = TemporalAttnEncoder(
@@ -190,6 +200,7 @@ def main() -> None:
                 n_heads=setup.get("n_heads", 4),
                 dropout=setup.get("dropout", 0.35),
                 stem_dropout1d=setup.get("stem_dropout1d", 0.15),
+                num_subjects=num_subjects,
             ).to(device)
         else:
             from mindseye.models.eeg_encoder import EEGClipEncoder
@@ -206,7 +217,14 @@ def main() -> None:
         with torch.inference_mode():
             for batch in val_loader:
                 eeg = batch["eeg"].to(device).float()
-                z_pred_list.append(model(eeg).cpu())
+                subject_id = batch.get("subject_id", None)
+                if subject_id is not None:
+                    subject_id = subject_id.to(device)
+                kwargs = {"subject_id": subject_id} if getattr(model, "subject_embed", None) is not None else {}
+                pred = model(eeg, **kwargs)
+                if isinstance(pred, tuple):
+                    pred = pred[0]
+                z_pred_list.append(pred.cpu())
         z_pred = torch.cat(z_pred_list)
 
         # Diagnostics: geometry of z_pred vs z_common

@@ -48,7 +48,11 @@ Return ONLY a valid JSON object matching this schema:
 def main():
     args = parse_args()
     
-    df = pd.read_csv(args.metadata)
+    # Support comma-separated metadata CSV paths
+    metadata_paths = [p.strip() for p in args.metadata.split(",")]
+    dfs = [pd.read_csv(p) for p in metadata_paths]
+    df = pd.concat(dfs, ignore_index=True)
+    
     # image_id looks like n03594734_45507
     unique_images = df["image_id"].unique()
     

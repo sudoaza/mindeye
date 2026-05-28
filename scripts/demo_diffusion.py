@@ -71,6 +71,7 @@ def main():
         target_space=setup.get("target_space", "common"),
         add_event_marker=setup.get("add_event_marker", False),
         augment_eeg=False,
+        subject_list=setup.get("subjects_loaded", None),
     )
     dataset = ZunaClipPairDataset(dataset_config)
     print(f"[Demo] Loaded validation dataset with {len(dataset)} samples.")
@@ -89,6 +90,7 @@ def main():
         ).to(device)
     elif setup.get("model") in ("temporal_attn", "temporal_attn_small"):
         from mindseye.models.eeg_encoder import TemporalAttnEncoder
+        num_subjects = len(setup.get("subjects_loaded", [1]))
         encoder = TemporalAttnEncoder(
             n_channels=n_channels,
             embedding_dim=dataset.embedding_dim,
@@ -96,6 +98,7 @@ def main():
             n_layers=setup.get("n_layers", 4),
             n_heads=setup.get("n_heads", 8),
             dropout=setup.get("dropout", 0.2),
+            num_subjects=num_subjects,
         ).to(device)
     else:
         from mindseye.models.eeg_encoder import EEGClipEncoder
@@ -156,7 +159,7 @@ def main():
         # Predict z_pred_common
         with torch.inference_mode():
             subject_id = torch.tensor([sample["subject_id"]], device=device).long()
-            kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(encoder).__name__.lower() or "spatialtemporal" in type(encoder).__name__.lower() else {}
+            kwargs = {"subject_id": subject_id} if getattr(encoder, "subject_embed", None) is not None else {}
             pred = encoder(eeg, **kwargs)
             pred_norm = F.normalize(pred, dim=-1)
             

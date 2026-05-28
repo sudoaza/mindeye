@@ -104,6 +104,7 @@ def main() -> None:
             target_space=train_config.get("target_space") or setup.get("target_space", "common"),
             add_event_marker=train_config.get("add_event_marker", setup.get("add_event_marker", False)),
             augment_eeg=False,
+            subject_list=train_config.get("subjects_loaded") or setup.get("subjects_loaded", None),
         )
     )
     
@@ -128,6 +129,7 @@ def main() -> None:
     n_channels, n_times = dataset.eeg_shape
     
     print(f"Recreating encoder model architecture: '{model_type}'...")
+    num_subjects = len(train_config.get("subjects_loaded") or setup.get("subjects_loaded", [1]))
     if model_type in {"spatial_temporal", "spatial_temporal_small"}:
         from mindseye.models.spatial_temporal_encoder import build_spatial_temporal_encoder
         preset = "small" if model_type == "spatial_temporal_small" else "medium"
@@ -144,6 +146,7 @@ def main() -> None:
             n_channels=n_channels,
             embedding_dim=dataset.embedding_dim,
             ch_names=getattr(dataset, "ch_names", None),
+            num_subjects=num_subjects,
             **overrides,
         ).to(device)
     elif model_type in {"temporal_attn", "temporal_attn_small"}:
@@ -170,6 +173,7 @@ def main() -> None:
             n_heads=n_heads,
             dropout=dropout,
             stem_dropout1d=train_config.get("stem_dropout1d", 0.15),
+            num_subjects=num_subjects,
         ).to(device)
     else:
         from mindseye.models.eeg_encoder import EEGClipEncoder
@@ -206,7 +210,7 @@ def main() -> None:
             subject_id = batch.get("subject_id", None)
             if subject_id is not None:
                 subject_id = subject_id.to(device)
-            kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+            kwargs = {"subject_id": subject_id} if getattr(model, "subject_embed", None) is not None else {}
             pred = model(eeg, **kwargs)
             if isinstance(pred, tuple):
                 pred = pred[0]

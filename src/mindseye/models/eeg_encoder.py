@@ -30,8 +30,10 @@ class EEGClipEncoder(nn.Module):
         dropout: float = 0.2,
         stem_dropout1d: float = 0.15,
         normalize_output: bool = True,
+        num_subjects: int = 1,
     ):
         super().__init__()
+        self.num_subjects = num_subjects
         self.normalize_output = normalize_output
         self.net = nn.Sequential(
             nn.Conv1d(n_channels, 128, kernel_size=7, padding=3),
@@ -87,6 +89,7 @@ class AttentionPooler(nn.Module):
 class TemporalAttnEncoder(nn.Module):
     """
     Lightweight Transformer-based encoder for longer EEG windows (e.g. 5s).
+    Supports subject-specific FiLM conditioning and per-subject projection heads.
     """
 
     def __init__(
@@ -100,9 +103,17 @@ class TemporalAttnEncoder(nn.Module):
         dropout: float = 0.2,
         stem_dropout1d: float = 0.15,
         normalize_output: bool = True,
+        num_subjects: int = 1,
+        no_film: bool = False,
+        no_subject_heads: bool = False,
+        head_reg_weight: float = 0.0,
     ):
         super().__init__()
+        self.num_subjects = num_subjects
         self.normalize_output = normalize_output
+        self.no_film = no_film
+        self.no_subject_heads = no_subject_heads
+        self.head_reg_weight = head_reg_weight
         self.stem = nn.Sequential(
             nn.Conv1d(n_channels, 128, kernel_size=7, stride=4, padding=3),
             _group_norm(128),
@@ -113,7 +124,7 @@ class TemporalAttnEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout1d(stem_dropout1d),
         )
-        
+
         self.max_tokens = 256
         self.pos_embed = nn.Parameter(torch.zeros(1, self.max_tokens, hidden_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
@@ -130,11 +141,54 @@ class TemporalAttnEncoder(nn.Module):
         self.pooler = AttentionPooler(hidden_dim, heads=n_heads)
         self.head = nn.Linear(hidden_dim, embedding_dim)
 
-    def forward(self, eeg: torch.Tensor, return_features: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if num_subjects > 1:
+            # FiLM: zero-init so initial transform is identity
+            self.subject_embed = nn.Embedding(num_subjects, hidden_dim * 2)
+            nn.init.zeros_(self.subject_embed.weight)
+            # Subject heads: warm-init from shared head (copy weights, not random)
+            self.subject_heads = nn.ModuleList([
+                nn.Linear(hidden_dim, embedding_dim) for _ in range(num_subjects)
+            ])
+            for h in self.subject_heads:
+                h.load_state_dict(self.head.state_dict())
+        else:
+            self.subject_embed = None
+            self.subject_heads = None
+
+    def compute_head_reg(self) -> torch.Tensor:
+        """L2 regularization: mean ||W_subject - W_shared||^2 over all subject heads."""
+        if self.subject_heads is None or self.no_subject_heads:
+            return torch.tensor(0.0)
+        ref_w = self.head.weight.detach()
+        ref_b = self.head.bias.detach()
+        reg = sum(
+            ((h.weight - ref_w) ** 2).mean() + ((h.bias - ref_b) ** 2).mean()
+            for h in self.subject_heads
+        )
+        return reg / self.num_subjects
+
+    def forward(
+        self,
+        eeg: torch.Tensor,
+        subject_id: torch.Tensor | None = None,
+        return_features: bool = False,
+        return_head_reg: bool = False,
+    ) -> torch.Tensor | tuple:
         # eeg: [B, C, T]
         x = self.stem(eeg)  # [B, D, T']
         x = x.transpose(1, 2)  # [B, T', D]
-        
+
+        # FiLM conditioning (skipped when no_film=True)
+        use_film = (
+            not self.no_film
+            and getattr(self, "subject_embed", None) is not None
+            and subject_id is not None
+        )
+        if use_film:
+            film_params = self.subject_embed(subject_id)  # [B, D*2]
+            gamma, beta = film_params.chunk(2, dim=-1)     # [B, D] each
+            x = x * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
         t = x.shape[1]
         if t > self.max_tokens:
             raise ValueError(f"Token length {t} exceeds max_tokens={self.max_tokens}")
@@ -142,12 +196,35 @@ class TemporalAttnEncoder(nn.Module):
 
         x = self.transformer(x)
         features = self.pooler(x)
-        x = self.head(features)
+
+        # Subject-specific projection heads (skipped when no_subject_heads=True)
+        use_subj_heads = (
+            not self.no_subject_heads
+            and getattr(self, "subject_heads", None) is not None
+            and subject_id is not None
+        )
+        if use_subj_heads:
+            b = features.shape[0]
+            out = torch.zeros(b, self.head.out_features, device=features.device, dtype=features.dtype)
+            for sub_idx in range(self.num_subjects):
+                mask = (subject_id == sub_idx)
+                if mask.any():
+                    out[mask] = self.subject_heads[sub_idx](features[mask])
+            x = out
+        else:
+            x = self.head(features)
+
         if self.normalize_output:
             x = F.normalize(x, dim=-1)
-            
+
+        head_reg = self.compute_head_reg() if return_head_reg else None
+
+        if return_features and return_head_reg:
+            return x, features, head_reg
         if return_features:
             return x, features
+        if return_head_reg:
+            return x, head_reg
         return x
 
 
@@ -230,6 +307,7 @@ class DualHeadTemporalAttnEncoder(nn.Module):
     """
     Dual-head Temporal Attention Encoder.
     Outputs L2-normalized unit embeddings (z_pred_unit) and raw embedding norm (pred_norm).
+    Supports subject-specific FiLM conditioning and per-subject projection heads.
     """
 
     def __init__(
@@ -242,9 +320,17 @@ class DualHeadTemporalAttnEncoder(nn.Module):
         n_heads: int = 8,
         dropout: float = 0.2,
         stem_dropout1d: float = 0.15,
+        num_subjects: int = 1,
+        no_film: bool = False,
+        no_subject_heads: bool = False,
+        head_reg_weight: float = 0.0,
     ):
         super().__init__()
         self.n_channels = n_channels
+        self.num_subjects = num_subjects
+        self.no_film = no_film
+        self.no_subject_heads = no_subject_heads
+        self.head_reg_weight = head_reg_weight
         self.stem = nn.Sequential(
             nn.Conv1d(n_channels, 128, kernel_size=7, stride=4, padding=3),
             _group_norm(128),
@@ -255,7 +341,7 @@ class DualHeadTemporalAttnEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout1d(stem_dropout1d),
         )
-        
+
         self.max_tokens = 256
         self.pos_embed = nn.Parameter(torch.zeros(1, self.max_tokens, hidden_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
@@ -270,7 +356,7 @@ class DualHeadTemporalAttnEncoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.pooler = AttentionPooler(hidden_dim, heads=n_heads)
-        
+
         # Dual Heads
         self.unit_head = nn.Linear(hidden_dim, embedding_dim)
         self.norm_head = nn.Sequential(
@@ -278,12 +364,69 @@ class DualHeadTemporalAttnEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(64, 1)
         )
+        # backward compat alias
+        self.subject_heads = None
 
-    def forward(self, eeg: torch.Tensor, return_features: bool = False, return_norm: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if num_subjects > 1:
+            # FiLM: zero-init so initial transform is identity
+            self.subject_embed = nn.Embedding(num_subjects, hidden_dim * 2)
+            nn.init.zeros_(self.subject_embed.weight)
+            # Subject unit heads: warm-init from shared unit_head
+            self.subject_unit_heads = nn.ModuleList([
+                nn.Linear(hidden_dim, embedding_dim) for _ in range(num_subjects)
+            ])
+            for u_h in self.subject_unit_heads:
+                u_h.load_state_dict(self.unit_head.state_dict())
+            # Subject norm heads: warm-init from shared norm_head
+            self.subject_norm_heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(hidden_dim, 64),
+                    nn.GELU(),
+                    nn.Linear(64, 1)
+                ) for _ in range(num_subjects)
+            ])
+            for n_h in self.subject_norm_heads:
+                n_h.load_state_dict(self.norm_head.state_dict())
+        else:
+            self.subject_embed = None
+            self.subject_unit_heads = None
+            self.subject_norm_heads = None
+
+    def compute_head_reg(self) -> torch.Tensor:
+        """L2 regularization: mean ||W_subject - W_shared||^2 over all subject unit heads."""
+        if self.subject_unit_heads is None or self.no_subject_heads:
+            return torch.tensor(0.0)
+        ref_w = self.unit_head.weight.detach()
+        ref_b = self.unit_head.bias.detach()
+        reg = sum(
+            ((h.weight - ref_w) ** 2).mean() + ((h.bias - ref_b) ** 2).mean()
+            for h in self.subject_unit_heads
+        )
+        return reg / self.num_subjects
+
+    def forward(
+        self,
+        eeg: torch.Tensor,
+        subject_id: torch.Tensor | None = None,
+        return_features: bool = False,
+        return_norm: bool = False,
+        return_head_reg: bool = False,
+    ) -> torch.Tensor | tuple:
         # eeg: [B, C, T]
         x = self.stem(eeg)  # [B, D, T']
         x = x.transpose(1, 2)  # [B, T', D]
-        
+
+        # FiLM conditioning (skipped when no_film=True)
+        use_film = (
+            not self.no_film
+            and getattr(self, "subject_embed", None) is not None
+            and subject_id is not None
+        )
+        if use_film:
+            film_params = self.subject_embed(subject_id)  # [B, D*2]
+            gamma, beta = film_params.chunk(2, dim=-1)     # [B, D] each
+            x = x * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
         t = x.shape[1]
         if t > self.max_tokens:
             raise ValueError(f"Token length {t} exceeds max_tokens={self.max_tokens}")
@@ -291,19 +434,47 @@ class DualHeadTemporalAttnEncoder(nn.Module):
 
         x = self.transformer(x)
         features = self.pooler(x)
-        
+
+        # Subject-specific projection heads (skipped when no_subject_heads=True)
+        use_subj_heads = (
+            not self.no_subject_heads
+            and getattr(self, "subject_unit_heads", None) is not None
+            and subject_id is not None
+        )
+        if use_subj_heads:
+            b = features.shape[0]
+            z_pred_unit = torch.zeros(b, self.unit_head.out_features, device=features.device, dtype=features.dtype)
+            pred_norm = torch.zeros(b, 1, device=features.device, dtype=features.dtype)
+            for sub_idx in range(self.num_subjects):
+                mask = (subject_id == sub_idx)
+                if mask.any():
+                    z_pred_unit[mask] = self.subject_unit_heads[sub_idx](features[mask])
+                    pred_norm[mask] = self.subject_norm_heads[sub_idx](features[mask])
+        else:
+            z_pred_unit = self.unit_head(features)
+            pred_norm = self.norm_head(features)
+
         # L2-normalized unit vector
-        z_pred_unit = F.normalize(self.unit_head(features), dim=-1)
-        
+        z_pred_unit = F.normalize(z_pred_unit, dim=-1)
+
         # Predicted norm (must be positive, use softplus)
-        pred_norm = F.softplus(self.norm_head(features)) + 1e-6
-        
+        pred_norm = F.softplus(pred_norm) + 1e-6
+
+        head_reg = self.compute_head_reg() if return_head_reg else None
+
+        if return_norm and return_features and return_head_reg:
+            return z_pred_unit, pred_norm, features, head_reg
+        if return_norm and return_features:
+            return z_pred_unit, pred_norm, features
+        if return_norm and return_head_reg:
+            return z_pred_unit, pred_norm, head_reg
         if return_norm:
-            if return_features:
-                return z_pred_unit, pred_norm, features
             return z_pred_unit, pred_norm
-            
+        if return_features and return_head_reg:
+            return z_pred_unit, features, head_reg
         if return_features:
             return z_pred_unit, features
+        if return_head_reg:
+            return z_pred_unit, head_reg
         return z_pred_unit
 

@@ -129,16 +129,40 @@ def main():
         
     print(f"Loading EEG Encoder from {run_dir}...")
     model_name = config.get("model", "cnn")
-    
+
     # Resolve multiple subject paths from setup block if present, allowing CLI overrides
     metadata_paths = args.metadata if args.metadata is not None else root_config.get("metadata", "")
     epochs_dir_paths = args.epochs_dir if args.epochs_dir is not None else root_config.get("epochs_dir", "")
-    
+
     if not metadata_paths:
         metadata_paths = config.get("metadata", "data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv")
     if not epochs_dir_paths:
         epochs_dir_paths = config.get("epochs_dir", "data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40")
-        
+
+    # Load subject_to_id from saved config (authoritative). Fall back to auto-detect.
+    saved_subject_to_id = config.get("subject_to_id", None)
+    if saved_subject_to_id:
+        num_subjects = len(saved_subject_to_id)
+        subject_list = list(saved_subject_to_id.keys())
+        print(f"[SubjectMap] Loaded from config: {saved_subject_to_id}")
+    else:
+        # Legacy fallback: derive from subjects_loaded
+        num_subjects = len(config.get("subjects_loaded", [1]))
+        subject_list = config.get("subjects_loaded", None)
+        print(f"[SubjectMap] No saved mapping, falling back to subjects_loaded len={num_subjects}")
+
+    no_film = config.get("no_film", False)
+    no_subject_heads = config.get("no_subject_heads", False)
+
+    # Pre-adapter checkpoints (no subject_to_id saved) don't have adapter keys.
+    # Force adapter-free mode so model is built without those params and loads cleanly.
+    is_legacy_checkpoint = saved_subject_to_id is None
+    if is_legacy_checkpoint:
+        num_subjects = 1
+        no_film = True
+        no_subject_heads = True
+        print("[SubjectMap] Legacy checkpoint (no subject_to_id): forcing num_subjects=1, no_film=True, no_subject_heads=True")
+
     if model_name in {"temporal_attn", "temporal_attn_small"}:
         if config.get("dual_head", False):
             model = DualHeadTemporalAttnEncoder(
@@ -149,6 +173,9 @@ def main():
                 n_heads=config.get("n_heads", 4 if model_name == "temporal_attn_small" else 8),
                 dropout=config["dropout"],
                 stem_dropout1d=config["stem_dropout1d"],
+                num_subjects=num_subjects,
+                no_film=no_film,
+                no_subject_heads=no_subject_heads,
             ).to(device)
         else:
             model = TemporalAttnEncoder(
@@ -159,6 +186,9 @@ def main():
                 n_heads=config.get("n_heads", 4 if model_name == "temporal_attn_small" else 8),
                 dropout=config["dropout"],
                 stem_dropout1d=config["stem_dropout1d"],
+                num_subjects=num_subjects,
+                no_film=no_film,
+                no_subject_heads=no_subject_heads,
             ).to(device)
     else:
         model = EEGClipEncoder(
@@ -184,7 +214,8 @@ def main():
         target_mode="real",
         input_domain="zuna",
         vlm_attributes_json="data/processed/clip_embeddings/vlm_attributes.json",
-        add_event_marker=root_config.get("add_event_marker", True)
+        add_event_marker=root_config.get("add_event_marker", True),
+        subject_list=subject_list,
     )
     dataset = ZunaClipPairDataset(dataset_config)
     
@@ -238,24 +269,31 @@ def main():
     val_eeg = []
     val_target_raw = []
     val_probe_targets = []
+    val_subjects = []
     for idx in eval_val_indices:
         item = dataset[idx]
         val_eeg.append(item["eeg"])
         val_target_raw.append(item["target_raw"])
         val_probe_targets.append(item["probe_targets"])
+        val_subjects.append(item["subject_id"])
         
     val_eeg = torch.stack(val_eeg).to(device)
     val_target_raw = torch.stack(val_target_raw).to(device)
+    val_subjects = torch.tensor(val_subjects, device=device).long()
     
     with torch.no_grad():
+        kwargs = {"subject_id": val_subjects} if getattr(model, "subject_embed", None) is not None else {}
+        shuffled_subjects = torch.roll(val_subjects, shifts=1, dims=0)
+        shuffled_kwargs = {"subject_id": shuffled_subjects} if getattr(model, "subject_embed", None) is not None else {}
+        
         if config.get("dual_head", False):
-            pred_unit, _ = model(val_eeg, return_norm=True)
+            pred_unit, _ = model(val_eeg, return_norm=True, **kwargs)
             shuffled_eeg = torch.roll(val_eeg, shifts=1, dims=0)
-            shuff_unit, _ = model(shuffled_eeg, return_norm=True)
+            shuff_unit, _ = model(shuffled_eeg, return_norm=True, **shuffled_kwargs)
         else:
-            pred_unit = model(val_eeg)
+            pred_unit = model(val_eeg, **kwargs)
             shuffled_eeg = torch.roll(val_eeg, shifts=1, dims=0)
-            shuff_unit = model(shuffled_eeg)
+            shuff_unit = model(shuffled_eeg, **shuffled_kwargs)
             
         # Retrieve target_raw via soft kNN
         real_embeds = retrieve_soft_knn(pred_unit, train_decode_unit, train_target_raw, k=args.k, temp=args.temperature)
@@ -344,11 +382,43 @@ def main():
         print(f"{c:<15} | {cos_mean:.5f} ({cos_low:.5f} to {cos_high:.5f}) | {attr_mean:.2%} ({attr_low:.2%} to {attr_high:.2%})")
         
     print("="*80)
-    
+
+    # --- Per-subject breakdown ---
+    subject_ids_np = val_subjects.cpu().numpy() if hasattr(val_subjects, "cpu") else np.array(val_subjects)
+    unique_subj_ids = sorted(set(subject_ids_np.tolist()))
+    # Build reverse map: adapter id -> subject name
+    id_to_subj = {v: k for k, v in (saved_subject_to_id or {}).items()}
+
+    per_subject_results = {}
+    if len(unique_subj_ids) > 1:
+        print("\n" + "="*80)
+        print("PER-SUBJECT BREAKDOWN")
+        print("="*80)
+        for sid in unique_subj_ids:
+            mask = (subject_ids_np == sid)
+            subj_name = id_to_subj.get(sid, f"sub-{sid}")
+            for c in ["real", "shuffled"]:
+                subj_cos = np.array(cosine_sims[c])[mask]
+                if len(subj_cos) == 0:
+                    continue
+                subj_attr = [attribute_matches[c][i] for i in range(len(subject_ids_np)) if mask[i]]
+                all_attr = [m for sample in subj_attr for m in sample if m is not None]
+                attr_mean = np.mean(all_attr) if all_attr else 0.0
+                print(f"  {subj_name} | {c:10s} | cosine={subj_cos.mean():.5f} | attr_agree={attr_mean:.2%} | n={mask.sum()}")
+            per_subject_results[subj_name] = {
+                c: {
+                    "cosine_mean": float(np.array(cosine_sims[c])[mask].mean()) if mask.sum() > 0 else 0.0,
+                    "n": int(mask.sum()),
+                } for c in ["oracle", "real", "shuffled", "random"]
+            }
+        print("="*80)
+
     # Save results to a json file in the run directory
     results = {
         "cosine_similarity": cosine_results,
         "attribute_agreement": attribute_results,
+        "per_subject": per_subject_results,
+        "subject_to_id": saved_subject_to_id or {},
     }
     out_json_path = run_dir / "generation_evaluation_metrics.json"
     with open(out_json_path, "w") as f:

@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     # --target-space is kept as a hidden ablation flag; canonical path always uses 'common'.
     p.add_argument(
         "--target-space",
-        choices=("common", "semantic", "image", "label", "decode_unit", "decode_raw", "decode_norm"),
+        choices=("common", "semantic", "image", "label", "decode_unit", "decode_raw", "decode_norm", "rae_unit"),
         default="common",
         help=argparse.SUPPRESS,
     )
@@ -172,6 +172,19 @@ def parse_args() -> argparse.Namespace:
                    help="Number of epochs to warmup learning rate")
     p.add_argument("--min-lr", type=float, default=1e-6,
                    help="Minimum learning rate for cosine annealing")
+    # --- Phase 16 adapter ablation flags ---
+    p.add_argument("--init-from", default=None,
+                   help="Path to a checkpoint (.pt) to warm-start from (soft load, missing adapter keys allowed)")
+    p.add_argument("--init-skip-heads", action="store_true",
+                   help="Filter out projection head parameters when loading from --init-from checkpoint")
+    p.add_argument("--target-key", default=None,
+                   help="Select the exact target key to load from the common embeddings file")
+    p.add_argument("--no-film", action="store_true",
+                   help="Disable FiLM conditioning (ablation: subject heads only)")
+    p.add_argument("--no-subject-heads", action="store_true",
+                   help="Disable subject-specific projection heads (ablation: shared head only)")
+    p.add_argument("--head-reg-weight", type=float, default=0.0,
+                   help="Weight for head regularization loss ||W_subject - W_shared||^2")
     args = p.parse_args()
     if args.model in {"temporal_attn_small", "spatial_temporal_small", "spatial_temporal"} and args.weight_decay == 1e-4:
         args.weight_decay = 1e-2
@@ -298,7 +311,7 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
         for batch in loader:
             batch_data = _batch_to_device(batch, device)
             subject_id = batch_data.get("subject_id", None)
-            kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+            kwargs = {"subject_id": subject_id} if getattr(model, "subject_embed", None) is not None else {}
             pred = model(batch_data["eeg"], **kwargs)
             if probe_model and active_tasks and "probe_targets" in batch_data:
                 # Probe was pretrained on F.normalize(z_common); normalize pred to match.
@@ -414,7 +427,7 @@ def main() -> None:
             args.vlm_attributes = str(candidate)
             print(f"[Dataset] Auto-detected vlm_attributes at {args.vlm_attributes}")
             
-    if args.target_space not in ("common", "decode_unit"):
+    if args.target_space not in ("common", "decode_unit", "rae_unit"):
         print("[WARN] Non-canonical target_space used for ablation only.")
 
     dataset_config = SemanticPairConfig(
@@ -428,6 +441,7 @@ def main() -> None:
             target_mode=args.target_mode,
             window_mode=args.window_mode,
             target_space=args.target_space,
+            target_key=args.target_key,
             add_event_marker=args.add_event_marker,
             augment_eeg=False,
         )
@@ -463,6 +477,7 @@ def main() -> None:
             target_mode="real",
             window_mode=args.window_mode,
             target_space=args.target_space,
+            target_key=args.target_key,
             add_event_marker=args.add_event_marker,
             augment_eeg=False,
             is_calibration=True,
@@ -587,9 +602,14 @@ def main() -> None:
             n_heads=n_heads,
             dropout=dropout,
             stem_dropout1d=args.stem_dropout1d,
+            num_subjects=len(getattr(dataset, "unique_subjects", ["unknown"])),
+            no_film=args.no_film,
+            no_subject_heads=args.no_subject_heads,
+            head_reg_weight=args.head_reg_weight,
         ).to(device)
         model.n_channels = n_channels
-        print(f"[Model] model: {args.model} dual_head={args.dual_head} hidden_dim={hidden_dim} n_layers={n_layers} n_heads={n_heads} dropout={dropout}")
+        print(f"[Model] model: {args.model} dual_head={args.dual_head} hidden_dim={hidden_dim} n_layers={n_layers} n_heads={n_heads} dropout={dropout} "
+              f"no_film={args.no_film} no_subject_heads={args.no_subject_heads} head_reg_weight={args.head_reg_weight}")
     else:
         hidden_dim = args.hidden_dim or 256
         dropout = args.dropout if args.dropout is not None else 0.2
@@ -618,7 +638,7 @@ def main() -> None:
             raise FileNotFoundError(f"Active tasks specification not found at {probe_specs_path}")
         with open(probe_specs_path, "r") as f:
             active_task_specs = json.load(f)
-        
+
         probe_model = CommonProbeModel(
             embedding_dim=dataset.embedding_dim,
             task_specs=active_task_specs
@@ -629,6 +649,34 @@ def main() -> None:
             p.requires_grad = False
         active_tasks = list(active_task_specs.keys())
         print(f"[Model] Loaded frozen CommonProbeModel with {len(active_tasks)} active tasks from {args.common_probe}")
+
+    # Warm-start from an existing checkpoint if requested (soft load: adapter keys may be absent)
+    if getattr(args, "init_from", None):
+        init_ckpt_path = Path(args.init_from)
+        if not init_ckpt_path.exists():
+            raise FileNotFoundError(f"--init-from checkpoint not found: {init_ckpt_path}")
+        init_ckpt = torch.load(init_ckpt_path, map_location=device)
+        init_state = init_ckpt.get("model_state", init_ckpt)
+        
+        if getattr(args, "init_skip_heads", False):
+            keys_to_skip = ["head", "subject_heads", "unit_head", "norm_head", "subject_unit_heads", "subject_norm_heads"]
+            filtered_state = {}
+            skipped = []
+            for k, v in init_state.items():
+                if any(skip_key in k for skip_key in keys_to_skip):
+                    skipped.append(k)
+                else:
+                    filtered_state[k] = v
+            print(f"[InitFrom] Skipping projection head keys as requested: {skipped}")
+            init_state = filtered_state
+
+        missing, unexpected = model.load_state_dict(init_state, strict=False)
+        print(f"[InitFrom] Loaded weights from {init_ckpt_path}")
+        if missing:
+            print(f"  Missing keys (will use current initialization): {len(missing)} keys")
+            print(f"  First 10 missing keys: {missing[:10]}")
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {len(unexpected)} keys")
         
     opt_params = list(model.parameters())
         
@@ -667,6 +715,9 @@ def main() -> None:
         mean_train_norm = sum(norms) / len(norms) if norms else 1.0
         print(f"[Dual-Head] Mean target norm in training set: {mean_train_norm:.4f}")
 
+    # Build subject_to_id mapping and save in setup
+    subject_to_id = getattr(dataset, "subject_to_id", {})
+
     setup = {
         "items": len(dataset),
         "train_items": len(train_idx),
@@ -687,6 +738,10 @@ def main() -> None:
         "use_fixed_mean_norm": args.use_fixed_mean_norm,
         "mean_train_norm": mean_train_norm,
         "probe_start_epoch": args.probe_start_epoch,
+        "probe_weight": args.probe_weight,
+        "common_probe": args.common_probe,
+        "decode_probe_loaded": (probe_model is not None),
+        "training_probe_active": (probe_model is not None and args.probe_weight > 0),
         "model": args.model,
         "hidden_dim": hidden_dim,
         "n_layers": n_layers,
@@ -704,8 +759,14 @@ def main() -> None:
         "target_bank_audit": target_bank_audit,
         "subjects_requested": subjects_requested,
         "subjects_loaded": subjects_loaded,
+        "subject_to_id": subject_to_id,
+        "num_subjects": len(subject_to_id) if subject_to_id else 1,
         "samples_per_subject": {str(k): int(v) for k, v in samples_per_subject.items()},
         "subjects_skipped": subjects_skipped,
+        "no_film": getattr(args, "no_film", False),
+        "no_subject_heads": getattr(args, "no_subject_heads", False),
+        "head_reg_weight": getattr(args, "head_reg_weight", 0.0),
+        "init_from": getattr(args, "init_from", None),
     }
     print(json.dumps({"setup": setup}, indent=2))
 
@@ -782,12 +843,12 @@ def main() -> None:
             batch_data = _batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
             subject_id = batch_data.get("subject_id", None)
-            kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+            kwargs = {"subject_id": subject_id} if getattr(model, "subject_embed", None) is not None else {}
             
             if args.dual_head:
                 from mindseye.models.eeg_encoder import clip_contrastive_loss
                 import torch.nn.functional as F
-                pred, pred_norm = model(batch_data["eeg"], return_norm=True)
+                pred, pred_norm = model(batch_data["eeg"], return_norm=True, **kwargs)
                 
                 # Primary contrastive loss on decode_unit target space
                 loss = clip_contrastive_loss(pred, batch_data["target"], temperature=args.temperature)
@@ -839,6 +900,13 @@ def main() -> None:
                     # Mean over active tasks — prevents loss magnitude from scaling with task count
                     probe_loss = torch.stack(task_losses).mean()
                     loss = loss + probe_loss
+
+            # Head regularization: penalize subject heads diverging from shared head
+            head_reg_weight = getattr(args, "head_reg_weight", 0.0)
+            if head_reg_weight > 0 and hasattr(model, "compute_head_reg"):
+                head_reg = model.compute_head_reg()
+                if head_reg.requires_grad or head_reg.item() != 0.0:
+                    loss = loss + head_reg_weight * head_reg.to(device)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

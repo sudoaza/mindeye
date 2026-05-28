@@ -158,6 +158,28 @@ def main() -> None:
         with open(config_json_path, "r") as f:
             train_config = json.load(f)
             
+    # Load subject_to_id from saved config (authoritative). Fall back to auto-detect.
+    saved_subject_to_id = train_config.get("subject_to_id") or setup.get("subject_to_id", None)
+    if saved_subject_to_id:
+        num_subjects = len(saved_subject_to_id)
+        subject_list = list(saved_subject_to_id.keys())
+        print(f"[SubjectMap] Loaded from config: {saved_subject_to_id}")
+    else:
+        # Legacy fallback: derive from subjects_loaded
+        num_subjects = len(train_config.get("subjects_loaded") or setup.get("subjects_loaded", [1]))
+        subject_list = train_config.get("subjects_loaded") or setup.get("subjects_loaded", None)
+        print(f"[SubjectMap] No saved mapping, falling back to subjects_loaded len={num_subjects}")
+
+    no_film = train_config.get("no_film") or setup.get("no_film", False)
+    no_subject_heads = train_config.get("no_subject_heads") or setup.get("no_subject_heads", False)
+    dual_head = train_config.get("dual_head") or setup.get("dual_head", False)
+    # Pre-adapter checkpoints don't have adapter keys — load cleanly by disabling adapters.
+    if saved_subject_to_id is None:
+        num_subjects = 1
+        no_film = True
+        no_subject_heads = True
+        print("[SubjectMap] Legacy checkpoint: forcing num_subjects=1, no_film=True, no_subject_heads=True")
+
     metadata_csv = args.metadata or train_config.get("metadata") or setup.get("metadata")
     epochs_dir = args.epochs_dir or train_config.get("epochs_dir") or setup.get("epochs_dir")
     
@@ -179,6 +201,7 @@ def main() -> None:
             target_space=train_config.get("target_space") or setup.get("target_space", "common"),
             add_event_marker=train_config.get("add_event_marker", setup.get("add_event_marker", False)),
             augment_eeg=False,
+            subject_list=subject_list,
         )
     )
     
@@ -202,7 +225,6 @@ def main() -> None:
     model_type = setup.get("model") or train_config.get("model", "cnn")
     n_channels, n_times = dataset.eeg_shape
     
-    print(f"Recreating encoder model architecture: '{model_type}'...")
     if model_type in {"spatial_temporal", "spatial_temporal_small"}:
         from mindseye.models.spatial_temporal_encoder import build_spatial_temporal_encoder
         preset = "small" if model_type == "spatial_temporal_small" else "medium"
@@ -219,10 +241,11 @@ def main() -> None:
             n_channels=n_channels,
             embedding_dim=dataset.embedding_dim,
             ch_names=getattr(dataset, "ch_names", None),
+            num_subjects=num_subjects,
             **overrides,
         ).to(device)
     elif model_type in {"temporal_attn", "temporal_attn_small"}:
-        from mindseye.models.eeg_encoder import TemporalAttnEncoder
+        from mindseye.models.eeg_encoder import TemporalAttnEncoder, DualHeadTemporalAttnEncoder
         hidden_dim = train_config.get("hidden_dim")
         n_layers = train_config.get("n_layers")
         n_heads = train_config.get("n_heads")
@@ -237,15 +260,32 @@ def main() -> None:
             n_layers = n_layers or 4
             n_heads = n_heads or 8
             dropout = 0.2 if dropout is None else dropout
-        model = TemporalAttnEncoder(
-            n_channels=n_channels,
-            embedding_dim=dataset.embedding_dim,
-            hidden_dim=hidden_dim,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            dropout=dropout,
-            stem_dropout1d=train_config.get("stem_dropout1d", 0.15),
-        ).to(device)
+        if dual_head:
+            model = DualHeadTemporalAttnEncoder(
+                n_channels=n_channels,
+                embedding_dim=dataset.embedding_dim,
+                hidden_dim=hidden_dim,
+                n_layers=n_layers,
+                n_heads=n_heads,
+                dropout=dropout,
+                stem_dropout1d=train_config.get("stem_dropout1d", 0.15),
+                num_subjects=num_subjects,
+                no_film=no_film,
+                no_subject_heads=no_subject_heads,
+            ).to(device)
+        else:
+            model = TemporalAttnEncoder(
+                n_channels=n_channels,
+                embedding_dim=dataset.embedding_dim,
+                hidden_dim=hidden_dim,
+                n_layers=n_layers,
+                n_heads=n_heads,
+                dropout=dropout,
+                stem_dropout1d=train_config.get("stem_dropout1d", 0.15),
+                num_subjects=num_subjects,
+                no_film=no_film,
+                no_subject_heads=no_subject_heads,
+            ).to(device)
     else:
         from mindseye.models.eeg_encoder import EEGClipEncoder
         hidden_dim = train_config.get("hidden_dim") or 256
@@ -312,6 +352,7 @@ def main() -> None:
     print("Computing predicted EEG embeddings...")
     preds = []
     ground_truth_ids = []
+    val_subjects = []
     predicted_attributes = []
     
     with torch.no_grad():
@@ -319,8 +360,12 @@ def main() -> None:
             eeg = batch["eeg"].to(device).float()
             subject_id = batch.get("subject_id", None)
             if subject_id is not None:
-                subject_id = subject_id.to(device)
-            kwargs = {"subject_id": subject_id} if "spatial_temporal" in type(model).__name__.lower() or "spatialtemporal" in type(model).__name__.lower() else {}
+                subject_id_dev = subject_id.to(device)
+                val_subjects.extend(subject_id.cpu().numpy().tolist())
+            else:
+                subject_id_dev = None
+                val_subjects.extend([0] * len(batch["image_id"]))
+            kwargs = {"subject_id": subject_id_dev} if getattr(model, "subject_embed", None) is not None else {}
             pred = model(eeg, **kwargs)
             if isinstance(pred, tuple):
                 pred = pred[0]
@@ -527,10 +572,68 @@ def main() -> None:
         print(f"  {a:<20}: {attr_top1[a]:.4f}")
     print("====================================================")
     
+    # --- Per-subject breakdown ---
+    val_subjects_np = np.array(val_subjects)
+    unique_subj_ids = sorted(set(val_subjects_np.tolist()))
+    id_to_subj = {v: k for k, v in (saved_subject_to_id or {}).items()}
+    
+    per_subject_results = {}
+    if len(unique_subj_ids) > 1:
+        print("\n" + "="*80)
+        print("PER-SUBJECT RETRIEVAL BREAKDOWN")
+        print("="*80)
+        for sid in unique_subj_ids:
+            mask = (val_subjects_np == sid)
+            subj_name = id_to_subj.get(sid, f"sub-{sid}")
+            n_subj = int(mask.sum())
+            if n_subj == 0:
+                continue
+                
+            subj_clip_sims = clip_similarities[mask]
+            subj_top1_sim = subj_clip_sims[:, 0].mean()
+            subj_top5_sim = subj_clip_sims[:, :5].mean(axis=1).mean()
+            subj_top10_sim = subj_clip_sims[:, :10].mean(axis=1).mean() if args.top_k >= 10 else 0.0
+            
+            subj_overall_top1_match = []
+            subj_overall_top5_match = []
+            subj_overall_top10_match = []
+            
+            for attr in ALL_EVAL_ATTRS:
+                matches = np.array(attribute_matches[attr])[mask]
+                subj_overall_top1_match.append(matches[:, 0])
+                subj_overall_top5_match.append(matches[:, :5].mean(axis=1))
+                if args.top_k >= 10:
+                    subj_overall_top10_match.append(matches[:, :10].mean(axis=1))
+                    
+            subj_mean_top1_attr = np.mean(subj_overall_top1_match) if subj_overall_top1_match else 0.0
+            subj_mean_top5_attr = np.mean(subj_overall_top5_match) if subj_overall_top5_match else 0.0
+            subj_mean_top10_attr = np.mean(subj_overall_top10_match) if (args.top_k >= 10 and subj_overall_top10_match) else 0.0
+            
+            print(f"  {subj_name} | n={n_subj}")
+            print(f"    CLIP Cosine: Top-1={subj_top1_sim:.5f}, Top-5={subj_top5_sim:.5f}, Top-10={subj_top10_sim:.5f}")
+            print(f"    Attr Agree:  Top-1={subj_mean_top1_attr:.2%}, Top-5={subj_mean_top5_attr:.2%}, Top-10={subj_mean_top10_attr:.2%}")
+            
+            per_subject_results[subj_name] = {
+                "n": n_subj,
+                "clip_similarity": {
+                    "top1": float(subj_top1_sim),
+                    "top5": float(subj_top5_sim),
+                    "top10": float(subj_top10_sim)
+                },
+                "attribute_agreement": {
+                    "top1_mean": float(subj_mean_top1_attr),
+                    "top5_mean": float(subj_mean_top5_attr),
+                    "top10_mean": float(subj_mean_top10_attr)
+                }
+            }
+        print("="*80)
+        
     # Save JSON report
     report = {
         "checkpoint": str(args.checkpoint),
         "metrics": summary_metrics,
+        "per_subject": per_subject_results,
+        "subject_to_id": saved_subject_to_id or {},
         "trials": results
     }
     

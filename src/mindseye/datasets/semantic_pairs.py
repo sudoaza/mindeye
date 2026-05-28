@@ -15,7 +15,7 @@ from mindseye.models.common_probe import CommonProbeModel, ATTRIBUTE_SCHEMAS, IG
 TargetMode = Literal["real", "shuffled", "random", "sameclass"]
 InputDomain = Literal["zuna", "raw", "resample"]
 WindowMode = Literal["crop", "full5s", "full5s_backaligned"]
-TargetSpace = Literal["image", "semantic", "common", "label", "decode_raw", "decode_unit", "decode_norm"]
+TargetSpace = Literal["image", "semantic", "common", "label", "decode_raw", "decode_unit", "decode_norm", "rae_unit"]
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,7 @@ class SemanticPairConfig:
     input_domain: InputDomain = "zuna"
     window_mode: WindowMode = "crop"
     target_space: TargetSpace = "common"
+    target_key: str | None = None
     epochs_dir_raw: str | Path | None = None
     epochs_dir_resample: str | Path | None = None
     shuffle_seed: int = 42
@@ -41,6 +42,7 @@ class SemanticPairConfig:
     aug_time_mask: int = 24
     aug_time_jitter: int = 8
     is_calibration: bool = False
+    subject_list: list[str] | None = None
 
 
 
@@ -117,9 +119,9 @@ class ZunaClipPairDataset(Dataset):
         # Use first valid epochs_dir as default for backwards compatibility
         self.epochs_dir = valid_ep_dirs[0] if valid_ep_dirs else Path(".")
 
-        if config.target_space not in ("common", "decode_unit"):
+        if config.target_space not in ("common", "decode_unit", "rae_unit"):
             import warnings
-            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common' and 'decode_unit' are canonical.")
+            warnings.warn(f"Non-canonical target_space '{config.target_space}' specified. Only 'common', 'decode_unit', and 'rae_unit' are canonical.")
 
         table = torch.load(self.common_embeddings_pt, map_location="cpu")
         
@@ -129,16 +131,22 @@ class ZunaClipPairDataset(Dataset):
             with open(config.vlm_attributes_json, "r") as f:
                 self.vlm_attributes = json.load(f)
         
-        target_key = f"image_id_to_{config.target_space}"
+        target_key = getattr(config, "target_key", None) or f"image_id_to_{config.target_space}"
         if target_key not in table:
             if "image_id_to_decode_unit" in table:
                 target_key = "image_id_to_decode_unit"
             else:
-                raise ValueError(f"Target space '{config.target_space}' not found in {self.common_embeddings_pt}")
+                raise ValueError(f"Target key/space '{target_key}' not found in {self.common_embeddings_pt}")
             
         self.image_id_to_target = table[target_key]
-        self.image_id_to_decode_raw = table.get("image_id_to_decode_raw", None)
-        self.image_id_to_decode_norm = table.get("image_id_to_decode_norm", None)
+        
+        if config.target_space == "rae_unit" or target_key == "image_id_to_rae_unit":
+            # For RAE, do not load tokens/norms as target_raw/norm to avoid activating raw MSE regression
+            self.image_id_to_decode_raw = None
+            self.image_id_to_decode_norm = None
+        else:
+            self.image_id_to_decode_raw = table.get("image_id_to_decode_raw", None)
+            self.image_id_to_decode_norm = table.get("image_id_to_decode_norm", None)
         
         if "class" in self.metadata.columns:
             unique_classes = sorted(self.metadata["class"].dropna().unique().tolist())
@@ -162,8 +170,29 @@ class ZunaClipPairDataset(Dataset):
                   f"({len(self.metadata)} remaining)")
 
         if "subject" in self.metadata.columns:
-            self.unique_subjects = sorted(self.metadata["subject"].astype(str).unique().tolist())
-            self.subject_to_id = {sub: i for i, sub in enumerate(self.unique_subjects)}
+            if getattr(config, "subject_list", None) is not None:
+                self.unique_subjects = list(config.subject_list)
+                self.subject_to_id = {sub: i for i, sub in enumerate(self.unique_subjects)}
+            else:
+                raw_subs = self.metadata["subject"].astype(str).unique().tolist()
+                import re
+                digit_subs = []
+                for sub in raw_subs:
+                    match = re.search(r'\d+', sub)
+                    if match:
+                        digit_subs.append((int(match.group(0)), sub))
+                    else:
+                        digit_subs.append((0, sub))
+                digit_subs.sort(key=lambda x: x[0] if x[0] > 0 else x[1])
+                
+                digits = [x[0] for x in digit_subs]
+                if len(digits) > 0 and max(digits) <= 12 and len(set(digits)) == len(digits) and all(d > 0 for d in digits):
+                    self.subject_to_id = {sub: d - 1 for d, sub in digit_subs}
+                    max_id = max(d - 1 for d, sub in digit_subs)
+                    self.unique_subjects = [f"sub-{i+1}" for i in range(max_id + 1)]
+                else:
+                    self.unique_subjects = sorted(raw_subs)
+                    self.subject_to_id = {sub: i for i, sub in enumerate(self.unique_subjects)}
         else:
             self.unique_subjects = ["unknown"]
             self.subject_to_id = {"unknown": 0}

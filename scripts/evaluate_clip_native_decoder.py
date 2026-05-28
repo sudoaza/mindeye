@@ -54,6 +54,22 @@ def main():
         
     print(f"Loading EEG Encoder from {run_dir}...")
     model_name = config.get("model", "cnn")
+    # Load subject_to_id from saved config (authoritative). Fall back to subjects_loaded length.
+    saved_subject_to_id = config.get("subject_to_id", None)
+    if saved_subject_to_id:
+        num_subjects = len(saved_subject_to_id)
+        subject_list = list(saved_subject_to_id.keys())
+    else:
+        num_subjects = len(config.get("subjects_loaded", [1]))
+        subject_list = config.get("subjects_loaded", None)
+    no_film = config.get("no_film", False)
+    no_subject_heads = config.get("no_subject_heads", False)
+    # Pre-adapter checkpoints don't have adapter keys — load cleanly by disabling adapters.
+    if saved_subject_to_id is None:
+        num_subjects = 1
+        no_film = True
+        no_subject_heads = True
+        print("[SubjectMap] Legacy checkpoint: forcing num_subjects=1, no_film=True, no_subject_heads=True")
     if model_name in {"temporal_attn", "temporal_attn_small"}:
         if config.get("dual_head", False):
             model = DualHeadTemporalAttnEncoder(
@@ -64,6 +80,9 @@ def main():
                 n_heads=config.get("n_heads", 4 if model_name == "temporal_attn_small" else 8),
                 dropout=config["dropout"],
                 stem_dropout1d=config["stem_dropout1d"],
+                num_subjects=num_subjects,
+                no_film=no_film,
+                no_subject_heads=no_subject_heads,
             ).to(device)
         else:
             model = TemporalAttnEncoder(
@@ -74,6 +93,9 @@ def main():
                 n_heads=config.get("n_heads", 4 if model_name == "temporal_attn_small" else 8),
                 dropout=config["dropout"],
                 stem_dropout1d=config["stem_dropout1d"],
+                num_subjects=num_subjects,
+                no_film=no_film,
+                no_subject_heads=no_subject_heads,
             ).to(device)
     else:
         model = EEGClipEncoder(
@@ -98,7 +120,8 @@ def main():
         window_mode="tight1s",
         target_mode="real",
         input_domain="zuna",
-        add_event_marker=root_config.get("add_event_marker", False)
+        add_event_marker=root_config.get("add_event_marker", False),
+        subject_list=config.get("subjects_loaded", None),
     )
     dataset = ZunaClipPairDataset(dataset_config)
     
@@ -124,29 +147,36 @@ def main():
     batch_eeg = []
     batch_target_raw = []
     batch_image_ids = []
+    batch_subjects = []
     for idx in sample_indices:
         item = dataset[idx]
         batch_eeg.append(item["eeg"])
         # For oracle unCLIP generation, we must use raw embeddings
         batch_target_raw.append(item.get("target_raw", item["target"]))
         batch_image_ids.append(item.get("image_id", ""))
+        batch_subjects.append(item["subject_id"])
 
     batch_eeg = torch.stack(batch_eeg).to(device)
     oracle_embeds = torch.stack(batch_target_raw).to(device)
+    batch_subjects = torch.tensor(batch_subjects, device=device).long()
     
     print("Loading ClipNativeDecoderBackend...")
     backend = ClipNativeDecoderBackend(device=device)
     
     with torch.inference_mode():
+        kwargs = {"subject_id": batch_subjects} if getattr(model, "subject_embed", None) is not None else {}
+        shuffled_subjects = torch.roll(batch_subjects, shifts=1, dims=0)
+        shuffled_kwargs = {"subject_id": shuffled_subjects} if getattr(model, "subject_embed", None) is not None else {}
+        
         # Predict unit embeddings from EEG
         if config.get("dual_head", False):
-            pred_unit, _ = model(batch_eeg, return_norm=True)
+            pred_unit, _ = model(batch_eeg, return_norm=True, **kwargs)
             shuffled_eeg = torch.roll(batch_eeg, shifts=1, dims=0)
-            shuff_unit, _ = model(shuffled_eeg, return_norm=True)
+            shuff_unit, _ = model(shuffled_eeg, return_norm=True, **shuffled_kwargs)
         else:
-            pred_unit = model(batch_eeg)
+            pred_unit = model(batch_eeg, **kwargs)
             shuffled_eeg = torch.roll(batch_eeg, shifts=1, dims=0)
-            shuff_unit = model(shuffled_eeg)
+            shuff_unit = model(shuffled_eeg, **shuffled_kwargs)
             
         # Retrieve target_raw using soft kNN
         real_eeg_embeds = retrieve_soft_knn(pred_unit, train_decode_unit, train_target_raw, k=args.k, temp=args.temperature)
