@@ -381,7 +381,8 @@ class ZunaClipPairDataset(Dataset):
     def audit_target_banks(self) -> dict[str, float]:
         """Summarize whether target bank properties are sane."""
         image_ids = sorted(set(self.metadata["image_id"].astype(str).tolist()))
-        target = torch.stack([F.normalize(self.image_id_to_target[i].float(), dim=-1) for i in image_ids])
+        # Flatten to [N, D] before normalizing (rae_code targets are spatial [C,H,W])
+        target = torch.stack([F.normalize(self.image_id_to_target[i].float().reshape(-1), dim=-1) for i in image_ids])
 
         # Optimize memory usage using matrix multiplication
         cos = torch.mm(target, target.t())
