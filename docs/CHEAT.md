@@ -307,7 +307,23 @@ python scripts/build_rae_bottleneck_codes.py \
 **Architecture summary:**
 | Arch | Code shape | Values | Notes |
 |---|---|---|---|
-| `spatial_768x4x4` | [768,4,4] | 12288 | No params — reconstruction upper bound |
-| `conv_256x4x4` | [256,4,4] | 4096 | Primary target for EEG regression |
-| `conv_128x4x4` | [128,4,4] | 2048 | Leaner — test compression tolerance |
+| `spatial_768x4x4` | [768,4,4] | 12,288 | Parameter-free compressor; learned expander — reconstruction upper bound |
+| `conv_256x4x4` | [256,4,4] | 4,096 | **Primary EEG target** |
+| `conv_128x4x4` | [128,4,4] | 2,048 | Leaner — compression tolerance test |
+| `conv_256x8x8` | [256,8,8] | 16,384 | Fallback if 4x4 fails visually |
+
+**Gate criteria (aspirational — compare all archs before deciding):**
+- `mean_token_cosine > 0.90` — bottleneck faithfully reconstructs token channel geometry
+- `pct_collapsed_channels < 5%` — relative std_ratio > 0.2 per channel (code_std / tok_std)
+- These are aspirational targets, not hard fails. RAE latents are high-dimensional; compare across architectures before deciding.
+- If `conv_256x4x4` fails visually, try `conv_256x8x8` before falling back to `spatial_768x4x4`.
+
+**Evaluation visual comparison (3-way):**
+- Target image
+- Full-token RAE oracle (image → full tokens → decode)
+- Bottleneck reconstruction (image → compress → expand → decode)
+
+This 3-way comparison is the ground truth for selecting the bottleneck. Run all three architectures before extracting codes.
+
+**Code extraction** — only run for the **selected** architecture (not mandatory for all three).
 

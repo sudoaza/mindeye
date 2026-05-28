@@ -125,11 +125,15 @@ def oracle_reconstruction_check(
     n: int,
     device: torch.device,
 ) -> dict:
-    """Compress → expand → compute token-level cosine vs original.
+    """Compress → expand → compute token-level reconstruction quality vs original.
 
-    This measures how well the bottleneck reconstructs RAE tokens.
-    For the image oracle (compress→expand→decode→re-encode), use the separate
-    evaluate script to avoid loading the full RAE backend here.
+    Measures:
+    - Channel-vector cosine similarity at each spatial site (F.cosine_similarity dim=1)
+    - Token-level MSE
+    - Relative std ratio: per-channel code_std / tok_std (collapse detection)
+
+    For the image oracle (compress→expand→decode image→re-encode), use a separate
+    evaluate_rae_bottleneck.py script that loads the RAE decoder backend.
 
     Args:
         model: trained bottleneck model
@@ -138,37 +142,42 @@ def oracle_reconstruction_check(
         device: torch device
 
     Returns:
-        dict with mean_token_cosine, mean_token_mse, pct_collapsed_channels
+        dict with mean_token_cosine, mean_token_mse, mean_std_ratio, pct_collapsed_channels
     """
     model.eval()
     indices = torch.randperm(len(val_tokens))[:n].tolist()
-    sample = val_tokens[indices].to(device)
+    sample = val_tokens[indices].to(device).float()
 
     with torch.no_grad():
         out = model(sample)
 
     expanded = out["expanded"]  # [n, 768, 16, 16]
-    original = sample.float()
+    original = sample
 
-    # Per-position cosine similarity
-    B, C, H, W = expanded.shape
-    e_flat = expanded.permute(0, 2, 3, 1).reshape(-1, C)
-    o_flat = original.permute(0, 2, 3, 1).reshape(-1, C)
-    cos_sim = F.cosine_similarity(e_flat, o_flat, dim=-1)
-    mean_token_cosine = cos_sim.mean().item()
+    # Channel-vector cosine at each spatial site: F.cosine_similarity(dim=1) → [B, H, W]
+    cos_spatial = F.cosine_similarity(expanded, original, dim=1)  # [n, 16, 16]
+    mean_token_cosine = cos_spatial.mean().item()
 
     mean_token_mse = F.mse_loss(expanded, original).item()
 
-    # Collapsed channels: std < 0.05 across batch*spatial
+    # Relative std collapse detection
     code = out["code"]
-    B2, Cc, Hc, Wc = code.shape
-    flat = code.reshape(B2, Cc, -1)
-    per_channel_std = flat.std(dim=[0, 2])
-    pct_collapsed = (per_channel_std < 0.05).float().mean().item() * 100.0
+    B, Cc, Hc, Wc = code.shape
+    code_flat = code.reshape(B, Cc, -1)                  # [B, Cc, Hc*Wc]
+    code_std = code_flat.std(dim=[0, 2])                  # [Cc]
+
+    tok_flat = original.reshape(B, original.shape[1], -1) # [B, 768, 256]
+    tok_std = tok_flat.std(dim=[0, 2]).mean()              # scalar reference
+
+    eps = 1e-6
+    std_ratio = code_std / (tok_std + eps)                 # [Cc]  >1 ok, <0.2 = collapsed
+    mean_std_ratio = std_ratio.mean().item()
+    pct_collapsed = (std_ratio < 0.2).float().mean().item() * 100.0
 
     return {
         "mean_token_cosine": mean_token_cosine,
         "mean_token_mse": mean_token_mse,
+        "mean_std_ratio": mean_std_ratio,
         "pct_collapsed_channels": pct_collapsed,
     }
 
@@ -200,13 +209,13 @@ def train(args: argparse.Namespace) -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
-    # For spatial_768x4x4 (no learnable params) skip optimizer
     has_params = n_params > 0
     if has_params:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.1)
     else:
-        print("[INFO] spatial_768x4x4 has no learnable params — skipping optimizer.")
+        # Should not happen with updated architectures (spatial_768x4x4 has a learned expander now)
+        print("[INFO] No learnable params found — skipping optimizer (eval only).")
 
     # 3. CSV log
     log_fields = ["epoch", "train_loss", "train_mse", "train_cos", "train_std", "val_loss", "val_mse", "val_cos", "val_std"]
@@ -320,17 +329,19 @@ def train(args: argparse.Namespace) -> None:
     print("\n--- Oracle Token Reconstruction Check ---")
     val_tokens_all = all_tokens[val_idx]
     oracle = oracle_reconstruction_check(model, val_tokens_all, n=args.oracle_n, device=device)
-    print(f"  mean_token_cosine:      {oracle['mean_token_cosine']:.4f}  (gate: > 0.90)")
+    print(f"  mean_token_cosine:      {oracle['mean_token_cosine']:.4f}  (aspirational target: > 0.90)")
     print(f"  mean_token_mse:         {oracle['mean_token_mse']:.6f}")
-    print(f"  pct_collapsed_channels: {oracle['pct_collapsed_channels']:.2f}%  (gate: < 5%)")
+    print(f"  mean_std_ratio:         {oracle['mean_std_ratio']:.4f}  (code_std / tok_std; > 0.2 per channel = healthy)")
+    print(f"  pct_collapsed_channels: {oracle['pct_collapsed_channels']:.2f}%  (aspirational target: < 5%)")
 
-    # Gate evaluation
+    # Aspirational gate evaluation (informational — not hard fail)
     gate_token_cos = oracle["mean_token_cosine"] > 0.90
     gate_collapse = oracle["pct_collapsed_channels"] < 5.0
     gate_pass = gate_token_cos and gate_collapse
-    print(f"\n  Gate token_cosine > 0.90:    {'PASS' if gate_token_cos else 'FAIL'}")
-    print(f"  Gate collapsed < 5%:         {'PASS' if gate_collapse else 'FAIL'}")
-    print(f"  Overall gate:                {'PASS ✓' if gate_pass else 'FAIL ✗'}")
+    print(f"\n  [Aspirational] token_cosine > 0.90:   {'MET' if gate_token_cos else 'not yet met'}")
+    print(f"  [Aspirational] collapsed < 5%:        {'MET' if gate_collapse else 'not yet met'}")
+    print(f"  Both targets met:                     {'YES ✓' if gate_pass else 'NO — review metrics and decide'}")
+    print(f"  NOTE: Thresholds are aspirational. Compare across architectures before deciding.")
 
     # 6. Save metrics
     code_sz = code_shape(args.arch)
@@ -344,10 +355,12 @@ def train(args: argparse.Namespace) -> None:
         "best_val_token_cosine": best_val_cos if has_params else None,
         "oracle_token_cosine": oracle["mean_token_cosine"],
         "oracle_token_mse": oracle["mean_token_mse"],
+        "oracle_mean_std_ratio": oracle["mean_std_ratio"],
         "oracle_pct_collapsed_channels": oracle["pct_collapsed_channels"],
-        "gate_token_cosine_pass": gate_token_cos,
-        "gate_collapse_pass": gate_collapse,
-        "gate_overall_pass": gate_pass,
+        # Aspirational targets — compare across archs before deciding
+        "aspirational_token_cosine_met": gate_token_cos,
+        "aspirational_collapse_met": gate_collapse,
+        "aspirational_both_met": gate_pass,
     }
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
