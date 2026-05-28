@@ -378,17 +378,23 @@ class ZunaClipPairDataset(Dataset):
 
         return x
 
-    def audit_target_banks(self) -> dict[str, float]:
-        """Summarize whether target bank properties are sane."""
-        image_ids = sorted(set(self.metadata["image_id"].astype(str).tolist()))
-        # Flatten to [N, D] before normalizing (rae_code targets are spatial [C,H,W])
-        target = torch.stack([F.normalize(self.image_id_to_target[i].float().reshape(-1), dim=-1) for i in image_ids])
+    def audit_target_banks(self, max_samples: int = 2000, seed: int = 42) -> dict[str, float]:
+        """Summarize target bank diversity using a random sample.
 
-        # Optimize memory usage using matrix multiplication
+        Caps at ``max_samples`` images to keep pairwise cosine O(max_samples^2 x D)
+        rather than O(N^2 x D), which hangs for high-dim codes (e.g. 12288-dim 4x4).
+        """
+        image_ids = sorted(set(self.metadata["image_id"].astype(str).tolist()))
+        if len(image_ids) > max_samples:
+            rng = torch.Generator().manual_seed(seed)
+            perm = torch.randperm(len(image_ids), generator=rng).tolist()
+            image_ids = [image_ids[i] for i in perm[:max_samples]]
+        # Flatten to [N, D] before normalizing (rae_code targets are spatial [C,H,W])
+        target = torch.stack(
+            [F.normalize(self.image_id_to_target[i].float().reshape(-1), dim=-1) for i in image_ids]
+        )
         cos = torch.mm(target, target.t())
-        # Exclude diagonal
         cos_off = cos[~torch.eye(len(image_ids), dtype=torch.bool, device=cos.device)]
-        
         return {
             "target_bank_n": float(len(image_ids)),
             "target_off_diag_mean": float(cos_off.mean().item()),
