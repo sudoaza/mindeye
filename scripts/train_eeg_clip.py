@@ -949,7 +949,7 @@ def main() -> None:
         import torch.nn.functional as _F
         all_ids = sorted(dataset.image_id_to_target.keys())
         full_bank_tensor = _torch.stack([
-            _F.normalize(dataset.image_id_to_target[i].float(), dim=-1) for i in all_ids
+            _F.normalize(dataset.image_id_to_target[i].float().reshape(-1), dim=-1) for i in all_ids
         ])
         print(f"[FullBank] Built retrieval bank: {full_bank_tensor.shape[0]} embeddings")
 
