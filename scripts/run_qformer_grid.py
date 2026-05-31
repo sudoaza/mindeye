@@ -62,22 +62,49 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device")
     parser.add_argument("--out-dir", type=str, default="outputs/qformer_aligned_grid", help="Parent outputs directory")
+    # Explicit run splits (overrides smoke-test defaults)
+    parser.add_argument("--train-runs", type=str, default=None, help="Train run range, e.g. '1-24'")
+    parser.add_argument("--val-runs", type=str, default=None, help="Val run range, e.g. '25-28'")
+    parser.add_argument("--test-runs", type=str, default=None, help="Test run range, e.g. '29-32'")
+    # Smoke-test mode: CLIP-only, 8 runs, fixed splits, fast epochs
+    parser.add_argument("--smoke-test", action="store_true", default=False,
+                        help="Smoke test: CLIP-only, 8 runs (1-6 train, 7-8 val), 25 epochs, batch 32")
+    # Temporal windowing
+    parser.add_argument("--temporal-window", action="store_true", default=True,
+                        help="Enable temporal windowing in train script (default: on)")
+    parser.add_argument("--no-temporal-window", action="store_false", dest="temporal_window")
     args = parser.parse_args()
     
+    # --- Smoke-test overrides ---
+    if args.smoke_test:
+        print("=== SMOKE TEST MODE: CLIP-only, runs 1-6 train / 7-8 val, 25 epochs ===")
+        epochs = args.epochs if args.epochs != 40 else 25
+        batch_size = args.batch_size if args.batch_size != 64 else 32
+        train_runs = args.train_runs or "1-6"
+        val_runs   = args.val_runs   or "7-8"
+        test_runs  = args.test_runs  or ""
+        targets = [("CLIP-Common-512", "CLIP-Common-512", args.clip_pt)]
+    else:
+        epochs = args.epochs
+        batch_size = args.batch_size
+        train_runs = args.train_runs
+        val_runs   = args.val_runs
+        test_runs  = args.test_runs
+        targets = [
+            ("CLIP-Common-512", "CLIP-Common-512", args.clip_pt),
+            ("DINO-Unit-768", "DINO-Unit-768", args.rae_pt),
+            ("DINO-PCA-256-Unit", "DINO-PCA-256-Unit", args.rae_pt),
+            ("DINO-PCA-128-Unit", "DINO-PCA-128-Unit", args.rae_pt)
+        ]
+
     # 12-run minimal grid configuration
     layers = ["post_mmd"]
-    targets = [
-        ("CLIP-Common-512", "CLIP-Common-512", args.clip_pt),
-        ("DINO-Unit-768", "DINO-Unit-768", args.rae_pt),
-        ("DINO-PCA-256-Unit", "DINO-PCA-256-Unit", args.rae_pt),
-        ("DINO-PCA-128-Unit", "DINO-PCA-128-Unit", args.rae_pt)
-    ]
     modes = ["real", "shuffled", "random"]
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     grid_dir = Path(args.out_dir) / f"grid_{timestamp}"
     grid_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"Starting stabilized QFormer minimal grid training...")
     print(f"Grid Output Root: {grid_dir}\n")
     
@@ -109,14 +136,26 @@ def main():
                     "--target-space", target_space,
                     "--target-mode", mode,
                     "--layer-name", layer,
-                    "--epochs", str(args.epochs),
+                    "--epochs", str(epochs),
                     "--patience", str(args.patience),
-                    "--batch-size", str(args.batch_size),
+                    "--batch-size", str(batch_size),
                     "--lr", str(args.lr),
                     "--device", args.device,
                     "--out-dir", str(grid_dir),
-                    "--slug", slug
+                    "--slug", slug,
                 ]
+                # Pass temporal window flag
+                if args.temporal_window:
+                    cmd.append("--temporal-window")
+                else:
+                    cmd.append("--no-temporal-window")
+                # Pass run splits if specified
+                if train_runs:
+                    cmd += ["--train-runs", train_runs]
+                if val_runs:
+                    cmd += ["--val-runs", val_runs]
+                if test_runs:
+                    cmd += ["--test-runs", test_runs]
                 
                 env = {**os.environ, "PYTHONPATH": "src"}
                 

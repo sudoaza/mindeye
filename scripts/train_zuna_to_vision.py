@@ -36,21 +36,58 @@ def variance_floor_loss(pred: torch.Tensor, target_std: torch.Tensor) -> torch.T
     pred_std = torch.sqrt(pred.var(dim=0) + 1e-6)
     return torch.mean(F.relu(target_std - pred_std))
 
+
+def window_latent_tokens(
+    latent: torch.Tensor,
+    onset_tc: int,
+    n_channels: int = 62,
+    tc: int = 40,
+    pre_frames: int = 4,
+    post_frames: int = 12,
+) -> torch.Tensor:
+    """
+    Slice a ZUNA post_mmd latent to a temporal window around the stimulus onset.
+    Tokens are laid out channel-major: [ch0_t0, ch0_t1, ..., ch0_t39, ch1_t0, ...].
+    Args:
+        latent:     [n_channels*tc, D]  full epoch tokens
+        onset_tc:   coarse-time index of event onset (e.g. 24 for anchor 768@256Hz)
+        pre_frames: frames before onset (0.5s = 4 frames at 125ms/frame)
+        post_frames: frames after onset (1.5s = 12 frames)
+    Returns:
+        [n_channels * (pre_frames + post_frames), D]
+    """
+    t_start = max(0, onset_tc - pre_frames)
+    t_end   = min(tc, onset_tc + post_frames)
+    # reshape to [n_channels, tc, D], select time window, flatten back
+    spatial = latent.view(n_channels, tc, latent.shape[-1])   # [C, T, D]
+    windowed = spatial[:, t_start:t_end, :]                   # [C, W, D]
+    return windowed.reshape(-1, latent.shape[-1])              # [C*W, D]
+
 class ZunaLatentTargetDataset(Dataset):
     """
     Dataset that loads cached ZUNA latents and maps them to target embeddings (CLIP/DINO).
     Supports baseline control target modes: real, shuffled, and random.
     """
     def __init__(
-        self, 
-        latents_pt_path: str, 
-        targets_pt_path: str, 
-        target_space: str, 
-        layer_name: str, 
-        target_mode: str = "real", 
-        shuffle_seed: int = 42, 
-        subject_list: list = None
+        self,
+        latents_pt_path: str,
+        targets_pt_path: str,
+        target_space: str,
+        layer_name: str,
+        target_mode: str = "real",
+        shuffle_seed: int = 42,
+        subject_list: list = None,
+        use_temporal_window: bool = True,
+        n_channels: int = 62,
+        tc: int = 40,
+        pre_frames: int = 4,
+        post_frames: int = 12,
     ):
+        self.use_temporal_window = use_temporal_window
+        self.n_channels = n_channels
+        self.tc = tc
+        self.pre_frames = pre_frames
+        self.post_frames = post_frames
         # Resolve cache dir and split paths
         if os.path.isdir(latents_pt_path):
             cache_dir = latents_pt_path
@@ -124,18 +161,32 @@ class ZunaLatentTargetDataset(Dataset):
         # Expose dimensions
         self.layer_name = layer_name
         if self.use_split_files:
-            first_latent = self.layer_dict[self.valid_records[0]["sample_id"]]
+            first_latent = self.layer_dict[self.valid_records[0]["sample_id"]].float()
         else:
-            first_latent = self.valid_records[0][layer_name]
+            first_latent = self.valid_records[0][layer_name].float()
         self.latent_dim = first_latent.shape[-1]
         first_target = self.image_id_to_target[self.valid_records[0]["image_id"]]
-        
+
         if self.pca_dims is not None:
             self.target_dim = self.pca_dims
         else:
             self.target_dim = first_target.shape[-1]
-            
-        print(f"Latent dim: {self.latent_dim} | Target dim: {self.target_dim}")
+
+        # Compute latent_seq_len after optional temporal windowing
+        if self.use_temporal_window:
+            onset_tc = self.valid_records[0].get("onset_tc", 24)
+            first_windowed = window_latent_tokens(
+                first_latent, onset_tc, self.n_channels, self.tc,
+                self.pre_frames, self.post_frames
+            )
+            self.latent_seq_len = first_windowed.shape[0]
+        else:
+            self.latent_seq_len = first_latent.shape[0]
+
+        print(f"Latent dim: {self.latent_dim} | Latent seq: {self.latent_seq_len} | Target dim: {self.target_dim}")
+        if self.use_temporal_window:
+            print(f"Temporal window: onset_tc±{self.pre_frames}/{self.post_frames} frames "
+                  f"({self.pre_frames*125}ms pre / {self.post_frames*125}ms post)")
         
         self.target_mode = target_mode
         n = len(self.valid_records)
@@ -157,26 +208,39 @@ class ZunaLatentTargetDataset(Dataset):
     def __getitem__(self, idx):
         record = self.valid_records[idx]
         s_id = record["sample_id"]
-        
+
         if self.use_split_files:
             latent = self.layer_dict[s_id].float()
         else:
             latent = record[self.layer_name].float()
-        
+
+        # Apply temporal window (spatial reshape then time slice)
+        if self.use_temporal_window:
+            onset_tc = record.get("onset_tc", 24)
+            latent = window_latent_tokens(
+                latent, onset_tc, self.n_channels, self.tc,
+                self.pre_frames, self.post_frames
+            )
+
+        # The "true" target is always the real image embedding — used for eval
+        true_target = self.image_id_to_target[record["image_id"]].float()
+
+        # The training target may be shuffled/random — used only for loss
         if self.target_mode == "real":
-            target = self.image_id_to_target[record["image_id"]].float()
+            train_target = true_target
         elif self.target_mode == "shuffled":
             perm_idx = self.target_perm[idx]
             perm_record = self.valid_records[perm_idx]
-            target = self.image_id_to_target[perm_record["image_id"]].float()
+            train_target = self.image_id_to_target[perm_record["image_id"]].float()
         elif self.target_mode == "random":
-            target = self.random_targets[idx]
+            train_target = self.random_targets[idx]
         else:
             raise ValueError(f"Unknown target_mode: {self.target_mode}")
-            
+
         return {
             "latent": latent,
-            "target": target,
+            "target": train_target,       # fake target for loss (real = same as eval_target)
+            "eval_target": true_target,    # always the true image embedding for retrieval eval
             "subject_id": torch.tensor(record["subject_id"] - 1, dtype=torch.long),
             "run_id": record["run_id"],
             "image_id": record["image_id"],
@@ -226,17 +290,18 @@ def evaluate_model(model, loader, device):
     model.eval()
     all_preds = []
     all_targets = []
-    
+
     for batch in loader:
         latents = batch["latent"].to(device)
-        targets = batch["target"].to(device)
+        # Bug 2 fix: always eval against the true image target, never the shuffled/random one
+        targets = batch["eval_target"].to(device)
         subject_ids = batch["subject_id"].to(device)
-        
+
         preds = model(latents, subject_id=subject_ids)
-        
+
         all_preds.append(preds.cpu())
         all_targets.append(targets.cpu())
-        
+
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
     
@@ -297,14 +362,15 @@ def save_eval_metadata(model, loader, device, out_path):
     all_targets = []
     sample_ids = []
     image_ids = []
-    
+
     for batch in loader:
         latents = batch["latent"].to(device)
-        targets = batch["target"].to(device)
+        # Bug 2 fix: always rank against true image targets
+        targets = batch["eval_target"].to(device)
         subject_ids = batch["subject_id"].to(device)
-        
+
         preds = model(latents, subject_id=subject_ids)
-        
+
         all_preds.append(preds.cpu())
         all_targets.append(targets.cpu())
         sample_ids.extend(batch["sample_id"])
@@ -350,6 +416,13 @@ def main():
     parser.add_argument("--val-runs", type=str, default=None, help="Val run list/range, e.g. 25-28")
     parser.add_argument("--test-runs", type=str, default=None, help="Test run list/range, e.g. 29-32")
     parser.add_argument("--subjects", type=str, default=None, help="Comma-separated subject IDs (e.g. 'sub-01') to filter")
+
+    # Temporal windowing
+    parser.add_argument("--temporal-window", action="store_true", default=True,
+                        help="Slice post_mmd tokens to [-0.5s, +1.5s] window around event onset")
+    parser.add_argument("--no-temporal-window", action="store_false", dest="temporal_window")
+    parser.add_argument("--pre-frames", type=int, default=4, help="Frames before onset (125ms each, default 4=0.5s)")
+    parser.add_argument("--post-frames", type=int, default=12, help="Frames after onset (default 12=1.5s)")
     
     # QFormer architecture
     parser.add_argument("--num-query-tokens", type=int, default=32, help="Number of query tokens")
@@ -411,7 +484,10 @@ def main():
         layer_name=args.layer_name,
         target_mode=args.target_mode,
         shuffle_seed=args.seed,
-        subject_list=subject_list
+        subject_list=subject_list,
+        use_temporal_window=args.temporal_window,
+        pre_frames=args.pre_frames,
+        post_frames=args.post_frames,
     )
     
     # Explicit splits determination
@@ -620,12 +696,17 @@ def main():
         json.dump(summary, f, indent=2)
         
     print(f"\n✓ Training complete! Best Validation MRR (Norm): {best_mrr:.4f} at epoch {best_metrics['epoch']}.")
-    
-    # Load best checkpoint and save predictions/targets with full sample metadata
+
+    # Bug 1 fix: reload best checkpoint before saving eval predictions
+    best_ckpt = torch.load(run_dir / "checkpoint_best.pt", map_location=device)
+    model.load_state_dict(best_ckpt["model_state_dict"])
+    model.eval()
+    print(f"Reloaded best checkpoint (epoch {best_ckpt['epoch']}) for eval prediction saving.")
+
     save_eval_metadata(model, val_loader, device, run_dir / "val_eval_preds.pt")
     if len(test_dataset) > 0:
         save_eval_metadata(model, test_loader, device, run_dir / "test_eval_preds.pt")
-        
+
     print(f"Results saved in: {run_dir}")
 
 if __name__ == "__main__":

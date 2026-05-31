@@ -91,13 +91,14 @@ class ZunaToVisionQFormer(nn.Module):
         force_unit_output: bool = True,
     ):
         super().__init__()
+        self.d_in = d_in
         self.pooling_mode = pooling_mode
         self.normalize_output = normalize_output
         self.output_layernorm = output_layernorm
         self.force_unit_output = force_unit_output
         self.hidden_dim = hidden_dim
         self.num_subjects = num_subjects
-        
+
         # Input projection: maps ZUNA latents [B, N, d_in] -> [B, N, hidden_dim]
         self.input_proj = nn.Sequential(
             nn.Linear(d_in, hidden_dim),
@@ -161,8 +162,15 @@ class ZunaToVisionQFormer(nn.Module):
         Returns:
             [B, d_out] normalized target embedding
         """
+        # Bug 3 fix: assert input is [B, N, D]
+        assert zuna_latents.ndim == 3, (
+            f"Expected zuna_latents to be 3-D [B, N, D], got shape {tuple(zuna_latents.shape)}"
+        )
+        assert zuna_latents.shape[-1] == self.d_in, (
+            f"Expected latent dim={self.d_in}, got {zuna_latents.shape[-1]}"
+        )
         b = zuna_latents.shape[0]
-        
+
         # Project ZUNA latents to internal representation size
         kv = self.input_proj(zuna_latents)  # [B, N, hidden_dim]
         
