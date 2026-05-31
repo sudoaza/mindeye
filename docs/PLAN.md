@@ -326,16 +326,53 @@ Rationale: Suppress scale inflation using target-anchored site norm loss (`--los
 - [x] Results:
   - **Scale inflation resolved**: `pred_code_std` = 1.03 vs 0.93 target (ratio **1.10x** vs 3.31x in 18C-v2).
   - **No expansion gap**: Expanded token cosine EEG vs Shuffled shows **0.2922** vs **0.2922** (gap = **0.00000**, 95% CI `[-0.00004, 0.00004]`).
-  - **Conclusion**: Distribution alignment works, but the predicted EEG codes lack the high-fidelity features required to survive the frozen non-linear expansion mapping. A stronger mapping or capacity increase is required.
+  - **Conclusion**: Distribution alignment works, but the predicted EEG codes lack the high-fidelity features required to survive the frozen non-linear expansion mapping.
+
+### Phase 18D-control: Isolate Loss vs Norm Fix (Complete) ✅
+
+- [x] Fixed `normalize_output=False` + old `--loss spatial_cosine` (cosine + 0.25 MSE).
+- [x] Results: **88.3%** channel collapse, `spatial_cosine` ≈ 0.58, paired EEG−shuffled Δ ≈ 0.
+- [x] **Conclusion**: Code-space cosine is too forgiving; the prior 18C-v2 +0.007 gap was likely scale/normalization pathology, not robust expander signal.
+
+### Phase 18E: Expander-Aligned + Z-Scored Code Training (In Progress) 🚧
+
+Rationale: Train through the frozen bottleneck expander on z-scored codes; checkpoint on bottleneck-expanded validation cosine; gate on paired bootstrap vs full RAE tokens.
+
+- [x] `scripts/build_rae_code_stats.py` — train-split `code_mean` / `code_std` `[768,4,4]`.
+- [x] `--loss expander_aligned` in `train_eeg_clip.py`:
+  - `pred_code = z_pred * code_std + code_mean`
+  - `loss = cosine(expand(pred), expand(target)) + 0.1 * SmoothL1(z_pred, target_z) + 0.01 * probe`
+  - `best.pt` by `val_expanded_to_bottleneck_cosine`; log `val_expanded_to_full_token_cosine`
+  - Collapse % on de-standardized `pred_code`; probe on `mean_pool(pred_code)`
+  - Pre-train smoke test: bottleneck grad=0, EEG head grad>0, pred_code std sane
+- [x] `scripts/run_phase18e.sh` — batch 64, epochs 40, patience 8, warm-start Phase 16c.
+- [ ] **Run on RunPod** + eval via `evaluate_rae_spatial.py`.
+- [ ] **Gate**: paired Δ > +0.005 (CI excludes 0), `collapsed_channels_pct` < 20%.
 
 ---
 
 ## 🗺️ Future Work
 
-### Phase 18E: RAE Capacity Scaling & Direct Regress
-- [ ] **Scale Spatial Grid**: Test `spatial_768x5x5` codes to increase the oracle ceiling beyond 0.85.
-- [ ] **Direct Token Regression**: Attempt direct regression of `[768, 16, 16]` space using convolutional priors on the projection head.
-- [ ] **Backfill VLM Attributes**: Re-annotate remaining 11 attributes to expand probe to 29 tasks and increase coverage.
+### Phase 18F — VLM Attribute Backfill (Deferred until 18E gate)
+
+**Canonical doc:** [`docs/VLM_ATTRIBUTES.md`](VLM_ATTRIBUTES.md)
+
+**Problem A — never annotated:** `ATTRIBUTE_SCHEMAS` has 29 attrs; original Qwen prompt only generated **18 Tier-1** keys. **11 calibration attrs** (`warm_vs_cool` … `organic_texture`) were always `unclear` / missing.
+
+**Problem B — sparse Tier-1:** ~75% `"unclear"` on many attrs → ~25% probe val coverage (not missing JSON keys).
+
+**Does not block 18E rerun** — keep `rae_code_probe_4x4` + `probe_weight=0.01`.
+
+**Scripts:**
+- [ ] `bash scripts/run_backfill_vlm_attributes.sh` on RunPod (audit → `--tier calibration --merge` → audit)
+- [ ] Gate: image coverage ≥ 99%; all 11 calibration keys present ≥ 99% of metadata images
+- [ ] Optional: `pretrain_common_probe.py` → `outputs/rae_code_probe_4x4_v2` after backfill; update Phase 18+ `--common-probe` path
+
+**Do not:** add all 29 tasks at high probe weight; retrain probe mid-18E; remove attrs from schema (use gating + low weight instead).
+
+### Phase 18G+: RAE Capacity Scaling (Deferred until 18E gate)
+- [ ] **Scale Spatial Grid**: Test `spatial_768x5x5` only if 18E fails minimum gate.
+- [ ] **Direct Token Regression**: Attempt direct regression of `[768, 16, 16]` with conv priors.
 
 ### Phase 7 (Deferred): BReAD-style Retrieval Branch
 - [ ] Add `src/mindseye/embeddings/faiss_index.py`, `scripts/build_retrieval_index.py`.

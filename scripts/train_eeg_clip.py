@@ -139,7 +139,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--loss", choices=("contrastive", "cosine_mse", "spatial_cosine", "spatial_cosine_norm"), default="contrastive")
+    p.add_argument("--loss", choices=("contrastive", "cosine_mse", "spatial_cosine", "spatial_cosine_norm", "expander_aligned"), default="contrastive")
+    p.add_argument("--bottleneck-checkpoint", default=None,
+                   help="Frozen RAE bottleneck .pt (required for --loss expander_aligned)")
+    p.add_argument("--code-stats", default=None,
+                   help="code_mean/code_std .pt from build_rae_code_stats.py (required for expander_aligned)")
+    p.add_argument("--rae-bank", default=None,
+                   help="Full RAE token bank .pt for val_expanded_to_full_token_cosine during training")
+    p.add_argument("--loss-z-weight", type=float, default=0.1,
+                   help="Weight for SmoothL1(z_pred, target_z) in expander_aligned loss")
+    p.add_argument("--loss-var-weight", type=float, default=0.0,
+                   help="Optional channel-variance penalty (off by default when z-scoring is active)")
     p.add_argument("--dual-head", action="store_true",
                    help="Use dual-head architecture to predict unit embedding and raw embedding norm separately")
     p.add_argument("--use-fixed-mean-norm", action="store_true",
@@ -317,6 +327,181 @@ def _spatial_cosine_norm_loss(pred: "torch.Tensor", target: "torch.Tensor", code
         return loss_cos + 0.05 * loss_norm
 
 
+def _load_frozen_bottleneck(checkpoint_path: str | Path, device: "torch.device"):
+    import torch
+    from mindseye.models.rae_token_bottleneck import build_bottleneck
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    bottleneck = build_bottleneck(ckpt["arch"])
+    bottleneck.load_state_dict(ckpt["state_dict"])
+    bottleneck = bottleneck.to(device)
+    bottleneck.eval()
+    for p in bottleneck.parameters():
+        p.requires_grad_(False)
+    return bottleneck, ckpt["arch"]
+
+
+def _load_code_stats(stats_path: str | Path, device: "torch.device"):
+    stats = torch.load(stats_path, map_location="cpu")
+    code_mean = stats["code_mean"].float().to(device)
+    code_std = stats["code_std"].float().to(device)
+    code_shape = tuple(stats["code_shape"])
+    return code_mean, code_std, code_shape
+
+
+def _codes_to_spatial(flat: "torch.Tensor", code_shape: tuple) -> "torch.Tensor":
+    c, h, w = code_shape
+    return flat.reshape(flat.shape[0], c, h, w)
+
+
+def _expanded_flat_cosine(pred_tokens: "torch.Tensor", target_tokens: "torch.Tensor") -> "torch.Tensor":
+    """Per-channel spatial cosine mean — matches evaluate_rae_spatial.py gate metric.
+
+    For [B, 768, 16, 16] tokens, compares 256-dim spatial vectors per channel (dim=-1).
+    """
+    import torch.nn.functional as F
+
+    b = pred_tokens.shape[0]
+    return F.cosine_similarity(
+        pred_tokens.reshape(b, 768, -1),
+        target_tokens.reshape(b, 768, -1),
+        dim=-1,
+    ).mean()
+
+
+def _expanded_flat_cosine_loss(pred_tokens: "torch.Tensor", target_tokens: "torch.Tensor") -> "torch.Tensor":
+    """1 - per-channel spatial cosine mean (training loss for expander_aligned)."""
+    return 1.0 - _expanded_flat_cosine(pred_tokens, target_tokens)
+
+
+def _expander_aligned_loss(
+    z_pred: "torch.Tensor",
+    target_flat: "torch.Tensor",
+    *,
+    bottleneck: "torch.nn.Module",
+    code_mean: "torch.Tensor",
+    code_std: "torch.Tensor",
+    code_shape: tuple,
+    loss_z_weight: float = 0.1,
+    loss_var_weight: float = 0.0,
+) -> tuple["torch.Tensor", dict[str, "torch.Tensor"]]:
+    """Train through frozen expander on de-standardized codes."""
+    import torch
+    import torch.nn.functional as F
+
+    pred_code = z_pred * code_std + code_mean
+    target_code = _codes_to_spatial(target_flat, code_shape)
+    target_z = (target_code - code_mean) / (code_std + 1e-6)
+
+    loss_z = F.smooth_l1_loss(z_pred, target_z)
+    pred_tokens = bottleneck.expand(pred_code)
+    with torch.no_grad():
+        target_tokens = bottleneck.expand(target_code)
+    expanded_cosine = _expanded_flat_cosine(pred_tokens, target_tokens)
+    loss_expanded = 1.0 - expanded_cosine
+
+    loss = loss_expanded + loss_z_weight * loss_z
+    if loss_var_weight > 0:
+        from mindseye.models.rae_token_bottleneck import relative_std_loss
+        loss = loss + loss_var_weight * relative_std_loss(pred_code, target_code)
+
+    return loss, {
+        "pred_code": pred_code,
+        "target_code": target_code,
+        "loss_expanded": loss_expanded,
+        "loss_z": loss_z,
+        "expanded_cosine": expanded_cosine,
+    }
+
+
+def _expanded_token_cosine(pred_tokens: "torch.Tensor", ref_tokens: "torch.Tensor") -> float:
+    """Per-channel spatial cosine scalar (evaluate_rae_spatial-compatible)."""
+    return float(_expanded_flat_cosine(pred_tokens, ref_tokens).item())
+
+
+def _smoke_test_expander_aligned(
+    model,
+    train_loader,
+    device,
+    *,
+    bottleneck: "torch.nn.Module",
+    code_mean: "torch.Tensor",
+    code_std: "torch.Tensor",
+    code_shape: tuple,
+    loss_z_weight: float = 0.1,
+) -> None:
+    """One-batch forward/backward: expander frozen, EEG head receives gradients."""
+    import torch
+    import torch.nn.functional as F
+
+    model.train()
+    batch = next(iter(train_loader))
+    batch_data = _batch_to_device(batch, device)
+    subject_id = batch_data.get("subject_id", None)
+    kwargs = {"subject_id": subject_id} if getattr(model, "subject_embed", None) is not None else {}
+
+    for p in bottleneck.parameters():
+        p.requires_grad_(False)
+
+    model.zero_grad(set_to_none=True)
+    z_flat = model(batch_data["eeg"], **kwargs)
+    z_pred = _codes_to_spatial(z_flat, code_shape)
+    loss, aux = _expander_aligned_loss(
+        z_pred,
+        batch_data["target"],
+        bottleneck=bottleneck,
+        code_mean=code_mean,
+        code_std=code_std,
+        code_shape=code_shape,
+        loss_z_weight=loss_z_weight,
+        loss_var_weight=0.0,
+    )
+    loss.backward()
+
+    bn_grad_max = max(
+        (p.grad.abs().max().item() for p in bottleneck.parameters() if p.grad is not None),
+        default=0.0,
+    )
+    eeg_grads = [p.grad.abs().max().item() for p in model.parameters() if p.grad is not None]
+    eeg_grad_max = max(eeg_grads) if eeg_grads else 0.0
+
+    pred_code = aux["pred_code"].detach()
+    target_code = aux["target_code"].detach()
+    pred_std = float(pred_code.std().item())
+    tgt_std = float(target_code.std().item())
+    std_ratio = pred_std / (tgt_std + 1e-6)
+
+    probe_ok = True
+    probe_in = F.normalize(pred_code.mean(dim=[-1, -2]), dim=-1)
+    if probe_in.shape[-1] != 768:
+        probe_ok = False
+
+    checks = {
+        "loss_finite": bool(torch.isfinite(loss).item()),
+        "bottleneck_grad_max": bn_grad_max,
+        "eeg_head_grad_max": eeg_grad_max,
+        "pred_code_std": pred_std,
+        "target_code_std": tgt_std,
+        "pred_target_std_ratio": std_ratio,
+        "probe_input_dim": int(probe_in.shape[-1]),
+    }
+    print("[ExpanderAligned SmokeTest] " + json.dumps(checks))
+
+    if not checks["loss_finite"]:
+        raise RuntimeError("Smoke test failed: loss is not finite")
+    if bn_grad_max > 0:
+        raise RuntimeError(f"Smoke test failed: bottleneck grad max={bn_grad_max} (expected 0)")
+    if eeg_grad_max <= 0:
+        raise RuntimeError("Smoke test failed: EEG head received no gradients")
+    if std_ratio > 100 or std_ratio < 0.01:
+        raise RuntimeError(f"Smoke test failed: pred_code std ratio={std_ratio:.4f} looks pathological")
+    if not probe_ok:
+        raise RuntimeError(f"Smoke test failed: probe input dim={probe_in.shape[-1]} (expected 768)")
+
+    model.zero_grad(set_to_none=True)
+    print("[ExpanderAligned SmokeTest] PASSED")
+
+
 # ---------------------------------------------------------------------------
 # Structured run directory
 # ---------------------------------------------------------------------------
@@ -368,7 +553,221 @@ def _save_env(run_dir: Path, args: argparse.Namespace, setup: dict) -> None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str = "common", probe_model=None, active_tasks=None, target_center=None, full_bank: "torch.Tensor | None" = None, code_shape: tuple | None = None) -> dict[str, float]:
+def _evaluate_rae_expander(
+    model,
+    loader,
+    device,
+    *,
+    bottleneck: "torch.nn.Module",
+    code_mean: "torch.Tensor",
+    code_std: "torch.Tensor",
+    code_shape: tuple,
+    image_id_to_rae_tokens: dict | None,
+    loss_z_weight: float,
+    loss_var_weight: float,
+    probe_model=None,
+    active_tasks=None,
+    full_bank: "torch.Tensor | None" = None,
+) -> dict[str, float]:
+    """Validation for expander_aligned: metrics on de-standardized pred_code."""
+    import torch
+    import torch.nn.functional as F
+
+    model.eval()
+    if probe_model:
+        probe_model.eval()
+
+    c, h, w = code_shape
+    total_losses, loss_expanded_vals, loss_z_vals = [], [], []
+    pred_codes_cpu, target_codes_cpu = [], []
+    cos_bottleneck_vals, cos_full_vals = [], []
+    probe_preds_dict = {task: [] for task in (active_tasks or [])}
+    probe_targets_dict = {task: [] for task in (active_tasks or [])}
+    debug_printed = False
+
+    with torch.inference_mode():
+        for batch in loader:
+            batch_data = _batch_to_device(batch, device)
+            image_ids = batch["image_id"] if isinstance(batch.get("image_id"), list) else list(batch["image_id"])
+
+            subject_id = batch_data.get("subject_id", None)
+            kwargs = {"subject_id": subject_id} if getattr(model, "subject_embed", None) is not None else {}
+            z_flat = model(batch_data["eeg"], **kwargs)
+            z_pred = _codes_to_spatial(z_flat, code_shape)
+            target_flat = batch_data["target"]
+            target_code = _codes_to_spatial(target_flat, code_shape)
+
+            loss, aux = _expander_aligned_loss(
+                z_pred,
+                target_flat,
+                bottleneck=bottleneck,
+                code_mean=code_mean,
+                code_std=code_std,
+                code_shape=code_shape,
+                loss_z_weight=loss_z_weight,
+                loss_var_weight=loss_var_weight,
+            )
+            loss_exp = float(aux["loss_expanded"].item())
+            loss_z = float(aux["loss_z"].item())
+            expanded_cos = float(aux["expanded_cosine"].item())
+            total_losses.append(float(loss.item()))
+            loss_expanded_vals.append(loss_exp)
+            loss_z_vals.append(loss_z)
+            cos_bottleneck_vals.append(expanded_cos)
+
+            if not debug_printed:
+                from mindseye.models.rae_token_bottleneck import spatial_cosine_loss
+                pred_code = aux["pred_code"]
+                pred_tokens = bottleneck.expand(pred_code)
+                with torch.no_grad():
+                    target_tokens = bottleneck.expand(target_code)
+                site_cos = float(
+                    F.cosine_similarity(pred_tokens, target_tokens, dim=1).mean().item()
+                )
+                debug = {
+                    "debug_loss_expanded": loss_exp,
+                    "debug_expanded_cosine": expanded_cos,
+                    "debug_1_minus_expanded_cosine": 1.0 - expanded_cos,
+                    "debug_loss_z": loss_z,
+                    "debug_total_loss": float(loss.item()),
+                    "debug_site_channel_cosine": site_cos,
+                    "debug_site_channel_loss": float(
+                        spatial_cosine_loss(pred_tokens, target_tokens).item()
+                    ),
+                    "invariant_ok": abs(loss_exp - (1.0 - expanded_cos)) < 1e-4,
+                }
+                print("[ExpanderAligned ValDebug] " + json.dumps(debug))
+                debug_printed = True
+
+            pred_code = aux["pred_code"]
+            pred_codes_cpu.append(pred_code.cpu())
+            target_codes_cpu.append(target_code.cpu())
+
+            pred_tokens = bottleneck.expand(pred_code)
+            with torch.no_grad():
+                target_tokens = bottleneck.expand(target_code)
+
+            if image_id_to_rae_tokens is not None:
+                oracle_list = []
+                for img_id in image_ids:
+                    if img_id in image_id_to_rae_tokens:
+                        tok = image_id_to_rae_tokens[img_id].float()
+                        if tok.ndim == 1:
+                            tok = tok.reshape(768, 16, 16)
+                        oracle_list.append(tok)
+                if oracle_list:
+                    oracle = torch.stack(oracle_list, dim=0).to(device)
+                    cos_full_vals.append(
+                        _expanded_token_cosine(pred_tokens[: len(oracle_list)], oracle)
+                    )
+
+            if probe_model and active_tasks and "probe_targets" in batch_data:
+                probe_in = F.normalize(pred_code.mean(dim=[-1, -2]), dim=-1)
+                a_preds = probe_model(probe_in)
+                for task in active_tasks:
+                    probe_preds_dict[task].append(a_preds[task].cpu())
+                    probe_targets_dict[task].append(batch_data["probe_targets"][task].cpu())
+
+    pred_t = torch.cat(pred_codes_cpu).reshape(-1, c * h * w)
+    target_t = torch.cat(target_codes_cpu).reshape(-1, c * h * w)
+    pred_s = torch.cat(pred_codes_cpu)
+    tgt_s = torch.cat(target_codes_cpu)
+
+    metrics: dict[str, float] = {
+        "loss": float(sum(total_losses) / max(1, len(total_losses))),
+        "val_loss_expanded": float(sum(loss_expanded_vals) / max(1, len(loss_expanded_vals))),
+        "val_loss_z": float(sum(loss_z_vals) / max(1, len(loss_z_vals))),
+        "n": int(pred_s.shape[0]),
+        "val_expanded_to_bottleneck_cosine": float(
+            sum(cos_bottleneck_vals) / max(1, len(cos_bottleneck_vals))
+        ),
+        "val_spatial_cosine": float(F.cosine_similarity(pred_s, tgt_s, dim=1).mean().item()),
+    }
+    if cos_full_vals:
+        metrics["val_expanded_to_full_token_cosine"] = float(sum(cos_full_vals) / len(cos_full_vals))
+    else:
+        metrics["val_expanded_to_full_token_cosine"] = 0.0
+
+    pred_mean = float(pred_t.mean().item())
+    pred_std = float(pred_t.std().item())
+    pred_norm = float(pred_t.norm(dim=-1).mean().item())
+    tgt_mean = float(target_t.mean().item())
+    tgt_std = float(target_t.std().item())
+    tgt_norm = float(target_t.norm(dim=-1).mean().item())
+    metrics.update({
+        "pred_code_mean": pred_mean,
+        "pred_code_std": pred_std,
+        "pred_code_norm": pred_norm,
+        "target_code_mean": tgt_mean,
+        "target_code_std": tgt_std,
+        "target_code_norm": tgt_norm,
+        "pred_code_std_ratio": pred_std / (tgt_std + 1e-6),
+    })
+
+    pos_cos = float(F.cosine_similarity(pred_s, tgt_s, dim=1).mean().item())
+    metrics["val_spatial_cosine"] = pos_cos
+
+    eps = 1e-6
+    pred_ch_std = pred_s.std(dim=[0, 2, 3])
+    tgt_ch_std = tgt_s.std(dim=[0, 2, 3])
+    ratio = pred_ch_std / (tgt_ch_std + eps)
+    metrics["pred_collapsed_channels_pct"] = float((ratio < 0.2).float().mean().item()) * 100.0
+
+    metrics["collapse_score"] = metrics["val_expanded_to_bottleneck_cosine"]
+    metrics.setdefault("top1", 0.0)
+    metrics.setdefault("top5", 0.0)
+    metrics.setdefault("top10", 0.0)
+    metrics.setdefault("mrr", metrics["val_expanded_to_bottleneck_cosine"])
+    metrics.setdefault("median_rank", 0.0)
+    metrics.setdefault("mean_diag_cosine", metrics["val_expanded_to_bottleneck_cosine"])
+
+    if full_bank is not None:
+        pred_norm_fb = F.normalize(pred_t.cpu(), dim=-1)
+        tgt_norm_fb = F.normalize(target_t.cpu(), dim=-1)
+        fb_norm = F.normalize(full_bank.cpu(), dim=-1)
+        fb_logits = pred_norm_fb @ fb_norm.T
+        tgt_fb_logits = tgt_norm_fb @ fb_norm.T
+        correct_idx = tgt_fb_logits.argmax(dim=-1)
+        fb_sorted = fb_logits.argsort(dim=-1, descending=True)
+        fb_rank = (fb_sorted == correct_idx[:, None]).nonzero(as_tuple=False)[:, 1].float()
+        full_bank_n = full_bank.shape[0]
+        for k in (1, 5, 10):
+            metrics[f"full_bank_top{k}"] = (fb_rank < k).float().mean().item()
+            metrics[f"full_bank_random_top{k}_expected"] = min(k, full_bank_n) / full_bank_n
+        metrics["full_bank_mrr"] = (1.0 / (fb_rank + 1.0)).mean().item()
+        metrics["full_bank_n"] = full_bank_n
+
+    if probe_model and active_tasks and probe_preds_dict:
+        from mindseye.models.common_probe import IGNORE_INDEX
+        for task in active_tasks:
+            ap = torch.cat(probe_preds_dict[task])
+            at = torch.cat(probe_targets_dict[task])
+            mask = at != IGNORE_INDEX
+            if mask.any():
+                metrics[f"probe_{task}_acc"] = (ap.argmax(dim=-1)[mask] == at[mask]).float().mean().item()
+            else:
+                metrics[f"probe_{task}_acc"] = 0.0
+
+    return metrics
+
+
+def evaluate(model, loader, device, *, loss_name: str, temperature: float, target_space: str = "common", probe_model=None, active_tasks=None, target_center=None, full_bank: "torch.Tensor | None" = None, code_shape: tuple | None = None, bottleneck: "torch.nn.Module | None" = None, code_mean: "torch.Tensor | None" = None, code_std: "torch.Tensor | None" = None, image_id_to_rae_tokens: dict | None = None, loss_z_weight: float = 0.1, loss_var_weight: float = 0.0) -> dict[str, float]:
+    if target_space == "rae_code" and loss_name == "expander_aligned" and bottleneck is not None:
+        assert code_mean is not None and code_std is not None and code_shape is not None
+        return _evaluate_rae_expander(
+            model, loader, device,
+            bottleneck=bottleneck,
+            code_mean=code_mean,
+            code_std=code_std,
+            code_shape=code_shape,
+            image_id_to_rae_tokens=image_id_to_rae_tokens,
+            loss_z_weight=loss_z_weight,
+            loss_var_weight=loss_var_weight,
+            probe_model=probe_model,
+            active_tasks=active_tasks,
+            full_bank=full_bank,
+        )
+
     from mindseye.models.eeg_encoder import retrieval_topk
     import torch
     import torch.nn.functional as F
@@ -612,6 +1011,12 @@ def evaluate(model, loader, device, *, loss_name: str, temperature: float, targe
 
 def main() -> None:
     args = parse_args()
+
+    if args.loss == "expander_aligned":
+        if not args.bottleneck_checkpoint:
+            raise ValueError("--loss expander_aligned requires --bottleneck-checkpoint")
+        if not args.code_stats:
+            raise ValueError("--loss expander_aligned requires --code-stats")
 
     global torch, DataLoader, Subset
     global SemanticPairConfig, ZunaClipPairDataset, split_indices
@@ -909,6 +1314,35 @@ def main() -> None:
         
     optimizer = torch.optim.AdamW(opt_params, lr=args.lr, weight_decay=args.weight_decay)
 
+    frozen_bottleneck = None
+    code_mean_t = None
+    code_std_t = None
+    rae_code_shape = getattr(dataset, "_rae_code_shape", None)
+    image_id_to_rae_tokens = None
+
+    if args.loss == "expander_aligned":
+        frozen_bottleneck, bn_arch = _load_frozen_bottleneck(args.bottleneck_checkpoint, device)
+        code_mean_t, code_std_t, stats_shape = _load_code_stats(args.code_stats, device)
+        if rae_code_shape is not None and tuple(stats_shape) != tuple(rae_code_shape):
+            raise ValueError(f"code_stats shape {stats_shape} != dataset code shape {rae_code_shape}")
+        rae_code_shape = stats_shape
+        print(f"[ExpanderAligned] Loaded frozen bottleneck arch={bn_arch}")
+        print(f"[ExpanderAligned] code_stats: mean={code_mean_t.mean().item():.4f} std={code_std_t.mean().item():.4f}")
+        if args.rae_bank:
+            rae_bank_data = torch.load(args.rae_bank, map_location="cpu")
+            image_id_to_rae_tokens = rae_bank_data.get("image_id_to_rae_tokens")
+            print(f"[ExpanderAligned] RAE token bank: {len(image_id_to_rae_tokens)} images (full-token val metric)")
+        _smoke_test_expander_aligned(
+            model,
+            train_loader,
+            device,
+            bottleneck=frozen_bottleneck,
+            code_mean=code_mean_t,
+            code_std=code_std_t,
+            code_shape=rae_code_shape,
+            loss_z_weight=args.loss_z_weight,
+        )
+
     # Quick forward pass to verify shapes
     first_batch = next(iter(train_loader))
     batch_data = _batch_to_device(first_batch, device)
@@ -1014,6 +1448,11 @@ def main() -> None:
         "loaded_keys_count": loaded_keys_count,
         "skipped_keys_count": skipped_keys_count,
         "skipped_keys_first50": skipped_keys_first50,
+        "bottleneck_checkpoint": getattr(args, "bottleneck_checkpoint", None),
+        "code_stats": getattr(args, "code_stats", None),
+        "rae_bank": getattr(args, "rae_bank", None),
+        "loss_z_weight": getattr(args, "loss_z_weight", None),
+        "loss_var_weight": getattr(args, "loss_var_weight", None),
     }
     print(json.dumps({"setup": setup}, indent=2))
 
@@ -1049,6 +1488,13 @@ def main() -> None:
             "pred_site_norm_std", "target_site_norm_std", "pred_site_norm_std_ratio",
             "val_spatial_cosine", "pred_collapsed_channels_pct"
         ])
+        if args.loss == "expander_aligned":
+            log_fields.extend([
+                "val_expanded_to_bottleneck_cosine",
+                "val_expanded_to_full_token_cosine",
+                "val_loss_expanded",
+                "val_loss_z",
+            ])
 
     if active_tasks:
         for task in active_tasks:
@@ -1133,7 +1579,24 @@ def main() -> None:
                     pred_for_loss = torch.nn.functional.normalize(pred, dim=-1)
                     target_for_loss = torch.nn.functional.normalize(batch_data["target"], dim=-1)
 
-                if args.loss in ("spatial_cosine", "spatial_cosine_norm"):
+                if args.loss == "expander_aligned":
+                    code_shape = rae_code_shape or getattr(dataset, "_rae_code_shape", None)
+                    z_pred = _codes_to_spatial(pred, code_shape)
+                    loss, aux = _expander_aligned_loss(
+                        z_pred,
+                        batch_data["target"],
+                        bottleneck=frozen_bottleneck,
+                        code_mean=code_mean_t,
+                        code_std=code_std_t,
+                        code_shape=code_shape,
+                        loss_z_weight=args.loss_z_weight,
+                        loss_var_weight=args.loss_var_weight,
+                    )
+                    pred_for_probe = torch.nn.functional.normalize(
+                        aux["pred_code"].mean(dim=[-1, -2]), dim=-1
+                    )
+                    pred_for_loss = pred_for_probe
+                elif args.loss in ("spatial_cosine", "spatial_cosine_norm"):
                     # For rae_code: use raw unnormalized predictions vs raw targets
                     code_shape = getattr(dataset, '_rae_code_shape', None)
                     if args.loss == "spatial_cosine":
@@ -1160,7 +1623,10 @@ def main() -> None:
                 from mindseye.models.common_probe import IGNORE_INDEX
                 # For rae_code (spatial_cosine/spatial_cosine_norm loss), pred_for_probe is already mean-pooled+normalized.
                 # For other target spaces, pred_for_loss is the normalized representation.
-                probe_input = pred_for_probe if (args.loss in ("spatial_cosine", "spatial_cosine_norm") and probe_model is not None) else pred_for_loss
+                probe_input = pred_for_probe if (
+                    args.loss in ("spatial_cosine", "spatial_cosine_norm", "expander_aligned")
+                    and probe_model is not None
+                ) else pred_for_loss
                 logits_dict = probe_model(probe_input)
 
                 task_losses = []
@@ -1189,23 +1655,43 @@ def main() -> None:
             optimizer.step()
             train_losses.append(float(loss.item()))
 
-        val = evaluate(model, val_loader, device, loss_name=args.loss,
-                       temperature=args.temperature, target_space=args.target_space,
-                       probe_model=probe_model, active_tasks=active_tasks,
-                       target_center=target_center, full_bank=full_bank_tensor,
-                       code_shape=getattr(dataset, '_rae_code_shape', None))
-        
+        _eval_code_shape = rae_code_shape or getattr(dataset, "_rae_code_shape", None)
+        val = evaluate(
+            model, val_loader, device, loss_name=args.loss,
+            temperature=args.temperature, target_space=args.target_space,
+            probe_model=probe_model, active_tasks=active_tasks,
+            target_center=target_center, full_bank=full_bank_tensor,
+            code_shape=_eval_code_shape,
+            bottleneck=frozen_bottleneck,
+            code_mean=code_mean_t,
+            code_std=code_std_t,
+            image_id_to_rae_tokens=image_id_to_rae_tokens,
+            loss_z_weight=args.loss_z_weight,
+            loss_var_weight=args.loss_var_weight,
+        )
+
         calib_val = None
         if calib_val_loader is not None:
-            calib_val = evaluate(model, calib_val_loader, device, loss_name=args.loss,
-                                 temperature=args.temperature, target_space=args.target_space,
-                                 probe_model=probe_model, active_tasks=active_tasks,
-                                 target_center=target_center,
-                                 code_shape=getattr(dataset, '_rae_code_shape', None))
+            calib_val = evaluate(
+                model, calib_val_loader, device, loss_name=args.loss,
+                temperature=args.temperature, target_space=args.target_space,
+                probe_model=probe_model, active_tasks=active_tasks,
+                target_center=target_center,
+                code_shape=_eval_code_shape,
+                bottleneck=frozen_bottleneck,
+                code_mean=code_mean_t,
+                code_std=code_std_t,
+                image_id_to_rae_tokens=image_id_to_rae_tokens,
+                loss_z_weight=args.loss_z_weight,
+                loss_var_weight=args.loss_var_weight,
+            )
 
-        score = float(val["mrr"] + 0.25 * val["top10"])
-        if val["collapse_score"] < 0.1:
-            score = -1.0
+        if args.loss == "expander_aligned":
+            score = float(val.get("val_expanded_to_bottleneck_cosine", -1.0))
+        else:
+            score = float(val["mrr"] + 0.25 * val["top10"])
+            if val["collapse_score"] < 0.1:
+                score = -1.0
         row = {
             "epoch": epoch,
             "train_loss": float(sum(train_losses) / max(1, len(train_losses))),
@@ -1275,11 +1761,19 @@ def main() -> None:
     target_center_eval = ckpt.get("target_center", None)
     if target_center_eval is not None:
         target_center_eval = target_center_eval.to(device)
-    final_metrics = evaluate(model, val_loader, device, loss_name=args.loss,
-                             temperature=args.temperature, target_space=args.target_space,
-                             probe_model=probe_model, active_tasks=active_tasks,
-                             target_center=target_center_eval, full_bank=full_bank_tensor,
-                             code_shape=getattr(dataset, '_rae_code_shape', None))
+    final_metrics = evaluate(
+        model, val_loader, device, loss_name=args.loss,
+        temperature=args.temperature, target_space=args.target_space,
+        probe_model=probe_model, active_tasks=active_tasks,
+        target_center=target_center_eval, full_bank=full_bank_tensor,
+        code_shape=rae_code_shape or getattr(dataset, "_rae_code_shape", None),
+        bottleneck=frozen_bottleneck,
+        code_mean=code_mean_t,
+        code_std=code_std_t,
+        image_id_to_rae_tokens=image_id_to_rae_tokens,
+        loss_z_weight=args.loss_z_weight,
+        loss_var_weight=args.loss_var_weight,
+    )
                              
     if calib_val_loader is not None:
         final_calib_metrics = evaluate(model, calib_val_loader, device, loss_name=args.loss,

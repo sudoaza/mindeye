@@ -38,7 +38,70 @@ ATTRIBUTE_SCHEMAS = {
     "organic_texture": ["no", "yes"],
 }
 
+# Canonical attribute tiers (keep in sync with generate_vlm_attributes.py / analyze_vlm_attributes.py).
+# Tier 1: original natural-image semantics (18 attrs) — always requested in full runs.
+TIER1_ATTRIBUTE_NAMES: tuple[str, ...] = (
+    "is_animate",
+    "human_visible",
+    "face_visible",
+    "animal_visible",
+    "indoor_outdoor",
+    "natural_artificial",
+    "scene_dominance",
+    "real_world_size",
+    "dominant_color",
+    "main_subject_position_x",
+    "subject_scale",
+    "soft_texture",
+    "spiky_or_pointed",
+    "furry",
+    "metallic",
+    "tool_like",
+    "vehicle_like",
+    "food_like",
+)
+
+# Phase 11A calibration / material-shape axes (11 attrs) — were in ATTRIBUTE_SCHEMAS but
+# missing from the original Qwen prompt; backfill with --tier calibration.
+CALIBRATION_ATTRIBUTE_NAMES: tuple[str, ...] = (
+    "warm_vs_cool",
+    "bright_vs_dark",
+    "round_or_curved",
+    "angular_or_geometric",
+    "symmetrical",
+    "single_object",
+    "glossy",
+    "rough",
+    "smooth",
+    "transparent",
+    "organic_texture",
+)
+
+ALL_VLM_ATTRIBUTE_NAMES: tuple[str, ...] = tuple(ATTRIBUTE_SCHEMAS.keys())
+
+# Probe training adds ImageNet class_label (+1) → up to 30 heads before gating.
+PROBE_CLASS_LABEL_TASK = "class_label"
+
 IGNORE_INDEX = -100
+
+
+def vlm_json_schema_lines(attr_names: tuple[str, ...]) -> list[str]:
+    """Build JSON schema fragment lines for the VLM system prompt."""
+    lines: list[str] = []
+    for name in attr_names:
+        choices = ATTRIBUTE_SCHEMAS[name]
+        if set(choices) <= {"no", "yes"}:
+            opt = '"yes" | "no" | "unclear"'
+        elif name == "dominant_color":
+            opt = " | ".join(f'"{c}"' for c in choices) + ' | "unclear"'
+        else:
+            opt = " | ".join(f'"{c}"' for c in choices) + ' | "unclear"'
+        lines.append(f'  "{name}": {opt}')
+    return lines
+
+
+def unclear_fallback(attr_names: tuple[str, ...]) -> dict[str, str]:
+    return {name: "unclear" for name in attr_names}
 
 class CommonProbeModel(nn.Module):
     """Multi-task probe model targeting class labels and VLM attributes from common space."""

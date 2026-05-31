@@ -16,6 +16,9 @@ This directory contains the orchestration scripts for the MindEye EEG-to-CLIP pi
 * `generate_image_semantics.py`: Uses a VLM (Qwen2-VL) to extract semantic captions from images.
 * `generate_text_embeddings.py`: Generates text CLIP embeddings (from captions or ImageNet labels).
 * `build_common_embeddings.py`: Fuses image, semantic, and label signals into a single `z_common` target space using $L_2$ normalization and weighted combinations.
+* `generate_vlm_attributes.py`: Qwen2-VL JSON labels for 29 semantic attributes (Tier-1 + calibration). See [`docs/VLM_ATTRIBUTES.md`](../docs/VLM_ATTRIBUTES.md).
+* `analyze_vlm_attributes.py`: Audit image coverage, per-attribute unclear %, missing calibration keys.
+* `run_backfill_vlm_attributes.sh`: RunPod helper — pre-audit, `--tier calibration --merge`, post-audit.
 
 ## 4. Core Training Pipeline
 * `train_eeg_clip.py`: The single-condition training loop. Uses the `ZunaClipPairDataset` and trains an EEG encoder (e.g. `temporal_attn_small` or `cnn`) against the multimodal target space.
