@@ -1,6 +1,7 @@
 # MindEye Dev Cheat Sheet
 
-> IMPORTANT: All GPU work runs on the **remote RunPod pod**. The dev machine has no GPU.
+> IMPORTANT: All GPU work runs on the **remote RunPod pod**. The dev machine has no GPU and no data.
+> **Never run pipeline steps locally** — always spin up / start a pod and run over SSH.
 > Doc index: [`README.md`](README.md). Pod sizing, network-volume strategy, and provisioning
 > live in [`INFRA.md`](INFRA.md). runpod MCP tool reference: [`RunPod_SKILL.md`](RunPod_SKILL.md).
 

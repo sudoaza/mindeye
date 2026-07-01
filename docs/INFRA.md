@@ -1,7 +1,11 @@
 # MindEye Infrastructure — RunPod + Network Volume
 
 > All GPU work runs on a **RunPod Secure Cloud** pod, managed via the **runpod MCP**
-> (see [`RunPod_SKILL.md`](RunPod_SKILL.md)). The local dev machine has no GPU.
+> (see [`RunPod_SKILL.md`](RunPod_SKILL.md)). The local dev machine has no GPU and no data.
+>
+> **Remote-only rule.** Never run training, ZUNA inference, embedding builds, or evaluation
+> locally — always spin up / start a pod and run there over SSH. There is no local venv for
+> pipeline steps.
 
 ## 1. Storage model — what lives where
 

@@ -9,9 +9,12 @@
 
 ## Where things run
 
-- **Local dev machine**: no GPU. Editing code, docs, git.
-- **RunPod pod**: all training, ZUNA inference, embedding builds, evaluation.
+- **Local dev machine**: **no GPU. Never run training/inference/eval locally.** Editing code, docs, git only.
+- **RunPod pod**: **all** training, ZUNA inference, embedding builds, and evaluation run here — always remote.
 - **RunPod network volume**: persistent `data/`, `outputs/`, model cache — moved between pods (see [`INFRA.md`](INFRA.md)).
+
+> **Remote-only rule.** GPU work always runs on the pod, launched via the runpod MCP + SSH. Do not
+> attempt local runs or a local venv for pipeline steps — the dev machine has no GPU and no data.
 
 ## Document map
 

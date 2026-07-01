@@ -7,8 +7,9 @@ disable-model-invocation: true
 # MindEye Pod Workflow
 
 All MindEye GPU work runs on a **RunPod** pod (managed via the `runpod` MCP); the local machine
-has no GPU. Data, checkpoints, and model weights live on a **network volume** that persists across
-pods. Authoritative infra doc: `docs/INFRA.md`. Architecture/plan: `docs/PLAN.md`, `docs/HANDOVER.md`.
+has no GPU and no data. **Remote-only: never run training/inference/eval locally** — always spin up
+or start a pod and run over SSH. Authoritative infra doc: `docs/INFRA.md`. Architecture/plan:
+`docs/PLAN.md`, `docs/HANDOVER.md`.
 
 ## Lifecycle checklist
 
