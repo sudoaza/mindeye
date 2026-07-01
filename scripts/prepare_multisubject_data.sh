@@ -11,7 +11,7 @@ export TRITON_CACHE_DIR=/workspace/triton_cache
 mkdir -p $TRITON_CACHE_DIR
 
 echo "=== [1/3] Downloading sub-02, sub-03, sub-04 (Runs 1-32) ==="
-for sub in sub-02 sub-03 sub-04; do
+for sub in sub-01 sub-02 sub-03 sub-04; do
   echo ">>> Downloading $sub..."
   python scripts/download_nod.py --subject $sub --runs 1-32
 done
@@ -21,7 +21,7 @@ echo "=== [2/3] Running ZUNA Batch Denoising Pipeline (15 steps) ==="
 python scripts/run_zuna_batch.py --diffusion-steps 15
 
 echo "=== [3/3] Cropping tight1s semantic epochs ==="
-for sub in sub-02 sub-03 sub-04; do
+for sub in sub-01 sub-02 sub-03 sub-04; do
   # Strip hyphen from subject name (sub-02 -> sub02) to match config paths
   sub_clean=${sub//-/}
   echo ">>> Cropping $sub -> $sub_clean..."

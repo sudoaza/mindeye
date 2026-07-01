@@ -1,6 +1,8 @@
 # MindEye Dev Cheat Sheet
 
 > IMPORTANT: All GPU work runs on the **remote RunPod pod**. The dev machine has no GPU.
+> Doc index: [`README.md`](README.md). Pod sizing, network-volume strategy, and provisioning
+> live in [`INFRA.md`](INFRA.md). runpod MCP tool reference: [`RunPod_SKILL.md`](RunPod_SKILL.md).
 
 ## Index
 - [RunPod Management](#runpod-management)
@@ -11,35 +13,21 @@
   - [EEG Model Architecture](#eeg-model-architecture--training)
   - [Pipeline, Data & Scripts](#pipeline-data--script-execution)
   - [RunPod & Infrastructure](#runpod--infrastructure)
-  - [Phase 12 / Large Model (Qwen-Image)](#phase-12--large-model-infrastructure-qwen-image)
 
 
 ---
 
 ## RunPod Management
 
-Use the `runpod` MCP tools. See [`docs/RunPod_SKILL.md`](RunPod_SKILL.md) for full details.
+Use the `runpod` MCP tools. **Pod sizing, provisioning JSON, and the network-volume
+detach/reattach workflow are in [`INFRA.md`](INFRA.md).** Full tool reference in
+[`RunPod_SKILL.md`](RunPod_SKILL.md).
 
 ```bash
 mcp_runpod_list-pods
 mcp_runpod_get-pod    {"podId": "<POD_ID>", "includeMachine": true}
 mcp_runpod_start-pod  {"podId": "<POD_ID>"}
 mcp_runpod_stop-pod   {"podId": "<POD_ID>"}
-```
-
-### Create a New Pod
-```json
-{
-  "cloudType": "SECURE",
-  "gpuCount": 1,
-  "volumeInGb": 80,
-  "containerDiskInGb": 50,
-  "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
-  "name": "mindeye-zuna",
-  "ports": ["22/tcp"],
-  "volumeMountPath": "/workspace",
-  "env": {"PUBLIC_KEY": "ssh-ed25519 AAA... user@example.com"}
-}
 ```
 
 ---
@@ -75,114 +63,55 @@ rsync -avz --no-o --no-g --no-perms \
 
 ### Install Dependencies
 ```bash
-# Install requirements (uses system Python — no venv needed on pod):
+# System Python on the pod — no venv. torch==2.6.0+cu124 is pinned in requirements.txt:
 ssh -p <PORT> root@<IP> "cd /workspace/mindeye && pip install -r requirements.txt"
-
-# IMPORTANT: Upgrade PyTorch to 2.6.0 for flex_attention support on CUDA 12.4:
-ssh -p <PORT> root@<IP> "pip install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124"
 ```
 
 ---
 
 ## Running the Pipeline
 
-For step-by-step details see [`scripts/README.md`](../scripts/README.md). The canonical entry points are via `make`:
+Current architecture: **ZUNA → QFormer → RAE** (see [`PLAN.md`](PLAN.md), [`HANDOVER.md`](HANDOVER.md)).
+For step-by-step details see [`scripts/README.md`](../scripts/README.md). Always run on the pod with
+`export PYTHONPATH=src` set (see [`INFRA.md`](INFRA.md) for the full env block).
 
+### Cold start (end-to-end)
 ```bash
-make pipeline    # Full end-to-end: download → ZUNA → crop → embeddings → matrix
-make matrix      # Matrix only (assumes prior steps done) — canonical training run
-make ablation    # no-probe vs probe comparison (faster, ~2-3h)
-make probe_sweep # Sweep probe weights 0 / 0.01 / 0.03 / 0.05 / 0.10
-make simulate    # EPOC-14 low-channel simulation
+bash cold_start.sh   # env → download → ZUNA → crop → targets → cache latents → QFormer grid
 ```
 
-### Phase 12A / 13 (Decode-Unit unCLIP Branch) — run on pod manually
+### Cache ZUNA latents (QFormer input)
 ```bash
-# Step 0: Extract z_decode_common targets (one-time)
-python scripts/build_decode_common_embeddings.py
-
-# Step 1: Retrain decode probe on decode_unit space (one-time)
-python scripts/pretrain_common_probe.py \
-  --target-key decode_unit \
-  --common-embeddings data/processed/clip_embeddings/decode_common_embeddings.pt \
-  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
-  --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
-  --output-dir outputs/decode_probe_v2 \
-  --epochs 50 --lr 1e-4
-
-# Step 2: Train EEG -> decode_unit (canonical Phase 13 config)
-# Uses --mode contrastive_only, probe_weight=0.01, probe_start_epoch=5
-python scripts/train_eeg_decode_common.py \
-  --mode contrastive_only \
-  --common-probe outputs/decode_probe_v2/common_probe.pt \
-  --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
-  --probe-weight 0.01 \
-  --probe-start-epoch 5 \
-  --epochs 30 \
-  --slug 13_probe001
-
-# Step 3: Evaluate generations (Oracle, EEG kNN, Shuffled, Random)
-python scripts/evaluate_clip_native_decoder.py \
-  --run-dir outputs/runs/<YOUR_RUN_DIR>
-
-### Phase 17 (DINOv2-RAE Target & Decoder Swap) — run on pod manually
-
-DINOv2-RAE is a 768-D target space. It uses a frozen DINOv2-RAE encoder and a trained decoder. The RAE-native pipeline uses target centering (Option B) to reduce conic crowd density.
-
-# Step 0: Pretrain the RAE-native CommonProbeModel (one-time)
-python scripts/train_rae_probe.py \
-  --target-key image_id_to_rae_centered_unit \
-  --common-embeddings data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
-  --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/all_runs_metadata.csv \
-  --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
-  --output-dir outputs/rae_probe \
-  --epochs 80 --lr 1e-4
-
-# Step 1: Train EEG -> rae_centered_unit (Option B target centering)
-# Initialized from the Phase 16 16c_film_heads checkpoint, skipping heads
-python scripts/train_eeg_clip.py \
-  --metadata "$METADATA" \
-  --epochs-dir "$EPOCHS_DIR" \
-  --common-embeddings data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
-  --target-space rae_centered_unit \
-  --target-key image_id_to_rae_centered_unit \
-  --window-mode tight1s \
-  --augment-eeg \
-  --model temporal_attn_small \
-  --epochs 50 \
-  --patience 15 \
-  --batch-size 128 \
-  --loss contrastive \
-  --temperature 0.07 \
-  --slug phase17_6_rae_centered_16c_init_augmented \
-  --output-dir outputs \
-  --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
-  --common-probe outputs/rae_probe/common_probe.pt \
-  --probe-weight 0.01 \
-  --probe-start-epoch 5 \
-  --head-reg-weight 0.01 \
-  --init-from outputs/runs/20260527_083218_zuna_real_16c_film_heads/best.pt \
-  --init-skip-heads \
-  --lr 1e-4 \
-  --device cuda
-
-# Step 2: Evaluate generations (Oracle, EEG kNN, Shuffled, Random)
-# Re-encodes generated images, centers, normalizes, and runs bootstrap + RAE probe
-python scripts/evaluate_rae_generation.py \
-  --run-dir outputs/<YOUR_RUN_DIR> \
-  --num-samples 500 \
-  --batch-size 25 \
-  --k 5 \
-  --target-key image_id_to_rae_centered_unit \
-  --temperature 0.05 \
-  --common-probe outputs/rae_probe/common_probe.pt \
-  --stimuli-dir data/raw/nod/stimuli/ImageNet \
-  --output-dir outputs/phase17_6_rae_eval
+python scripts/cache_zuna_latents.py \
+  --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08 \
+  --output-dir data/processed/zuna_latents/sub01_runs01_08 \
+  --layers post_mmd
 ```
 
-On the pod, prefix with `export PYTHONPATH=src &&` when running scripts directly:
+### Run the QFormer bridge grid (real / shuffled / random + paired bootstrap)
 ```bash
-ssh -p <PORT> root@<IP> "cd /workspace/mindeye && export PYTHONPATH=src && nohup make matrix > matrix.log 2>&1 &"
+python scripts/run_qformer_grid.py \
+  --latents-pt data/processed/zuna_latents/sub01_runs01_32 \
+  --clip-pt    data/processed/clip_embeddings/common_embeddings.pt \
+  --rae-pt     data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
+  --train-runs 1-24 --val-runs 25-28 --test-runs 29-32 \
+  --epochs 40 --patience 8 --batch-size 64 --lr 3e-4 \
+  --device cuda --out-dir outputs/qformer_aligned_grid
+```
+
+Target spaces: `CLIP-Common-512` (semantic baseline), `DINO-Unit-768` (primary RAE target),
+`DINO-PCA-256-Unit`, `DINO-PCA-128-Unit`. Smoke test: add `--smoke-test` (CLIP-only, runs 1-6/7-8).
+
+**Gate**: paired Δ (real − shuffled) > +0.005 with 95% CI excluding 0, `collapse_pct` < 20%,
+on full-set retrieval against the RAE bank.
+
+> **Deprecated command paths** (kept for reference only, not the live plan): the `make matrix` /
+> decode_unit unCLIP branch (Phase 12A/13) and the RAE code-bottleneck branch (`train_rae_token_bottleneck.py`,
+> Phase 17/18). See [`PLAN.md`](PLAN.md) §6 for why the code-bottleneck path was abandoned.
+
+On the pod, prefix direct script calls with `export PYTHONPATH=src &&`:
+```bash
+ssh -p <PORT> root@<IP> "cd /workspace/mindeye && export PYTHONPATH=src && nohup python scripts/run_qformer_grid.py ... > qformer_grid.log 2>&1 &"
 ```
 
 ---
@@ -260,70 +189,10 @@ pkill -f 'python.*run_baseline_matrix' # Kill matrix run
 - **Target Centering in Evaluation**: Generated images must be encoded using the RAE backend, subtracted by the training set mean (`rae_center_mean`), and then L2-normalized. Raw unit comparison will hide retrieval performance.
 - **Option B Coordinate Alignment**: Make sure `pred_for_loss` is defined as `normalize(pred - target_center)` during training, and the auxiliary probe model gets `pred_for_loss` as input (instead of uncentered prediction).
 
-### Phase 18A (RAE Token Bottleneck Autoencoder)
+### ⛔ Deprecated: RAE code-bottleneck (Phase 18A–18E)
 
-The bottleneck decouples EEG↔RAE into two independent systems:
-1. **Image-only bridge**: compress [768,16,16] RAE tokens → [C,4,4] code → expand back → decode image.
-2. **EEG→code**: EEG encoder predicts the compact code (Phase 18B, not yet started).
-
-```bash
-# Step 0: Train the bottleneck (on pod, tokens already in RAE bank)
-python scripts/train_rae_token_bottleneck.py \
-    --rae-bank data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
-    --arch conv_256x4x4 \
-    --epochs 50 \
-    --batch-size 64 \
-    --lr 1e-3 \
-    --output-dir outputs/rae_bottleneck/conv_256x4x4 \
-    --device cuda
-
-# To run all three archs in sequence (background):
-for arch in spatial_768x4x4 conv_256x4x4 conv_128x4x4; do
-    python scripts/train_rae_token_bottleneck.py \
-        --rae-bank data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
-        --arch $arch \
-        --epochs 50 \
-        --output-dir outputs/rae_bottleneck/$arch \
-        --device cuda
-done
-
-# Step 1: Check gate metrics from outputs/rae_bottleneck/<arch>/metrics.json
-#   gate_token_cosine_pass: true   (mean_token_cosine > 0.90)
-#   gate_collapse_pass:     true   (pct_collapsed_channels < 5%)
-
-# Step 2: Extract codes for all images (after bottleneck is validated)
-python scripts/build_rae_bottleneck_codes.py \
-    --rae-bank data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
-    --checkpoint outputs/rae_bottleneck/conv_256x4x4/best.pt \
-    --output data/processed/rae_embeddings/rae_bottleneck_codes_conv256.pt \
-    --device cuda
-```
-
-**Gate criteria (must pass before Phase 18B):**
-- `mean_token_cosine > 0.90` — bottleneck faithfully reconstructs token geometry
-- `pct_collapsed_channels < 5%` — no mode collapse in the code
-- If `conv_256x4x4` fails, try `conv_128x4x4` before falling back to `spatial_768x4x4` (upper bound).
-
-**Architecture summary:**
-| Arch | Code shape | Values | Notes |
-|---|---|---|---|
-| `spatial_768x4x4` | [768,4,4] | 12,288 | Parameter-free compressor; learned expander — reconstruction upper bound |
-| `conv_256x4x4` | [256,4,4] | 4,096 | **Primary EEG target** |
-| `conv_128x4x4` | [128,4,4] | 2,048 | Leaner — compression tolerance test |
-| `conv_256x8x8` | [256,8,8] | 16,384 | Fallback if 4x4 fails visually |
-
-**Gate criteria (aspirational — compare all archs before deciding):**
-- `mean_token_cosine > 0.90` — bottleneck faithfully reconstructs token channel geometry
-- `pct_collapsed_channels < 5%` — relative std_ratio > 0.2 per channel (code_std / tok_std)
-- These are aspirational targets, not hard fails. RAE latents are high-dimensional; compare across architectures before deciding.
-- If `conv_256x4x4` fails visually, try `conv_256x8x8` before falling back to `spatial_768x4x4`.
-
-**Evaluation visual comparison (3-way):**
-- Target image
-- Full-token RAE oracle (image → full tokens → decode)
-- Bottleneck reconstruction (image → compress → expand → decode)
-
-This 3-way comparison is the ground truth for selecting the bottleneck. Run all three architectures before extracting codes.
-
-**Code extraction** — only run for the **selected** architecture (not mandatory for all three).
+The `train_rae_token_bottleneck.py` / `build_rae_bottleneck_codes.py` / `run_phase18*.sh` path
+is **abandoned** — squeezing EEG through a `768×4×4` code discarded per-site fidelity and the
+expanded-token gap collapsed to ~0. Superseded by the **QFormer bridge**. The scripts remain on
+disk for reference only. See [`PLAN.md`](PLAN.md) §6 for the full post-mortem.
 

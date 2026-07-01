@@ -1,10 +1,10 @@
 # MindEye — ZUNA-first EEG→Semantic→Image
 
 ## Project Thesis
-EEG-driven image generation using ZUNA as the signal normalization layer. The core objective is to map real continuous EEG, cleaned by ZUNA, into the multimodal latent space (`z_common`) to reconstruct what a subject is seeing.
+EEG-driven image reconstruction with three best-in-class components: **ZUNA** as the frozen EEG foundation embedding (signal feature recovery), a learned **QFormer** bridge, and **RAE (DINOv2)** as the reconstruction target (visual fidelity). The core objective is to map real continuous EEG, embedded by ZUNA, into RAE's visual latent space to reconstruct what a subject is seeing.
 
-## Current Status: Phase 12A (CLIP-Native Diffusion Decoder) 🚧
-**MindEye v0.2-dev**: We have successfully completed the baseline evaluation matrix, retrieval index setup, and frozen diffusion image reconstruction. The pipeline now enforces a single canonical `z_common` target space with multi-subject FiLM scale/shift adapters and multi-task frozen probe heads. We are currently in Phase 12A, extracting target embeddings via a CLIP-Native decoder (`sd2-community/stable-diffusion-2-1-unclip`) to enable direct, unprompted image generation from decoded EEG embeddings.
+## Current Status: QFormer Bridge (ZUNA → QFormer → RAE) 🚧
+**MindEye v0.3-dev**: The architecture is three best-in-class components — **ZUNA** as the frozen EEG foundation embedding (best feature recovery), **RAE (DINOv2)** as the reconstruction target (best visual fidelity; CLIP/ViT was semantically ok but visually imprecise), and a learned **QFormer** as the bridge between them (simple adapters did not work). We cache ZUNA `post_mmd` latents, onset-crop them, and train the QFormer to map them into the RAE/DINO embedding space, ranking against the full image bank with mandatory `real / shuffled / random` controls and a paired bootstrap gate. The earlier RAE code-bottleneck path (Phase 18B–18E) was abandoned because squeezing EEG through a tiny `768×4×4` code discarded the per-site fidelity RAE needs. See [`docs/HANDOVER.md`](docs/HANDOVER.md) for the current architecture and run instructions.
 
 ## Project Structure
 * `configs/`: Configuration files for datasets, ZUNA pipeline, and training.
@@ -34,6 +34,7 @@ make pipeline
 ```
 
 ## Methodology & Non-Negotiable Principles
-1. **ZUNA-First**: All models are trained on continuous EEG data that has passed through ZUNA.
-2. **Strict Controls**: We never evaluate "absolute" performance. Every run includes strict baseline controls (`zuna_shuffled`, `zuna_random`) to guard against dimensional collapse and dataset biases.
-3. **No Premature Diffusion**: Diffusion image generation is locked until the semantic retrieval branch consistently beats shuffled/random baselines.
+1. **ZUNA-First**: All models are trained on continuous EEG data that has passed through ZUNA (frozen EEG foundation model). ZUNA and RAE are frozen; only the QFormer bridge trains.
+2. **Strict Controls**: We never evaluate "absolute" performance. Every run includes strict baseline controls (`shuffled`, `random`) and a paired bootstrap to guard against dimensional collapse and dataset leakage. This split has repeatedly caught data/pipeline bugs.
+3. **Full-set retrieval is the only honest metric**; within-val ranking is diagnostic only (inflated).
+4. **No Premature Reconstruction**: The RAE decoder / diffusion image generation is locked until the QFormer retrieval gate (paired bootstrap Δ > +0.005, 95% CI excluding 0) is consistently met.

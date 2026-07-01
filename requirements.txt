@@ -1,6 +1,10 @@
-torch>=2.1.0
-torchvision
-torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+nvidia-cudnn-cu12==9.1.0.70
+
 mne
 mne-bids
 transformers

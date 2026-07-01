@@ -37,31 +37,27 @@ def variance_floor_loss(pred: torch.Tensor, target_std: torch.Tensor) -> torch.T
     return torch.mean(F.relu(target_std - pred_std))
 
 
-def window_latent_tokens(
+def crop_zuna_latent(
     latent: torch.Tensor,
-    onset_tc: int,
     n_channels: int = 62,
     tc: int = 40,
-    pre_frames: int = 4,
-    post_frames: int = 12,
+    d: int = 32,
+    tc_start: int = 20,
+    tc_end: int = 36,
 ) -> torch.Tensor:
     """
     Slice a ZUNA post_mmd latent to a temporal window around the stimulus onset.
-    Tokens are laid out channel-major: [ch0_t0, ch0_t1, ..., ch0_t39, ch1_t0, ...].
-    Args:
-        latent:     [n_channels*tc, D]  full epoch tokens
-        onset_tc:   coarse-time index of event onset (e.g. 24 for anchor 768@256Hz)
-        pre_frames: frames before onset (0.5s = 4 frames at 125ms/frame)
-        post_frames: frames after onset (1.5s = 12 frames)
-    Returns:
-        [n_channels * (pre_frames + post_frames), D]
     """
-    t_start = max(0, onset_tc - pre_frames)
-    t_end   = min(tc, onset_tc + post_frames)
-    # reshape to [n_channels, tc, D], select time window, flatten back
-    spatial = latent.view(n_channels, tc, latent.shape[-1])   # [C, T, D]
-    windowed = spatial[:, t_start:t_end, :]                   # [C, W, D]
-    return windowed.reshape(-1, latent.shape[-1])              # [C*W, D]
+    if tc_start == 20 and tc_end == 36 and d == 32 and tc == 40 and n_channels == 62:
+        assert latent.shape == (2480, 32), f"Expected input latent shape (2480, 32), got {latent.shape}"
+        x = latent.view(n_channels, tc, d)
+        cropped = x[:, tc_start:tc_end, :].reshape(n_channels * (tc_end - tc_start), d)
+        assert cropped.shape == (992, 32), f"Expected cropped latent shape (992, 32), got {cropped.shape}"
+        return cropped
+    else:
+        x = latent.view(n_channels, tc, d)
+        return x[:, tc_start:tc_end, :].reshape(-1, d)
+
 
 class ZunaLatentTargetDataset(Dataset):
     """
@@ -80,14 +76,14 @@ class ZunaLatentTargetDataset(Dataset):
         use_temporal_window: bool = True,
         n_channels: int = 62,
         tc: int = 40,
-        pre_frames: int = 4,
-        post_frames: int = 12,
+        latent_tc_start: int = 20,
+        latent_tc_end: int = 36,
     ):
         self.use_temporal_window = use_temporal_window
         self.n_channels = n_channels
         self.tc = tc
-        self.pre_frames = pre_frames
-        self.post_frames = post_frames
+        self.latent_tc_start = latent_tc_start
+        self.latent_tc_end = latent_tc_end
         # Resolve cache dir and split paths
         if os.path.isdir(latents_pt_path):
             cache_dir = latents_pt_path
@@ -174,10 +170,9 @@ class ZunaLatentTargetDataset(Dataset):
 
         # Compute latent_seq_len after optional temporal windowing
         if self.use_temporal_window:
-            onset_tc = self.valid_records[0].get("onset_tc", 24)
-            first_windowed = window_latent_tokens(
-                first_latent, onset_tc, self.n_channels, self.tc,
-                self.pre_frames, self.post_frames
+            first_windowed = crop_zuna_latent(
+                first_latent, self.n_channels, self.tc, self.latent_dim,
+                self.latent_tc_start, self.latent_tc_end
             )
             self.latent_seq_len = first_windowed.shape[0]
         else:
@@ -185,8 +180,14 @@ class ZunaLatentTargetDataset(Dataset):
 
         print(f"Latent dim: {self.latent_dim} | Latent seq: {self.latent_seq_len} | Target dim: {self.target_dim}")
         if self.use_temporal_window:
-            print(f"Temporal window: onset_tc±{self.pre_frames}/{self.post_frames} frames "
-                  f"({self.pre_frames*125}ms pre / {self.post_frames*125}ms post)")
+            onset_tc = self.valid_records[0].get("onset_tc", 24)
+            pre_s = (self.latent_tc_start - onset_tc) * 0.125
+            post_s = (self.latent_tc_end - onset_tc) * 0.125
+            print(f"latent_crop_window_s = [{pre_s:+.1f}, {post_s:+.1f}]")
+            print(f"latent_tc_start = {self.latent_tc_start}")
+            print(f"latent_tc_end = {self.latent_tc_end}")
+            print(f"tokens_before = {self.n_channels * self.tc}")
+            print(f"tokens_after = {self.latent_seq_len}")
         
         self.target_mode = target_mode
         n = len(self.valid_records)
@@ -216,10 +217,9 @@ class ZunaLatentTargetDataset(Dataset):
 
         # Apply temporal window (spatial reshape then time slice)
         if self.use_temporal_window:
-            onset_tc = record.get("onset_tc", 24)
-            latent = window_latent_tokens(
-                latent, onset_tc, self.n_channels, self.tc,
-                self.pre_frames, self.post_frames
+            latent = crop_zuna_latent(
+                latent, self.n_channels, self.tc, self.latent_dim,
+                self.latent_tc_start, self.latent_tc_end
             )
 
         # The "true" target is always the real image embedding — used for eval
@@ -419,10 +419,10 @@ def main():
 
     # Temporal windowing
     parser.add_argument("--temporal-window", action="store_true", default=True,
-                        help="Slice post_mmd tokens to [-0.5s, +1.5s] window around event onset")
+                        help="Slice post_mmd tokens to event window")
     parser.add_argument("--no-temporal-window", action="store_false", dest="temporal_window")
-    parser.add_argument("--pre-frames", type=int, default=4, help="Frames before onset (125ms each, default 4=0.5s)")
-    parser.add_argument("--post-frames", type=int, default=12, help="Frames after onset (default 12=1.5s)")
+    parser.add_argument("--latent-tc-start", type=int, default=20, help="Latent time slice start index")
+    parser.add_argument("--latent-tc-end", type=int, default=36, help="Latent time slice end index (exclusive)")
     
     # QFormer architecture
     parser.add_argument("--num-query-tokens", type=int, default=32, help="Number of query tokens")
@@ -486,8 +486,8 @@ def main():
         shuffle_seed=args.seed,
         subject_list=subject_list,
         use_temporal_window=args.temporal_window,
-        pre_frames=args.pre_frames,
-        post_frames=args.post_frames,
+        latent_tc_start=args.latent_tc_start,
+        latent_tc_end=args.latent_tc_end,
     )
     
     # Explicit splits determination
@@ -543,7 +543,7 @@ def main():
     print(f"Saving checkpoints and metrics to {run_dir}")
 
     # Fit PCA if target space is a PCA target
-    if is_pca and args.target_mode != "random":
+    if is_pca:
         train_image_ids = set()
         for idx in train_indices:
             rec = full_dataset.valid_records[idx]

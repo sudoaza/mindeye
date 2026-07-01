@@ -1,82 +1,69 @@
 # MindEye Scripts
 
-This directory contains the orchestration scripts for the MindEye EEG-to-CLIP pipeline.
+This directory contains the orchestration scripts for the MindEye **ZUNA → QFormer → RAE** pipeline.
+Doc index: [`../docs/README.md`](../docs/README.md). Architecture/roadmap: [`../docs/PLAN.md`](../docs/PLAN.md).
 
 ## 1. Data Preparation
-* `download_nod.py`: Downloads continuous NOD dataset recordings from OpenNeuro (Runs 1-8).
+* `download_nod.py`: Downloads continuous NOD dataset recordings from OpenNeuro.
 * `sync_stimuli_s3_targeted.py`: Syncs ImageNet stimuli images from S3.
 
 ## 2. Signal Processing
 * `run_zuna_batch.py`: Orchestrates the continuous ZUNA diffusion-based denoising pipeline on the raw `.fif` files.
-* `run_cropper.py`: Crops the continuous files into semantic epochs. 
-  * *Canonical Usage*: `python scripts/run_cropper.py --mode zuna --full5s-backaligned --add-event-marker`
+* `run_cropper.py`: Crops the continuous files into semantic epochs, onset-back-aligned.
+  * *Canonical Usage*: `python scripts/run_cropper.py --mode zuna --tmin -0.2 --tmax 1.0 --add-event-marker`
 
-## 3. Multimodal Latent Space
-* `generate_clip_embeddings.py`: Generates canonical 512-dim CLIP embeddings for stimuli images.
+## 3. Multimodal Target Spaces
+* `generate_clip_embeddings.py`: Generates 512-dim CLIP embeddings for stimuli images.
 * `generate_image_semantics.py`: Uses a VLM (Qwen2-VL) to extract semantic captions from images.
 * `generate_text_embeddings.py`: Generates text CLIP embeddings (from captions or ImageNet labels).
-* `build_common_embeddings.py`: Fuses image, semantic, and label signals into a single `z_common` target space using $L_2$ normalization and weighted combinations.
-* `generate_vlm_attributes.py`: Qwen2-VL JSON labels for 29 semantic attributes (Tier-1 + calibration). See [`docs/VLM_ATTRIBUTES.md`](../docs/VLM_ATTRIBUTES.md).
+* `build_common_embeddings.py`: Fuses image/semantic/label signals into the CLIP `common` target (semantic baseline).
+* `build_rae_latent_bank.py`: Builds the **RAE / DINOv2 embedding bank** — the primary reconstruction target.
+* `generate_vlm_attributes.py`: Qwen2-VL JSON labels for 29 semantic attributes. See [`../docs/VLM_ATTRIBUTES.md`](../docs/VLM_ATTRIBUTES.md).
 * `analyze_vlm_attributes.py`: Audit image coverage, per-attribute unclear %, missing calibration keys.
-* `run_backfill_vlm_attributes.sh`: RunPod helper — pre-audit, `--tier calibration --merge`, post-audit.
 
-## 4. Core Training Pipeline
-* `train_eeg_clip.py`: The single-condition training loop. Uses the `ZunaClipPairDataset` and trains an EEG encoder (e.g. `temporal_attn_small` or `cnn`) against the multimodal target space.
-* `run_baseline_matrix.py`: Orchestrates comparative matrix runs (e.g., `zuna_real` vs `zuna_shuffled` vs `zuna_random`). Outputs results to a timestamped matrix directory and streams progress to `matrix_run.log`.
+## 4. Core Training Pipeline (current — QFormer bridge)
+* `cache_zuna_latents.py`: Caches ZUNA `post_mmd` latents (the QFormer input) to `data/processed/zuna_latents/`.
+* `train_zuna_to_vision.py`: Trains the `ZunaToVisionQFormer` bridge (ZUNA latents → vision target). Supports `real / shuffled / random` target modes and onset-crop windowing.
+* `run_qformer_grid.py`: Orchestrates the QFormer grid over target spaces (CLIP-Common-512, DINO-Unit-768, DINO-PCA-256/128) × control modes, then runs the 10,000-iter paired bootstrap.
 
-## Canonical Execution Order (Sprint 2/3)
-To reproduce the Phase 3 architecture from scratch, run the scripts in this sequence:
+## Canonical Execution Order (ZUNA → QFormer → RAE)
+Run on the pod with `export PYTHONPATH=src`. See [`../docs/CHEAT.md`](../docs/CHEAT.md) and `cold_start.sh`.
 
 ```bash
-# 1. Fetch Data
+# 1. Fetch data
 python scripts/download_nod.py --subject sub-01 --runs 1-8
 python scripts/sync_stimuli_s3_targeted.py
 
-# 2. Process Signals
+# 2. Process signals (ZUNA denoise + onset-aligned crop)
 python scripts/run_zuna_batch.py --diffusion-steps 15
-python scripts/run_cropper.py \
-    --mode zuna \
-    --tmin -0.2 --tmax 1.0 \
-    --add-event-marker \
+python scripts/run_cropper.py --mode zuna --tmin -0.2 --tmax 1.0 --add-event-marker \
     --runs 1 2 3 4 5 6 7 8 \
     --zuna-dir data/processed/zuna_real/4_fif_output \
     --output-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08
 
-# 3. Generate Multimodal Latent Space
-python scripts/generate_clip_embeddings.py
-python scripts/generate_text_embeddings.py
-python scripts/generate_image_semantics.py
-python scripts/build_common_embeddings.py \
-    --image-embeddings data/processed/clip_embeddings/sub01_image_embeddings.pt \
-    --semantic-embeddings data/processed/clip_embeddings/image_semantic_text_embeddings.pt \
-    --label-embeddings data/processed/clip_embeddings/imagenet_text_embeddings.pt \
-    --metadata data/raw/nod/derivatives/detailed_events/sub-01_events.csv \
-    --w-img 0.25 --w-sem 0.65 --w-lbl 0.10 \
-    --output data/processed/clip_embeddings/common_embeddings.pt
+# 3. Build target spaces
+python scripts/build_common_embeddings.py ...   # CLIP common (semantic baseline)
+python scripts/build_rae_latent_bank.py \
+    --image-dir data/raw/nod/stimuli/ImageNet \
+    --output data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt
 
-# 4. Train Model via Baseline Matrix
-# First, pretrain the common probe model on static visual embeddings
-python scripts/pretrain_common_probe.py \
-    --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
-    --vlm-attributes data/processed/clip_embeddings/vlm_attributes.json \
-    --metadata data/raw/nod/derivatives/detailed_events/sub-01_events.csv \
-    --output-dir outputs/common_probe
-
-# Then, train the EEG model using the baseline matrix and pass the pretrained probe
-python scripts/run_baseline_matrix.py \
-    --metadata data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08/all_runs_metadata.csv \
+# 4. Cache ZUNA latents (QFormer input)
+python scripts/cache_zuna_latents.py \
     --epochs-dir data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_08 \
-    --common-embeddings data/processed/clip_embeddings/common_embeddings.pt \
-    --common-probe outputs/common_probe/common_probe.pt \
-    --probe-weight 0.03 \
-    --val-runs 8 \
-    --window-mode tight1s \
-    --model temporal_attn_small \
-    --epochs 50 \
-    --batch-size 64 \
-    --device cuda \
-    --slug common_space_sprint2 \
-    --add-event-marker \
-    --augment-eeg \
-    --conditions zuna_real zuna_shuffled zuna_random
+    --output-dir data/processed/zuna_latents/sub01_runs01_08 \
+    --layers post_mmd
+
+# 5. Train + evaluate the QFormer bridge grid (real / shuffled / random + paired bootstrap)
+python scripts/run_qformer_grid.py \
+    --latents-pt data/processed/zuna_latents/sub01_runs01_08 \
+    --clip-pt    data/processed/clip_embeddings/common_embeddings.pt \
+    --rae-pt     data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
+    --epochs 40 --patience 8 --batch-size 64 --lr 3e-4 \
+    --device cuda --out-dir outputs/qformer_aligned_grid
 ```
+
+## ⛔ Deprecated scripts (kept for reference, not the live plan)
+See [`../docs/PLAN.md`](../docs/PLAN.md) §6 for the post-mortem.
+
+* Decode_unit / unCLIP branch: `train_eeg_decode_common.py`, `build_decode_common_embeddings.py`, `evaluate_clip_native_decoder.py`, `pretrain_common_probe.py`, `run_baseline_matrix.py` (`make matrix`).
+* RAE code-bottleneck branch: `train_rae_token_bottleneck.py`, `build_rae_bottleneck_codes.py`, `build_rae_code_stats.py`, `run_phase17_rae.sh`, `run_phase18*.sh`, `train_eeg_clip.py` (`--loss expander_aligned` / `spatial_cosine*`).

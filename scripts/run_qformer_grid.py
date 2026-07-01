@@ -73,6 +73,8 @@ def main():
     parser.add_argument("--temporal-window", action="store_true", default=True,
                         help="Enable temporal windowing in train script (default: on)")
     parser.add_argument("--no-temporal-window", action="store_false", dest="temporal_window")
+    parser.add_argument("--latent-tc-start", type=int, default=20, help="Latent time slice start index")
+    parser.add_argument("--latent-tc-end", type=int, default=36, help="Latent time slice end index (exclusive)")
     args = parser.parse_args()
     
     # --- Smoke-test overrides ---
@@ -118,6 +120,7 @@ def main():
     
     for layer in layers:
         for target_name, target_space, target_path in targets:
+            processes = []
             for mode in modes:
                 if not os.path.exists(target_path):
                     print(f"Warning: Target path {target_path} not found. Skipping {target_name} ({mode}).")
@@ -125,7 +128,7 @@ def main():
                     
                 slug = f"grid_{layer}_{target_name}_{mode}"
                 print(f"\n==================================================")
-                print(f" Running: Layer={layer} | Target={target_name} | Mode={mode}")
+                print(f" Preparing: Layer={layer} | Target={target_name} | Mode={mode}")
                 print(f"==================================================")
                 
                 cmd = [
@@ -146,7 +149,11 @@ def main():
                 ]
                 # Pass temporal window flag
                 if args.temporal_window:
-                    cmd.append("--temporal-window")
+                    cmd += [
+                        "--temporal-window",
+                        "--latent-tc-start", str(args.latent_tc_start),
+                        "--latent-tc-end", str(args.latent_tc_end),
+                    ]
                 else:
                     cmd.append("--no-temporal-window")
                 # Pass run splits if specified
@@ -159,14 +166,19 @@ def main():
                 
                 env = {**os.environ, "PYTHONPATH": "src"}
                 
+                print(f"Launching subprocess: Layer={layer} | Target={target_name} | Mode={mode}")
                 process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                for line in process.stdout:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-                process.wait()
+                processes.append((mode, slug, process))
+                
+            # Wait for all modes in this target group to complete
+            for mode, slug, process in processes:
+                print(f"\nWaiting for {target_name} ({mode}) to finish...")
+                stdout, _ = process.communicate()
+                print(f"=== Subprocess Output for {target_name} ({mode}) ===")
+                print(stdout)
                 
                 if process.returncode != 0:
-                    print(f"❌ Run failed with code {process.returncode}")
+                    print(f"❌ {target_name} ({mode}) failed with code {process.returncode}")
                     continue
                     
                 # Find output directory
