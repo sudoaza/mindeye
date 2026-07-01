@@ -35,11 +35,14 @@ mcp_runpod_stop-pod   {"podId": "<POD_ID>"}
 
 ## SSH & File Transfer
 
-Always use `-i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no`.
+**Two keys**: `~/.ssh/runpod` = laptop→pod (`ssh -i ~/.ssh/runpod`); `~/.ssh/id_ed25519` = GitHub.
+Always use the **SSH git URL** (`git@github.com:sudoaza/mindeye.git`). The pod has no GitHub key →
+**forward the agent**: `ssh-add ~/.ssh/id_ed25519` then `ssh -A ... -i ~/.ssh/runpod`.
 
 ### Preferred: git pull on pod (no file transfer needed)
 ```bash
-ssh -p <PORT> root@<IP> "cd /workspace/mindeye && git pull origin master"
+ssh-add ~/.ssh/id_ed25519
+ssh -A -p <PORT> root@<IP> -i ~/.ssh/runpod "cd /workspace/mindeye && git pull origin master"
 ```
 
 ### Rsync (last resort — debugging only)
@@ -64,8 +67,12 @@ rsync -avz --no-o --no-g --no-perms \
 
 ### Install Dependencies
 ```bash
-# System Python on the pod — no venv. torch==2.6.0+cu124 is pinned in requirements.txt:
-ssh -p <PORT> root@<IP> "cd /workspace/mindeye && pip install -r requirements.txt"
+# The pod image already ships torch 2.8.0+cu128 — do NOT reinstall torch.
+# Install only the non-torch deps (system Python, --break-system-packages for Ubuntu 24.04 PEP 668):
+ssh -p <PORT> root@<IP> -i ~/.ssh/runpod \
+  "cd /workspace/mindeye && \
+   grep -vE '^(--extra-index-url|torch==|torchvision==|torchaudio==|nvidia-cudnn|\$)' requirements.txt > /tmp/reqs_notorch.txt && \
+   pip install --break-system-packages -r /tmp/reqs_notorch.txt"
 ```
 
 ---
@@ -172,7 +179,7 @@ pkill -f 'python.*run_baseline_matrix' # Kill matrix run
 
 ### RunPod & Infrastructure
 
-- **SSH key mismatch on pod creation**: Pods not provisioned with `~/.ssh/id_ed25519.pub` as `PUBLIC_KEY` will prompt for a password and block SSH. Always explicitly pass the ed25519 pub key.
+- **SSH key mismatch on pod creation**: Pods not provisioned with `~/.ssh/runpod.pub` as `PUBLIC_KEY` will prompt for a password and block SSH. Always explicitly pass the ed25519 pub key. (The GitHub key `~/.ssh/id_ed25519` is separate — forward it with `ssh -A` for git operations.)
 - **rsync overwrites remote checkpoints**: See the [rsync note above](#ssh--file-transfer). Pull before push.
 - **FlexAttention OOM / missing features**: PyTorch < 2.6.0 on the base RunPod image causes `flex_attention` CUDA OOMs. Always upgrade to `torch==2.6.0+cu124` after pod creation.
 - **`source venv/bin/activate` on pod**: The pod uses system Python with no venv. Replace `source venv/bin/activate` with `export PYTHONPATH=src` in any scripts synced to the pod.

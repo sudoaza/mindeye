@@ -63,27 +63,35 @@ mcp_runpod_stop-pod   {"podId": "<POD_ID>"}
 {
   "cloudType": "SECURE",
   "gpuCount": 1,
+  "gpuTypeIds": ["NVIDIA A40"],
   "volumeInGb": 200,
   "containerDiskInGb": 100,
-  "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+  "imageName": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
   "name": "mindeye-qformer",
   "ports": ["22/tcp"],
   "volumeMountPath": "/workspace",
-  "env": {"PUBLIC_KEY": "<your ed25519 pubkey>"}
+  "env": {"PUBLIC_KEY": "<contents of ~/.ssh/runpod.pub>"}
 }
 ```
+> The MCP `create-pod` cannot attach an existing network volume → MCP pods get a fresh empty volume
+> (bootstrap via `cold_start.sh`). Reuse a persistent volume via the RunPod web UI. See `docs/INFRA.md`.
 
 ### SSH & Setup
+Two keys: **`~/.ssh/runpod`** = laptop→pod; **`~/.ssh/id_ed25519`** = GitHub (SSH git URL always).
+The pod has no GitHub key → forward the agent (`ssh -A` after `ssh-add ~/.ssh/id_ed25519`).
 ```bash
-ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no
+ssh-add ~/.ssh/id_ed25519
+ssh -A root@<IP> -p <PORT> -i ~/.ssh/runpod -o StrictHostKeyChecking=no
 
-# On pod: clone / pull latest code
-cd /workspace && git clone <repo_url> mindeye
+# On pod: clone / pull latest code over the SSH git URL (uses forwarded key)
+cd /workspace && git clone git@github.com:sudoaza/mindeye.git mindeye
 # or: cd /workspace/mindeye && git pull origin master
 
-# Install dependencies (torch + cu124 pinned in requirements.txt)
+# Install deps. Image ships torch 2.8.0+cu128 — do NOT reinstall torch.
+# Install only non-torch deps (--break-system-packages for Ubuntu 24.04 PEP 668):
 cd /workspace/mindeye
-pip install -r requirements.txt
+grep -vE '^(--extra-index-url|torch==|torchvision==|torchaudio==|nvidia-cudnn|$)' requirements.txt > /tmp/reqs_notorch.txt
+pip install --break-system-packages -r /tmp/reqs_notorch.txt
 
 export PYTHONPATH=src   # always prefix this
 ```

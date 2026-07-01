@@ -31,18 +31,28 @@ mcp_runpod_get-pod    {"podId": "<POD_ID>", "includeMachine": true}   # get IP +
 ```
 
 To provision a new pod, use the JSON in `docs/INFRA.md` §3 (`volumeInGb: 200`, `containerDiskInGb: 100`,
-`PUBLIC_KEY` = contents of `~/.ssh/id_ed25519.pub`).
+`gpuTypeIds: ["NVIDIA A40"]`, `PUBLIC_KEY` = contents of `~/.ssh/runpod.pub`).
 
-> **Network volumes are datacenter-local.** Create the pod in the same DC as the volume, or it
-> cannot mount at `/workspace`. See `docs/INFRA.md` §2 for the detach/reattach procedure.
+> **The runpod MCP cannot attach an existing network volume** (no `networkVolumeId` field), so an
+> MCP-created pod gets a **fresh, empty volume** → bootstrap from scratch with `cold_start.sh`. To
+> reuse a persistent volume, create the pod in the RunPod **web UI** in the volume's datacenter.
 
 ## 2. Code + deps (on pod)
 
+Two keys: **`~/.ssh/runpod`** = laptop→pod; **`~/.ssh/id_ed25519`** = GitHub. Always use the **SSH git
+URL** (`git@github.com:sudoaza/mindeye.git`). The pod has no GitHub key, so **forward the agent** (`ssh -A`
+after `ssh-add ~/.ssh/id_ed25519`) — no private key lands on the pod.
+
 ```bash
-ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
-  "cd /workspace/mindeye && git pull origin master && pip install -r requirements.txt"
+ssh-add ~/.ssh/id_ed25519
+ssh -A root@<IP> -p <PORT> -i ~/.ssh/runpod -o StrictHostKeyChecking=no \
+  "cd /workspace/mindeye && git pull origin master && \
+   grep -vE '^(--extra-index-url|torch==|torchvision==|torchaudio==|nvidia-cudnn|$)' requirements.txt > /tmp/reqs_notorch.txt && \
+   pip install --break-system-packages -r /tmp/reqs_notorch.txt"
 ```
 
+The image ships torch 2.8.0+cu128 — **don't reinstall torch** (skip the pin lines above) or you'll
+trigger a cudnn-breaking downgrade. `--break-system-packages` is required on Ubuntu 24.04 (PEP 668).
 Prefer `git pull` over rsync. **If you must rsync, pull `outputs/` first** — local copies silently
 overwrite pod checkpoints (`docs/CHEAT.md`).
 
@@ -53,12 +63,11 @@ export PYTHONPATH=/workspace/mindeye/src HF_HOME=/workspace/hf_cache TMPDIR=/wor
 
 ## 3. Run (background, survives SSH drop)
 
-Launch the current pipeline (QFormer grid) via `nohup` so it survives disconnection:
+Launch the current pipeline (QFormer grid, RAE-only) via `nohup` so it survives disconnection:
 ```bash
-ssh root@<IP> -p <PORT> \
+ssh root@<IP> -p <PORT> -i ~/.ssh/runpod \
   "cd /workspace/mindeye && export PYTHONPATH=src && nohup python scripts/run_qformer_grid.py \
      --latents-pt data/processed/zuna_latents/sub01_runs01_32 \
-     --clip-pt data/processed/clip_embeddings/common_embeddings.pt \
      --rae-pt data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
      --train-runs 1-24 --val-runs 25-28 --test-runs 29-32 \
      --device cuda --out-dir outputs/qformer_aligned_grid \
@@ -68,7 +77,7 @@ ssh root@<IP> -p <PORT> \
 ## 4. Monitor
 
 ```bash
-ssh root@<IP> -p <PORT> "tail -n 50 /workspace/mindeye/qformer_grid.log; echo '---'; ps aux | grep -c '[p]ython'"
+ssh root@<IP> -p <PORT> -i ~/.ssh/runpod "tail -n 50 /workspace/mindeye/qformer_grid.log; echo '---'; ps aux | grep -c '[p]ython'"
 ```
 Gather multiple checks in one SSH call — connection overhead is significant. The **gate** is the
 paired-bootstrap table: real − shuffled Δ > +0.005, 95% CI excludes 0, `collapse_pct` < 20%.

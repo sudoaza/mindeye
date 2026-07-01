@@ -40,7 +40,7 @@ The volume is the durable artifact; pods are disposable.
 
 1. **Stop or delete** the old pod (`mcp_runpod_stop-pod` / `mcp_runpod_delete-pod`). Stopping preserves the pod shell; deleting frees it entirely — the volume survives either way.
 2. **Create/start** the new pod **in the same datacenter as the volume**, attaching the existing network volume at `/workspace`.
-3. On the new pod: `cd /workspace/mindeye && git pull` → `pip install -r requirements.txt` → `export PYTHONPATH=src`. Data/outputs/cache are already present from the volume.
+3. On the new pod: `cd /workspace/mindeye && git pull` (SSH git URL, agent-forwarded key) → install non-torch deps (§4) → `export PYTHONPATH=src`. Data/outputs/cache are already present from the volume.
 
 > [!IMPORTANT]
 > **Network volumes are datacenter-local.** A pod in `EUR-NO-2` cannot mount a volume created in `EU-RO-1`. Always check the volume's `dataCenterId` and create the pod in the same DC. This is the #1 cause of "my data is gone" — it isn't gone, the pod just can't reach the volume.
@@ -57,7 +57,7 @@ The volume is the durable artifact; pods are disposable.
 | **CPU RAM** | ≥ 32 GB | Dataloaders and dataset preloading |
 | **Container disk** | 100 GB | Ephemeral scratch, pip build cache, torch tmp |
 | **Network volume** | 200 GB | Persistent `/workspace`: raw EEG + processed data + outputs + hf_cache |
-| **Image** | `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` | Matches pinned torch/CUDA (`torch==2.6.0+cu124`) in `requirements.txt` |
+| **Image** | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (Runpod PyTorch 2.8) | Ships torch 2.8.0+cu128, ready to use. **Do not force the `torch==2.6.0+cu124` pin from `requirements.txt` onto this image** — install only the non-torch deps (see §4) to avoid a cudnn-conflicting downgrade. |
 
 > Canonical sizes: **containerDiskInGb = 100**, **volumeInGb = 200**. Earlier docs quoted 50/80–100;
 > those are too tight once all 4 subjects at full runs (~20 GB raw each) plus ZUNA outputs, embedding
@@ -70,26 +70,53 @@ The volume is the durable artifact; pods are disposable.
 {
   "cloudType": "SECURE",
   "gpuCount": 1,
+  "gpuTypeIds": ["NVIDIA A40"],
   "volumeInGb": 200,
   "containerDiskInGb": 100,
-  "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+  "imageName": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
   "name": "mindeye-qformer",
   "ports": ["22/tcp"],
   "volumeMountPath": "/workspace",
-  "env": {"PUBLIC_KEY": "<contents of ~/.ssh/id_ed25519.pub>"}
+  "env": {"PUBLIC_KEY": "<contents of ~/.ssh/runpod.pub>"}
 }
 ```
 
 > [!WARNING]
-> Pods not provisioned with your `~/.ssh/id_ed25519.pub` as `PUBLIC_KEY` will prompt for a password and block SSH. Always pass the ed25519 pub key.
+> Pods not provisioned with your `~/.ssh/runpod.pub` as `PUBLIC_KEY` will prompt for a password and
+> block SSH. Always pass the ed25519 pub key. SSH to the pod with `-i ~/.ssh/runpod`.
+
+> [!IMPORTANT]
+> **The runpod MCP `create-pod` / `update-pod` cannot attach an existing network volume** — there is
+> no `networkVolumeId` field in the MCP schema, and MCP-created pods may land in a different
+> datacenter than the volume. In practice, **an MCP-created pod gets a fresh, empty volume** and must
+> be bootstrapped from scratch (§4c). To reuse a persistent volume (e.g. `mindeye-netvol-100gb` in
+> `EU-RO-1`), create the pod in the **RunPod web UI**, selecting that volume, then drive it over SSH.
+> Choose your path per run: MCP = fast + disposable; UI = persistent data.
 
 ## 4. Fresh-pod setup
 
-```bash
-ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no
+Two distinct SSH keys are in play:
+- **`~/.ssh/runpod`** — laptop → pod access (the pod's `PUBLIC_KEY`). Use with `ssh -i ~/.ssh/runpod`.
+- **`~/.ssh/id_ed25519`** — GitHub auth. **Always use the SSH git URL** (`git@github.com:sudoaza/mindeye.git`).
+  Locally this "just works" via `~/.ssh/config`. On the **pod** the GitHub key is not present, so either
+  **forward the agent** (`ssh -A`, with the key added via `ssh-add ~/.ssh/id_ed25519`) or copy the key
+  to the pod. Agent forwarding is preferred — no private key ever lands on the pod.
 
-cd /workspace/mindeye && git pull origin master     # code (volume or fresh clone)
-pip install -r requirements.txt                     # system Python, no venv
+```bash
+# From the laptop: make the GitHub key available for forwarding, then SSH with -A
+ssh-add ~/.ssh/id_ed25519
+ssh -A root@<IP> -p <PORT> -i ~/.ssh/runpod -o StrictHostKeyChecking=no
+
+# On the pod: clone/pull over the SSH git URL (uses the forwarded key)
+cd /workspace && git clone git@github.com:sudoaza/mindeye.git mindeye   # fresh volume
+# or: cd /workspace/mindeye && git pull origin master                   # existing volume
+# (existing HTTPS remote? switch it: git remote set-url origin git@github.com:sudoaza/mindeye.git)
+
+# Deps: the image already ships torch 2.8.0+cu128. Install only the non-torch deps
+# (skipping the torch/cu124 pin lines) with --break-system-packages (Ubuntu 24.04 PEP 668):
+cd /workspace/mindeye
+grep -vE '^(--extra-index-url|torch==|torchvision==|torchaudio==|nvidia-cudnn|$)' requirements.txt > /tmp/reqs_notorch.txt
+pip install --break-system-packages -r /tmp/reqs_notorch.txt
 
 # Always set before any script:
 export PYTHONPATH=/workspace/mindeye/src
@@ -132,7 +159,7 @@ so **no data needs to be pushed from the laptop**.
 - [ ] Raw EEG + stimuli   → data/raw/nod/        (OpenNeuro ds005811, public)
 - [ ] ZUNA denoise        → data/processed/zuna_real/
 - [ ] Onset-aligned crop  → data/processed/semantic_epochs/
-- [ ] Target banks        → data/processed/{clip_embeddings,rae_embeddings}/
+- [ ] Target banks        → data/processed/rae_embeddings/   (RAE/DINO; CLIP dropped)
 - [ ] Cache ZUNA latents  → data/processed/zuna_latents/
 ```
 
@@ -168,7 +195,7 @@ Host mindeye-pod
   HostName <PUBLIC_IP>
   Port <SSH_PORT>
   User root
-  IdentityFile ~/.ssh/id_ed25519
+  IdentityFile ~/.ssh/runpod
   StrictHostKeyChecking no
 ```
 
