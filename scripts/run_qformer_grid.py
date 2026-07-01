@@ -54,7 +54,6 @@ def align_and_compute_deltas(real_data, control_data):
 def main():
     parser = argparse.ArgumentParser(description="Run minimal QFormer training grid with bootstrap evaluation.")
     parser.add_argument("--latents-pt", type=str, default="/workspace/mindeye/data/processed/zuna_latents/sub01_runs01_32")
-    parser.add_argument("--clip-pt", type=str, default="/workspace/mindeye/data/processed/clip_embeddings/common_embeddings.pt")
     parser.add_argument("--rae-pt", type=str, default="/workspace/mindeye/data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt")
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs per run")
     parser.add_argument("--patience", type=int, default=8, help="Early stopping patience")
@@ -66,9 +65,9 @@ def main():
     parser.add_argument("--train-runs", type=str, default=None, help="Train run range, e.g. '1-24'")
     parser.add_argument("--val-runs", type=str, default=None, help="Val run range, e.g. '25-28'")
     parser.add_argument("--test-runs", type=str, default=None, help="Test run range, e.g. '29-32'")
-    # Smoke-test mode: CLIP-only, 8 runs, fixed splits, fast epochs
+    # Smoke-test mode: RAE-only (DINO-Unit-768), 8 runs, fixed splits, fast epochs
     parser.add_argument("--smoke-test", action="store_true", default=False,
-                        help="Smoke test: CLIP-only, 8 runs (1-6 train, 7-8 val), 25 epochs, batch 32")
+                        help="Smoke test: RAE DINO-Unit-768 only, 8 runs (1-6 train, 7-8 val), 25 epochs, batch 32")
     # Temporal windowing
     parser.add_argument("--temporal-window", action="store_true", default=True,
                         help="Enable temporal windowing in train script (default: on)")
@@ -79,13 +78,13 @@ def main():
     
     # --- Smoke-test overrides ---
     if args.smoke_test:
-        print("=== SMOKE TEST MODE: CLIP-only, runs 1-6 train / 7-8 val, 25 epochs ===")
+        print("=== SMOKE TEST MODE: RAE DINO-Unit-768 only, runs 1-6 train / 7-8 val, 25 epochs ===")
         epochs = args.epochs if args.epochs != 40 else 25
         batch_size = args.batch_size if args.batch_size != 64 else 32
         train_runs = args.train_runs or "1-6"
         val_runs   = args.val_runs   or "7-8"
         test_runs  = args.test_runs  or ""
-        targets = [("CLIP-Common-512", "CLIP-Common-512", args.clip_pt)]
+        targets = [("DINO-Unit-768", "DINO-Unit-768", args.rae_pt)]
     else:
         epochs = args.epochs
         batch_size = args.batch_size
@@ -93,7 +92,6 @@ def main():
         val_runs   = args.val_runs
         test_runs  = args.test_runs
         targets = [
-            ("CLIP-Common-512", "CLIP-Common-512", args.clip_pt),
             ("DINO-Unit-768", "DINO-Unit-768", args.rae_pt),
             ("DINO-PCA-256-Unit", "DINO-PCA-256-Unit", args.rae_pt),
             ("DINO-PCA-128-Unit", "DINO-PCA-128-Unit", args.rae_pt)

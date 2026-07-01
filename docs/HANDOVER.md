@@ -19,14 +19,14 @@ Three frozen/learned components, each chosen because it is the best available to
 |---|---|---|
 | **ZUNA** | EEG embedding | EEG foundation model; recovers signal features best. Used frozen; we cache its `post_mmd` latents. |
 | **QFormer** | Bridge | Learned ZUNA→vision adapter. Simple linear/MLP adapters did **not** work; QFormer's query-token cross-attention is the bridge. |
-| **RAE** | Reconstruction target | Best visual reconstruction fidelity. CLIP/ViT was acceptable semantically but visually imprecise. |
+| **RAE** | Reconstruction target | Best visual reconstruction fidelity. CLIP/ViT was acceptable semantically but visually imprecise, so it has been dropped as a target. |
 
 The pipeline:
 
 1. Process continuous EEG through **ZUNA** (frozen EEG foundation diffusion denoiser) → cache `post_mmd` latents.
 2. Onset-crop the cached latents to a tight window around stimulus onset.
 3. Train a **QFormer bridge** (`ZunaToVisionQFormer`) to map ZUNA latents → visual embedding space.
-4. Target the **RAE (DINOv2-based) embedding bank** for reconstruction-grade visual fidelity (CLIP retained as a semantic baseline only).
+4. Target the **RAE (DINOv2-based) embedding bank** for reconstruction-grade visual fidelity. **CLIP has been dropped** — it was only ever a semantic baseline and is no longer a training target.
 
 **Primary gate metric**: full-set retrieval rank against the entire RAE/DINO image bank (`val_top10_norm` / `val_mrr_norm`), with a **paired bootstrap** vs `shuffled`/`random` controls. `within_val` ranking inflates signal and is diagnostic only.
 
@@ -41,7 +41,7 @@ The pipeline:
 | Phase 10–16 | ✅ Complete | Retrieval branch, calibration stimuli, multi-subject scaling, full-bank eval |
 | Phase 17 | ✅ Complete | DINOv2-RAE decoder swap; established RAE as the reconstruction target |
 | Phase 18B–18E | ⛔ Deprecated | EEG→RAE 4×4 *code bottleneck* + expander-aligned loss. Abandoned: codes lacked per-site fidelity to survive non-linear expansion; warm-start Δ collapsed to ~0. **Superseded by the QFormer bridge.** |
-| **QFormer Bridge** | 🚧 In Progress | ZUNA `post_mmd` → QFormer → RAE/CLIP retrieval grid with paired bootstrap controls |
+| **QFormer Bridge** | 🚧 In Progress | ZUNA `post_mmd` → QFormer → RAE (DINO-Unit-768) retrieval grid with paired bootstrap controls |
 
 > **Why we left the 18B–18E code-bottleneck path**: forcing EEG into a tiny `768×4×4` RAE code and then expanding it discarded the per-channel/per-site fidelity RAE's decoder needs. Rather than fight the bottleneck, we now learn the ZUNA→vision mapping directly with a QFormer and rank against the full RAE bank.
 
@@ -63,8 +63,8 @@ mcp_runpod_stop-pod   {"podId": "<POD_ID>"}
 {
   "cloudType": "SECURE",
   "gpuCount": 1,
-  "volumeInGb": 100,
-  "containerDiskInGb": 50,
+  "volumeInGb": 200,
+  "containerDiskInGb": 100,
   "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
   "name": "mindeye-qformer",
   "ports": ["22/tcp"],
@@ -107,7 +107,7 @@ EEG (256 Hz, 5s, 64 ch)
                           • 4× QFormer blocks:
                               self-attn(queries) → cross-attn(queries → ZUNA kv) → FFN
                           • CLS readout → proj_head → d_out → LayerNorm → L2-normalize
-                          └─► vision embedding  (RAE/DINO-768 target; CLIP-512 baseline)
+                          └─► vision embedding  (RAE / DINO-768 target)
 ```
 
 **Loss**: InfoNCE (contrastive) + cosine + variance-floor (anti-collapse, weight 0.05).
@@ -134,8 +134,7 @@ decoder for image generation until then.
 | Cropped epochs (tight1s) | `data/processed/semantic_epochs/zuna_tight1s_sub01_runs01_40/` |
 | **Cached ZUNA latents** | `data/processed/zuna_latents/sub01_runs01_32/` (`latents_post_mmd.pt`, `metadata.pt`) |
 | NOD stimuli (ImageNet) | `data/raw/nod/stimuli/ImageNet/` |
-| **CLIP common embeddings** (baseline target) | `data/processed/clip_embeddings/common_embeddings.pt` |
-| **RAE/DINOv2 embedding bank** (primary target) | `data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt` |
+| **RAE/DINOv2 embedding bank** (target) | `data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt` |
 | VLM attributes | `data/processed/clip_embeddings/vlm_attributes.json` |
 | QFormer grid outputs | `outputs/qformer_aligned_grid/grid_<timestamp>/` |
 
@@ -163,9 +162,7 @@ python scripts/cache_zuna_latents.py \
 
 ### Build target banks
 ```bash
-# CLIP common (semantic baseline target)
-python scripts/build_common_embeddings.py ...   # → common_embeddings.pt
-# RAE / DINOv2 bank (primary reconstruction target)
+# RAE / DINOv2 bank (reconstruction target)
 python scripts/build_rae_latent_bank.py \
     --image-dir data/raw/nod/stimuli/ImageNet \
     --output data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt
@@ -175,7 +172,6 @@ python scripts/build_rae_latent_bank.py \
 ```bash
 python scripts/run_qformer_grid.py \
     --latents-pt data/processed/zuna_latents/sub01_runs01_32 \
-    --clip-pt    data/processed/clip_embeddings/common_embeddings.pt \
     --rae-pt     data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
     --train-runs 1-24 --val-runs 25-28 --test-runs 29-32 \
     --epochs 40 --patience 8 --batch-size 64 --lr 3e-4 \
@@ -184,15 +180,14 @@ python scripts/run_qformer_grid.py \
 ```
 
 The grid trains, for each target space, all three control modes (`real` / `shuffled` / `random`) and
-then runs the paired bootstrap. Target spaces:
-- `CLIP-Common-512` — semantic baseline
+then runs the paired bootstrap. Target spaces (all RAE/DINO — **CLIP has been dropped**):
 - `DINO-Unit-768` — primary RAE target
 - `DINO-PCA-256-Unit`, `DINO-PCA-128-Unit` — lower-rank DINO targets (is a reduced target easier to hit?)
 
-Smoke test (CLIP-only, runs 1-6 train / 7-8 val, fast):
+Smoke test (RAE DINO-Unit-768 only, runs 1-6 train / 7-8 val, fast):
 ```bash
 python scripts/run_qformer_grid.py --smoke-test \
-    --latents-pt <...> --clip-pt <...> --rae-pt <...> --device cuda
+    --latents-pt <...> --rae-pt <...> --device cuda
 ```
 
 ### Gate (both must hold on full-set retrieval)

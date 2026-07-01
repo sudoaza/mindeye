@@ -93,15 +93,14 @@ python scripts/cache_zuna_latents.py \
 ```bash
 python scripts/run_qformer_grid.py \
   --latents-pt data/processed/zuna_latents/sub01_runs01_32 \
-  --clip-pt    data/processed/clip_embeddings/common_embeddings.pt \
   --rae-pt     data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt \
   --train-runs 1-24 --val-runs 25-28 --test-runs 29-32 \
   --epochs 40 --patience 8 --batch-size 64 --lr 3e-4 \
   --device cuda --out-dir outputs/qformer_aligned_grid
 ```
 
-Target spaces: `CLIP-Common-512` (semantic baseline), `DINO-Unit-768` (primary RAE target),
-`DINO-PCA-256-Unit`, `DINO-PCA-128-Unit`. Smoke test: add `--smoke-test` (CLIP-only, runs 1-6/7-8).
+Target spaces (all RAE/DINO — **CLIP dropped**): `DINO-Unit-768` (primary RAE target),
+`DINO-PCA-256-Unit`, `DINO-PCA-128-Unit`. Smoke test: add `--smoke-test` (DINO-Unit-768 only, runs 1-6/7-8).
 
 **Gate**: paired Δ (real − shuffled) > +0.005 with 95% CI excluding 0, `collapse_pct` < 20%,
 on full-set retrieval against the RAE bank.
