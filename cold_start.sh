@@ -3,7 +3,7 @@
 # MindEye EEG-to-Vision Pipeline: End-to-End Cold Start Script
 # ==============================================================================
 # This script automates the complete lifecycle:
-# 1. Environment Setup (venv and pip install)
+# 1. Environment Setup (deps install; skip with SKIP_ENV=1 if already installed)
 # 2. Raw NOD-EEG dataset downloading from OpenNeuro
 # 3. ZUNA Denoising
 # 4. Segmenting continuous recordings into semantic epochs
@@ -14,11 +14,17 @@
 # ==============================================================================
 set -e
 
-echo "=== [1/10] Setting up Python virtual environment ==="
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+# On a RunPod pod the image already ships torch and deps are installed with
+# --break-system-packages (system Python, no venv). Set SKIP_ENV=1 to skip this step.
+if [ "${SKIP_ENV:-0}" != "1" ]; then
+  echo "=== [1/8] Setting up Python virtual environment ==="
+  python3 -m venv venv
+  source venv/bin/activate
+  pip install --upgrade pip
+  pip install -r requirements.txt
+else
+  echo "=== [1/8] SKIP_ENV=1 — using existing environment ==="
+fi
 
 # Create necessary directories
 mkdir -p data/raw/nod
@@ -26,15 +32,15 @@ mkdir -p data/processed/rae_embeddings
 mkdir -p data/processed/zuna_latents
 mkdir -p outputs/qformer_aligned_grid
 
-echo "=== [2/10] Downloading raw NOD-EEG (ds005811) files from OpenNeuro ==="
+echo "=== [2/8] Downloading raw NOD-EEG (ds005811) files from OpenNeuro ==="
 # We default to subject sub-01, runs 1-8 for development. 
 # For a full run, change runs to 1-40.
 python scripts/download_nod.py --subject sub-01 --runs 1-8
 
-echo "=== [3/10] Running ZUNA diffusion-based continuous denoising ==="
+echo "=== [3/8] Running ZUNA diffusion-based continuous denoising ==="
 python scripts/run_zuna_batch.py --diffusion-steps 15
 
-echo "=== [4/10] Cropping continuous EEG recordings into semantic epochs ==="
+echo "=== [4/8] Cropping continuous EEG recordings into semantic epochs ==="
 python scripts/run_cropper.py \
     --mode zuna \
     --tmin -0.2 \
