@@ -74,6 +74,7 @@ def main():
     parser.add_argument("--no-temporal-window", action="store_false", dest="temporal_window")
     parser.add_argument("--latent-tc-start", type=int, default=20, help="Latent time slice start index")
     parser.add_argument("--latent-tc-end", type=int, default=36, help="Latent time slice end index (exclusive)")
+    parser.add_argument("--num-subjects", type=int, default=1, help="Number of subjects in the cohort (enables subject FiLM in the QFormer when > 1)")
     args = parser.parse_args()
     
     # --- Smoke-test overrides ---
@@ -144,6 +145,7 @@ def main():
                     "--device", args.device,
                     "--out-dir", str(grid_dir),
                     "--slug", slug,
+                    "--num-subjects", str(args.num_subjects),
                 ]
                 # Pass temporal window flag
                 if args.temporal_window:

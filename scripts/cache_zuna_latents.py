@@ -28,7 +28,7 @@ from mindseye.zuna.latent_extractor import ZunaLatentExtractor
 
 def main():
     parser = argparse.ArgumentParser(description="Cache ZUNA encoder latents from 5s epochs.")
-    parser.add_argument("--epochs-dir", type=str, required=True, help="Directory containing zuna_full5s_backaligned npz and metadata")
+    parser.add_argument("--epochs-dir", type=str, nargs="+", required=True, help="One or more directories containing zuna epochs npz + metadata. Pass multiple to cache a combined multi-subject cohort into a single output.")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to save cached latents")
     parser.add_argument("--layers", type=str, default="all", help="Layers to cache (comma-separated, e.g. 'layer_8,post_mmd') or 'all'")
     parser.add_argument("--max-trials", type=int, default=None, help="Maximum number of trials to cache (for Phase 0.5 sweep)")
@@ -37,20 +37,26 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Load all_runs_metadata.csv
-    metadata_path = os.path.join(args.epochs_dir, "all_runs_metadata.csv")
-    if not os.path.exists(metadata_path):
-        # Look for individual metadata files and merge them
-        metadata_files = glob.glob(os.path.join(args.epochs_dir, "*_metadata.csv"))
-        if not metadata_files:
-            raise FileNotFoundError(f"No metadata files found in {args.epochs_dir}")
-        print(f"Found {len(metadata_files)} individual metadata files. Merging...")
-        dfs = [pd.read_csv(f) for f in metadata_files]
-        metadata_df = pd.concat(dfs, ignore_index=True)
-    else:
-        print(f"Loading metadata from {metadata_path}")
-        metadata_df = pd.read_csv(metadata_path)
+
+    # Load metadata from one or more epochs dirs. Track the source dir per row so
+    # npz files resolve correctly when caching a combined multi-subject cohort.
+    per_dir_frames = []
+    for epochs_dir in args.epochs_dir:
+        metadata_path = os.path.join(epochs_dir, "all_runs_metadata.csv")
+        if not os.path.exists(metadata_path):
+            metadata_files = glob.glob(os.path.join(epochs_dir, "*_metadata.csv"))
+            if not metadata_files:
+                raise FileNotFoundError(f"No metadata files found in {epochs_dir}")
+            print(f"[{epochs_dir}] Found {len(metadata_files)} individual metadata files. Merging...")
+            dfs = [pd.read_csv(f) for f in metadata_files]
+            df = pd.concat(dfs, ignore_index=True)
+        else:
+            print(f"[{epochs_dir}] Loading metadata from {metadata_path}")
+            df = pd.read_csv(metadata_path)
+        df["_epochs_dir"] = epochs_dir
+        per_dir_frames.append(df)
+    metadata_df = pd.concat(per_dir_frames, ignore_index=True)
+    print(f"Total trials across {len(args.epochs_dir)} dir(s): {len(metadata_df)}")
 
     # If max_trials is set, truncate metadata
     if args.max_trials is not None:
@@ -71,22 +77,23 @@ def main():
         
     print(f"Layers to cache: {layers_to_cache}")
 
-    # Group metadata by NPZ file to load them efficiently
-    grouped = metadata_df.groupby("npz_file")
+    # Group metadata by source dir + NPZ file to load them efficiently. Different
+    # subjects can share an npz basename, so include the dir in the grouping key.
+    grouped = metadata_df.groupby(["_epochs_dir", "npz_file"])
     
     latent_records = []
     n_channels = 62
     
-    for npz_filename, group_df in tqdm(grouped, desc="Processing runs"):
-        npz_path = os.path.join(args.epochs_dir, npz_filename)
+    for (epochs_dir, npz_filename), group_df in tqdm(grouped, desc="Processing runs"):
+        npz_path = os.path.join(epochs_dir, npz_filename)
         if not os.path.exists(npz_path):
             # Check if there is a zuna prefix or similar
             # Try to resolve relative path issues
-            alternative_path = glob.glob(os.path.join(args.epochs_dir, f"*{npz_filename}*"))
+            alternative_path = glob.glob(os.path.join(epochs_dir, f"*{npz_filename}*"))
             if alternative_path:
                 npz_path = alternative_path[0]
             else:
-                print(f"Warning: npz file {npz_filename} not found in {args.epochs_dir}. Skipping.")
+                print(f"Warning: npz file {npz_filename} not found in {epochs_dir}. Skipping.")
                 continue
                 
         # Load NPZ file

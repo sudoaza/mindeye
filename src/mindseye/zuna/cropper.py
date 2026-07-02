@@ -396,6 +396,13 @@ def crop_runs(
         run_meta["global_run"] = int(run)
         # Keep the canonical training split column as the global run id.
         run_meta["run"] = int(run)
+        # Record subject identity so downstream caching/training can distinguish
+        # subjects (used for unique sample_ids and subject FiLM). Parse "sub-0X" -> X.
+        run_meta["subject_label"] = subject
+        try:
+            run_meta["subject"] = int(str(subject).split("-")[-1])
+        except (ValueError, IndexError):
+            run_meta["subject"] = 1
         all_metadata.append(run_meta)
         summary["runs"].append({
             "run": int(run),
