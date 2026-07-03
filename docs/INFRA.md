@@ -55,26 +55,28 @@ The volume is the durable artifact; pods are disposable.
 | **GPU** | RTX 4090 / A100 / H100 | Fits the model stack comfortably; A100/H100 speed iteration |
 | **VRAM** | ≥ 16 GB | Room for batching + any decoder stack |
 | **CPU RAM** | ≥ 32 GB | Dataloaders and dataset preloading |
-| **Container disk** | 100 GB | Ephemeral scratch, pip build cache, torch tmp |
-| **Network volume** | 200 GB | Persistent `/workspace`: raw EEG + processed data + outputs + hf_cache |
-| **Image** | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (Runpod PyTorch 2.8) | Ships torch 2.8.0+cu128, ready to use. **Do not force the `torch==2.6.0+cu124` pin from `requirements.txt` onto this image** — install only the non-torch deps (see §4) to avoid a cudnn-conflicting downgrade. |
+| **Container disk** | 60 GB | Ephemeral scratch, pip build cache, torch tmp |
+| **Network volume** | 200 GB | Persistent `/workspace`: raw EEG + processed data + outputs + hf_cache. Ample for the full 9-subject cohort. |
+| **Image** | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (Runpod PyTorch 2.8) | Ships torch 2.8.0+cu128, ready to use. **Do not force the `torch==2.6.0+cu124` pin from `requirements.txt` onto this image** — install only the non-torch deps (see §4), then **re-pin torch back to 2.8.0** because a transitive dep upgrades it to 2.12.1 and breaks the CUDA stack. |
 
-> Canonical sizes: **containerDiskInGb = 100**, **volumeInGb = 200**. Earlier docs quoted 50/80–100;
-> those are too tight once all 4 subjects at full runs (~20 GB raw each) plus ZUNA outputs, embedding
-> banks, HF weights (~20 GB), and checkpoints coexist. Size up before pulling the full dataset; a
-> single-subject dev volume can be smaller (100 GB).
+> Canonical sizes: **containerDiskInGb = 60**, **volumeInGb = 200**. Do **not** request larger disks
+> — A100 hosts reject 500–700 GB requests with *"no instances available with enough disk space"*.
+> NOD data is tiny (~0.6 GB/subject); the RAE bank (~14 GB) + hf_cache (~20 GB) are the real consumers.
+> **GPU choice**: A100 80GB is recommended for full-cohort runs (fast ZUNA batch + grid). A40 works for
+> single-subject dev. v2 `create-pod` accepts only **one** GPU type per pod (extra `gpuTypeIds` ignored).
 
 ### Provisioning JSON (runpod MCP `create-pod`)
 
 ```json
 {
   "cloudType": "SECURE",
+  "computeType": "GPU",
   "gpuCount": 1,
-  "gpuTypeIds": ["NVIDIA A40"],
+  "gpuTypeIds": ["NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"],
   "volumeInGb": 200,
-  "containerDiskInGb": 100,
+  "containerDiskInGb": 60,
   "imageName": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
-  "name": "mindeye-qformer",
+  "name": "mindeye-cohort9",
   "ports": ["22/tcp"],
   "volumeMountPath": "/workspace",
   "env": {"PUBLIC_KEY": "<contents of ~/.ssh/runpod.pub>"}
@@ -107,9 +109,11 @@ Two distinct SSH keys are in play:
 ssh-add ~/.ssh/id_ed25519
 ssh -A root@<IP> -p <PORT> -i ~/.ssh/runpod -o StrictHostKeyChecking=no
 
-# On the pod: clone/pull over the SSH git URL (uses the forwarded key)
-cd /workspace && git clone git@github.com:sudoaza/mindeye.git mindeye   # fresh volume
-# or: cd /workspace/mindeye && git pull origin master                   # existing volume
+# On the pod: git over SSH needs relaxed host-key checking on a fresh pod — a bare
+# `git clone` fails with "Host key verification failed" even after `ssh -T` succeeded.
+export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+cd /workspace && git clone git@github.com:sudoaza/mindeye.git mindeye        # fresh volume
+# or: cd /workspace/mindeye && git fetch origin && git reset --hard origin/master  # existing volume
 # (existing HTTPS remote? switch it: git remote set-url origin git@github.com:sudoaza/mindeye.git)
 
 # Deps: the image already ships torch 2.8.0+cu128. Install only the non-torch deps
@@ -117,6 +121,11 @@ cd /workspace && git clone git@github.com:sudoaza/mindeye.git mindeye   # fresh 
 cd /workspace/mindeye
 grep -vE '^(--extra-index-url|torch==|torchvision==|torchaudio==|nvidia-cudnn|$)' requirements.txt > /tmp/reqs_notorch.txt
 pip install --break-system-packages -r /tmp/reqs_notorch.txt
+
+# ⚠️ A transitive dep pulls torch 2.12.1 and breaks torchvision/torchaudio + cu128. Re-pin:
+pip install --break-system-packages torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+python3 -c "import torch,torchvision; print(torch.__version__, torchvision.__version__, torch.cuda.is_available())"
 
 # Always set before any script:
 export PYTHONPATH=/workspace/mindeye/src
@@ -126,6 +135,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
 > The pod uses **system Python with `PYTHONPATH=src`** — no venv. A venv created on the pod can end up with zero-byte binaries after a container restart; if you hit that, delete it and use system Python.
+
+### Driving the pod without SSH-approval prompts — `pod-exec` MCP
+
+A small custom MCP server (`~/.cursor/mcp-servers/pod-exec/server.py`, registered in `~/.cursor/mcp.json` as `pod-exec`, tools namespaced `user-pod-exec`) execs arbitrary commands on the pod over SSH, so the agent runs pod commands without a local approval prompt each time. Update the pod host/port in `~/.cursor/mcp-servers/pod-exec/pod.json` (or via the `pod_config` tool) when the pod changes. Background long runs on the pod with `nohup ... &`; they survive Cursor/backend disconnects. See `docs/HANDOVER.md` §2.
 
 ## 4b. Model weights (downloaded, not stored in git)
 
@@ -154,18 +167,21 @@ in order — this is exactly what `cold_start.sh` automates. All raw inputs come
 so **no data needs to be pushed from the laptop**.
 
 ```
-- [ ] Code + deps (§4)
+- [ ] Code + deps (§4), torch re-pinned to 2.8.0
 - [ ] Model weights warm to HF_HOME (§4b, or lazy on first run)
 - [ ] Raw EEG + stimuli   → data/raw/nod/        (OpenNeuro ds005811, public)
-- [ ] ZUNA denoise        → data/processed/zuna_real/
-- [ ] Onset-aligned crop  → data/processed/semantic_epochs/
-- [ ] Target banks        → data/processed/rae_embeddings/   (RAE/DINO; CLIP dropped)
-- [ ] Cache ZUNA latents  → data/processed/zuna_latents/
+- [ ] ZUNA denoise        → data/processed/zuna_real/4_fif_output/
+- [ ] 5s back-aligned crop → data/processed/semantic_epochs/zuna_full5s_backaligned_*/  (--full5s-backaligned)
+- [ ] Target bank         → data/processed/rae_embeddings/rae_dinov2_base_all.pt   (RAE/DINO; CLIP dropped)
+- [ ] Cache ZUNA latents  → data/processed/zuna_latents/cohort9_runs01_32/
 ```
 
 ```bash
 cd /workspace/mindeye && export PYTHONPATH=src HF_HOME=/workspace/hf_cache
-bash cold_start.sh            # end-to-end; edit subject/run range at the top for full vs dev
+# Full 9-subject cohort (recommended — positive results need scale):
+SKIP_ENV=1 bash scripts/prepare_multisubject_data.sh
+# Single-subject dev slice:
+SKIP_ENV=1 bash cold_start.sh
 ```
 
 Raw data sources (used by `cold_start.sh`, safe to run standalone):
@@ -203,14 +219,16 @@ Then: `ssh mindeye-pod`.
 
 ## 6. Disk budget
 
+Measured on the 2026-07-03 9-subject run — NOD EEG is **much smaller** than earlier estimates:
+
 | Path (on network volume) | Size | Notes |
 |---|---|---|
-| `data/raw/nod` | ~20 GB / subject (~80 GB for 4) | Raw NOD EEG + referenced ImageNet stimuli |
-| `data/processed/` | tens of GB | ZUNA outputs, epochs, embedding banks, cached latents |
+| `data/raw/nod` | **~0.6 GB / subject** (~6 GB for 9) | Raw NOD EEG (run FIF ~11 MB, subject epoch FIF ~215 MB) + referenced ImageNet stimuli |
+| `data/processed/` | tens of GB | ZUNA outputs, 5s epochs, cached latents |
+| `data/processed/rae_embeddings/rae_dinov2_base_all.pt` | **~14 GB** | The single biggest data artifact |
 | `hf_cache` | ~20 GB | ZUNA + RAE/DINOv2 weights |
 | `outputs/` | grows | Checkpoints, metrics, grids |
 
-- **Single-subject dev**: ~100 GB volume is comfortable.
-- **Full 4-subject**: use the canonical **200 GB** volume — raw (~80 GB) + processed + `hf_cache`
-  (~20 GB) + outputs leave little headroom below that. Size up the volume before pulling all
-  subjects; RunPod volumes can be grown but not shrunk.
+- The old "~20 GB / subject" figure was wrong by ~30×. The **RAE bank (~14 GB) and hf_cache (~20 GB)** dominate, not raw EEG.
+- **200 GB volume is ample** even for the full 9-subject cohort. Do **not** over-request volume/container disk: A100 hosts reject large disk requests with *"no instances available with enough disk space"* (500–700 GB failed; 200 GB + 60 GB container succeeded).
+- RunPod volumes can be grown but not shrunk.

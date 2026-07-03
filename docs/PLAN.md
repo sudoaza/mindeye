@@ -20,7 +20,7 @@ Primary source is **NOD-EEG** (continuous, event-timed). Alljoined/ENIGMA are fo
 
 1. **Full-set retrieval + paired bootstrap** vs `real / shuffled / random` is the only honest gate. Within-val ranking inflates signal 2–4× and is diagnostic only. The 3-way control split has repeatedly caught data/pipeline bugs and stays mandatory.
 2. **ZUNA and RAE are frozen; only the QFormer bridge trains.**
-3. **Onset back-alignment is assumed.** Epochs are cropped to stimulus onset, so the fixed ZUNA latent window `tc[20:36)` (`[-0.5s, +1.5s]`) is correct.
+3. **Onset back-alignment is assumed.** Epochs for ZUNA latent caching are **5s back-aligned** (`run_cropper.py --full5s-backaligned`, `-3.0/+2.0`, 1280 samples, onset at sample 768), so the fixed ZUNA latent window `tc[20:36)` is correct. The tight `-0.2/+1.0` window is the deprecated semantic-classifier path and crashes latent caching (asserts 1280 timepoints).
 4. **No RAE decoder / diffusion** until the QFormer retrieval gate (Δ real−shuffled > +0.005, 95% CI excludes 0) is consistently met.
 5. **Timing integrity is critical** (stimulus onset → ZUNA axis → crop).
 6. `PYTHONPATH=src` before any `python scripts/` call on the pod.
@@ -36,22 +36,24 @@ EEG (256 Hz, 5s, 64 ch)
                           input_proj 32→256 · 32 query tokens (+CLS) · subject FiLM
                           4× (self-attn → cross-attn(queries→ZUNA) → FFN) · CLS readout
                           → proj_head → d_out → LayerNorm → L2-normalize
-                          └─► vision embedding (RAE/DINO-768 primary; CLIP-512 baseline)
+                          └─► vision embedding (RAE/DINO-768 target; CLIP dropped)
 ```
 
 - **Loss**: InfoNCE + cosine + variance-floor (anti-collapse, 0.05).
 - **Eval**: full-set retrieval against the real RAE/DINO bank (`rae_unit`); always ranked vs the true image target even under shuffled/random training.
-- **Grid**: `scripts/run_qformer_grid.py` trains real/shuffled/random for each target space (CLIP-Common-512, DINO-Unit-768, DINO-PCA-256/128) then runs a 10,000-iter paired bootstrap.
+- **Grid**: `scripts/run_qformer_grid.py` trains real/shuffled/random for each target space (DINO-Unit-768, DINO-PCA-256/128 — CLIP dropped) then runs a 10,000-iter paired bootstrap.
 
 ## 4. Live roadmap
 
 ### Phase Q1 — QFormer retrieval gate (🚧 In Progress)
 - [x] Cache ZUNA `post_mmd` latents; onset-crop plumbing (`crop_zuna_latent`, `--latent-tc-start/-end`).
 - [x] `ZunaToVisionQFormer` bridge; InfoNCE + cosine + variance-floor loss.
-- [x] `run_qformer_grid.py` with real/shuffled/random + paired bootstrap over 4 target spaces.
-- [ ] **Run the grid on the pod** across all target spaces.
+- [x] `run_qformer_grid.py` with real/shuffled/random + paired bootstrap over the DINO target spaces.
+- [x] Multi-subject cohort support: `subject` column in cropper, multi-`--epochs-dir` merged caching, `--num-subjects` FiLM plumbing (`scripts/prepare_multisubject_data.sh`).
+- [ ] **Full 9-subject cohort grid running on the A100 pod** (`sub-01..09 × 32 runs`, `--num-subjects 9`) — in progress as of 2026-07-03; see HANDOVER §0. Positive results have historically needed this scale.
 - [ ] **Gate**: paired Δ (real − shuffled) > +0.005, 95% CI excludes 0, `collapse_pct` < 20%, on full-set retrieval against the RAE bank.
 - [ ] Pick the winning target space (expectation: `DINO-Unit-768`; PCA variants test whether a lower-rank target is easier to hit).
+- [ ] Decide whether combined-cohort FiLM helps vs per-subject; consider an image-disjoint split if leakage is suspected (current split is global run-based, shared across subjects).
 
 ### Phase Q2 — Reconstruction bridge (after Q1 gate) 🔜
 > **Open architectural gap.** The current QFormer pools to a single vector — a *retrieval* bridge.
@@ -75,7 +77,7 @@ EEG (256 Hz, 5s, 64 ch)
 
 Every run writes a timestamped dir with `config.json`, `metrics.json`, `history.csv`, checkpoints,
 and `val/test_eval_preds.pt` (for the paired bootstrap). Grid outputs under
-`outputs/qformer_aligned_grid/grid_<timestamp>/`.
+`outputs/qformer_cohort9_grid/grid_<timestamp>/` (or the `--out-dir` passed to the grid).
 
 ---
 
