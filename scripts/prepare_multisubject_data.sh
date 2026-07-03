@@ -53,9 +53,9 @@ echo "=== [3/7] Cropping semantic epochs (per subject) ==="
 EPOCHS_DIRS=()
 for sub in $SUBJECTS; do
   sub_clean=${sub//-/}
-  out="data/processed/semantic_epochs/zuna_tight1s_${sub_clean}_${RUN_TAG}"
+  out="data/processed/semantic_epochs/zuna_full5s_backaligned_${sub_clean}_${RUN_TAG}"
   echo ">>> Cropping $sub -> $out"
-  python scripts/run_cropper.py --mode zuna --tmin -0.2 --tmax 1.0 --add-event-marker \
+  python scripts/run_cropper.py --mode zuna --full5s-backaligned --add-event-marker \
     --runs $RUNS_SEQ \
     --subject "$sub" \
     --zuna-dir data/processed/zuna_real/4_fif_output \
