@@ -272,13 +272,56 @@ python scripts/run_qformer_grid.py --smoke-test \
 | **FAISS kNN priors** | After gap ≥ 0.02 | BReAD-style retrieval priors for visual grounding. |
 | **Frozen diffusion** | After visual grids clear | img2img refinement on RAE decode. |
 
+### 6b. Luminance grounding (reconstruction path — opt-in, overrides rule #3 by explicit decision)
+
+> **Deliberate override.** The RAE token-grid bridge + decoder above were "deferred until the
+> retrieval gate passes" (non-negotiable #3). By explicit decision we brought a **minimal**
+> version forward to add basic *visual grounding tests* on scene illumination. This is **opt-in
+> and additive**: with the default `--recon-luma-weight 0`, the retrieval grid is byte-for-byte
+> unchanged and rule #3 still holds. Only when the weight is > 0 does the reconstruction path activate.
+
+**Idea (what the user asked for):** very basic, objective visual tests derived from pixels (no VLM,
+no learned label) that ground the translator on lighting — one for **general illumination** (global
+mean luminance) and one for **illumination direction** (which region is bright: top-left / top /
+top-right / left / center / right / bottom-left / bottom / bottom-right). Implemented as a
+**stimulus-vs-generated luminance-grid loss**: the QFormer predicts an RAE token grid, the frozen
+RAE decodes it to an image, and we match the decoded image's **3×3 region + global** luminance to
+the stimulus image's.
+
+**Why this forces the token-grid bridge:** the QFormer previously output only a pooled unit vector
+(§3 open gap) which cannot be decoded. To compare pixel luminance of stimulus vs *generated* image,
+the model must emit a decodable `[768,16,16]` grid — so the luminance test and the reconstruction
+bridge are the same piece of work.
+
+**What was built:**
+- `ZunaToVisionQFormer(recon_grid=True)` adds a spatial head: learned `G·G` position queries
+  cross-attend the processed query tokens → `[B, 768, 16, 16]`. `forward(..., return_grid=True)`
+  returns `(pooled_vec, token_grid)`. Default calls are unchanged (pooled vector only).
+- `RaeDecoderBackend.decode_differentiable(tokens) -> [B,3,H,W]` — decode with gradients (RAE stays
+  frozen; grad flows through it to the QFormer). `generate_from_embeds` (PIL, inference-mode) is kept for eval.
+- `src/mindseye/generation/luminance.py` — reusable `luminance_grid` (Rec-601 luma → `adaptive_avg_pool2d(3)`
+  + global mean, `[B,10]`) and `luminance_grid_loss`. Region order is row-major
+  (`top_left … bottom_right`); verified against `adaptive_avg_pool2d`.
+- `train_zuna_to_vision.py` / `run_qformer_grid.py` gain `--recon-luma-weight` (default 0),
+  `--stimuli-dir`, `--recon-grid-px`, `--recon-grid-size`, `--recon-token-dim`. The dataset loads the
+  stimulus image (by `image_id`) only when reconstruction is on. `real/shuffled/random` controls are
+  preserved. **NOT yet run/validated on the pod** (cohort-9 latent cache still in flight; §0).
+
+Enable (single run) example:
+```bash
+PYTHONPATH=src python scripts/train_zuna_to_vision.py \
+  --latents-pt <...> --targets-pt <rae bank> --target-space DINO-Unit-768 --target-mode real \
+  --recon-luma-weight 0.5 --stimuli-dir data/raw/nod/stimuli/ImageNet --device cuda
+```
+Grid: add `--recon-luma-weight 0.5` to `run_qformer_grid.py` (forwarded to every run).
+
 ---
 
 ## 7. Non-Negotiable Rules
 
 1. **Full-set retrieval is the only honest metric.** `within_val` ranking is diagnostic only (inflated).
 2. **Run controls every time.** Every experiment includes `real / shuffled / random` and reports all three in the paired-bootstrap table. This split has repeatedly caught data/pipeline bugs.
-3. **Do not add the RAE decoder / diffusion** until the QFormer retrieval gate (Δ > +0.005, CI excludes 0) is consistently met.
+3. **Do not add the RAE decoder / diffusion** until the QFormer retrieval gate (Δ > +0.005, CI excludes 0) is consistently met — **except** the opt-in luminance-grounding reconstruction path (§6b), brought forward by explicit decision. It is disabled by default (`--recon-luma-weight 0`); with it off, this rule holds unchanged.
 4. **ZUNA and RAE are frozen.** Only the QFormer bridge trains.
 5. **Epochs for ZUNA latent caching MUST be 5s back-aligned** (`run_cropper.py --full5s-backaligned`, window `-3.0/+2.0`, 1281 samples, onset at sample 768). The `ZunaLatentExtractor` hard-asserts 1280 timepoints. The tight `-0.2/+1.0` window belongs to the deprecated semantic-classifier path and will crash caching. Because onset is back-aligned, the fixed latent window `tc[20:36)` is correct.
 6. **`PYTHONPATH=src` must be set** before any `python scripts/` call on the pod.

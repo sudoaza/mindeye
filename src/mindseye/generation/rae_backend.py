@@ -127,6 +127,27 @@ class RaeDecoderBackend:
             "norm": norm
         }
 
+    def decode_differentiable(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Decode RAE spatial latents to an image tensor while preserving gradients.
+
+        Unlike ``generate_from_embeds`` (which is wrapped in ``inference_mode`` and
+        returns PIL images), this keeps the autograd graph intact so a loss on the
+        decoded image can backprop into the ``latents`` (and therefore the QFormer).
+        The RAE itself stays frozen (its parameters have ``requires_grad=False``);
+        gradients only flow through it to the input tokens.
+
+        Args:
+            latents: RAE spatial latents of shape [B, 768, 16, 16], requires_grad.
+
+        Returns:
+            image tensor of shape [B, 3, H, W] in [0, 1] (float, differentiable).
+        """
+        self.load()
+        latents = latents.to(self.device, dtype=self.dtype)
+        sample = self.model.decode(latents).sample
+        return sample.clamp(0.0, 1.0)
+
     @torch.inference_mode()
     def generate_from_embeds(self, latents: torch.Tensor) -> list[Image.Image]:
         """
