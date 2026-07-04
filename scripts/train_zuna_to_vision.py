@@ -12,12 +12,19 @@ from torch.utils.data import Dataset, DataLoader
 from datetime import datetime
 from pathlib import Path
 import json
+from PIL import Image
+import torchvision.transforms.functional as TF
 
 # Ensure import paths work
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 from mindseye.adapters.qformer import ZunaToVisionQFormer
-from mindseye.models.eeg_encoder import clip_contrastive_loss, retrieval_topk
+from mindseye.models.eeg_encoder import (
+    clip_contrastive_loss,
+    retrieval_topk,
+    retrieval_topk_full_bank,
+)
+from mindseye.generation.luminance import luminance_grid_loss
 
 def parse_runs_spec(spec: str) -> list[int]:
     runs = set()
@@ -78,12 +85,18 @@ class ZunaLatentTargetDataset(Dataset):
         tc: int = 40,
         latent_tc_start: int = 20,
         latent_tc_end: int = 36,
+        stimuli_dir: str = None,
+        stim_size: int = 256,
     ):
         self.use_temporal_window = use_temporal_window
         self.n_channels = n_channels
         self.tc = tc
         self.latent_tc_start = latent_tc_start
         self.latent_tc_end = latent_tc_end
+        # Optional stimulus image loading for the luminance-grounding reconstruction loss.
+        # Only used when stimuli_dir is set; keeps the retrieval path unaffected.
+        self.stimuli_dir = Path(stimuli_dir) if stimuli_dir else None
+        self.stim_size = stim_size
         # Resolve cache dir and split paths
         if os.path.isdir(latents_pt_path):
             cache_dir = latents_pt_path
@@ -153,6 +166,14 @@ class ZunaLatentTargetDataset(Dataset):
         print(f"Found {len(self.valid_records)} valid records with target embeddings.")
         if len(self.valid_records) == 0:
             raise ValueError("No valid records found after filtering.")
+
+        # Finding M2: FiLM must be indexed by a cohort-relative id, not the raw
+        # subject number, so cohorts that don't start at sub-01 (or have gaps)
+        # don't index past the embedding table. Map sorted unique subject_ids -> 0..K-1.
+        unique_subject_ids = sorted({int(r["subject_id"]) for r in self.valid_records})
+        self.subject_id_to_index = {sid: i for i, sid in enumerate(unique_subject_ids)}
+        self.num_subjects = len(unique_subject_ids)
+        print(f"Cohort subjects (raw ids): {unique_subject_ids} -> FiLM indices 0..{self.num_subjects - 1}")
             
         # Expose dimensions
         self.layer_name = layer_name
@@ -170,6 +191,25 @@ class ZunaLatentTargetDataset(Dataset):
 
         # Compute latent_seq_len after optional temporal windowing
         if self.use_temporal_window:
+            # Finding M1: the fixed tc[start:end) window is only correct when the
+            # stimulus onset sits where we assume it does. The cache stores onset_tc
+            # per trial; verify the window brackets it and that onset_tc is uniform,
+            # so a different crop config fails loudly instead of silently windowing
+            # the wrong latents.
+            onset_tcs = sorted({int(r.get("onset_tc", 24)) for r in self.valid_records})
+            if len(onset_tcs) != 1:
+                raise ValueError(
+                    f"Non-uniform onset_tc across records {onset_tcs}; the fixed "
+                    f"[{self.latent_tc_start}:{self.latent_tc_end}) latent window cannot be "
+                    f"correct for all trials. Re-cache with a consistent crop or window per-trial."
+                )
+            onset_tc = onset_tcs[0]
+            if not (self.latent_tc_start <= onset_tc < self.latent_tc_end):
+                raise ValueError(
+                    f"Latent window [{self.latent_tc_start}:{self.latent_tc_end}) does not bracket "
+                    f"the stimulus onset (onset_tc={onset_tc}). This windows pre/post-onset latents "
+                    f"incorrectly. Adjust --latent-tc-start/--latent-tc-end for this crop."
+                )
             first_windowed = crop_zuna_latent(
                 first_latent, self.n_channels, self.tc, self.latent_dim,
                 self.latent_tc_start, self.latent_tc_end
@@ -206,6 +246,19 @@ class ZunaLatentTargetDataset(Dataset):
     def __len__(self):
         return len(self.valid_records)
 
+    def _load_stimulus(self, image_id: str) -> torch.Tensor:
+        """Load a stimulus image as a [3, stim_size, stim_size] tensor in [0, 1].
+
+        Returns a mid-gray tensor if the image file is missing so training does not
+        crash on a single bad id (defensive; missing files are rare).
+        """
+        for ext in (".JPEG", ".jpg", ".png"):
+            p = self.stimuli_dir / f"{image_id}{ext}"
+            if p.exists():
+                img = Image.open(p).convert("RGB").resize((self.stim_size, self.stim_size))
+                return TF.to_tensor(img)
+        return torch.full((3, self.stim_size, self.stim_size), 0.5)
+
     def __getitem__(self, idx):
         record = self.valid_records[idx]
         s_id = record["sample_id"]
@@ -241,11 +294,19 @@ class ZunaLatentTargetDataset(Dataset):
             "latent": latent,
             "target": train_target,       # fake target for loss (real = same as eval_target)
             "eval_target": true_target,    # always the true image embedding for retrieval eval
-            "subject_id": torch.tensor(record["subject_id"] - 1, dtype=torch.long),
+            "subject_id": torch.tensor(
+                self.subject_id_to_index[int(record["subject_id"])], dtype=torch.long
+            ),
             "run_id": record["run_id"],
             "image_id": record["image_id"],
             "class_id": record["class_id"],
-            "sample_id": record["sample_id"]
+            "sample_id": record["sample_id"],
+            # Stimulus image for luminance grounding (mid-gray placeholder when disabled).
+            "stimulus": (
+                self._load_stimulus(record["image_id"])
+                if self.stimuli_dir is not None
+                else torch.zeros(1)
+            ),
         }
 
 def set_seed(seed):
@@ -254,18 +315,23 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def train_epoch(model, loader, optimizer, temperature, target_std, device):
+def train_epoch(model, loader, optimizer, temperature, target_std, device,
+                rae_backend=None, recon_luma_weight=0.0, recon_grid_px=3):
     model.train()
     total_loss = 0
     num_batches = 0
-    
+    use_recon = rae_backend is not None and recon_luma_weight > 0.0
+
     for batch in loader:
         latents = batch["latent"].to(device)
         targets = batch["target"].to(device)
         subject_ids = batch["subject_id"].to(device)
         
         optimizer.zero_grad()
-        preds = model(latents, subject_id=subject_ids)
+        if use_recon:
+            preds, pred_grid = model(latents, subject_id=subject_ids, return_grid=True)
+        else:
+            preds = model(latents, subject_id=subject_ids)
         
         # InfoNCE + Cosine + Variance Floor Loss
         pred_u = F.normalize(preds, dim=-1)
@@ -276,6 +342,19 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device):
         loss_var = variance_floor_loss(preds, target_std.to(device))
         
         loss = loss_nce + loss_cos + 0.05 * loss_var
+
+        # Luminance grounding: decode the predicted RAE token grid to an image and
+        # match its global + 3x3 region luminance to the stimulus image. This is the
+        # basic "visual test" that grounds the translator on scene illumination.
+        if use_recon:
+            stimulus = batch["stimulus"].to(device)  # [B, 3, H, W] in [0, 1]
+            gen_img = rae_backend.decode_differentiable(pred_grid)  # [B, 3, H', W']
+            if gen_img.shape[-2:] != stimulus.shape[-2:]:
+                stimulus = F.interpolate(
+                    stimulus, size=gen_img.shape[-2:], mode="bilinear", align_corners=False
+                )
+            loss_luma = luminance_grid_loss(gen_img.float(), stimulus.float(), grid=recon_grid_px)
+            loss = loss + recon_luma_weight * loss_luma
         
         loss.backward()
         optimizer.step()
@@ -286,10 +365,11 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device):
     return total_loss / max(num_batches, 1)
 
 @torch.no_grad()
-def evaluate_model(model, loader, device):
+def evaluate_model(model, loader, device, bank=None, image_id_to_bank_idx=None):
     model.eval()
     all_preds = []
     all_targets = []
+    all_image_ids = []
 
     for batch in loader:
         latents = batch["latent"].to(device)
@@ -301,6 +381,7 @@ def evaluate_model(model, loader, device):
 
         all_preds.append(preds.cpu())
         all_targets.append(targets.cpu())
+        all_image_ids.extend(list(batch["image_id"]))
 
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
@@ -353,10 +434,27 @@ def evaluate_model(model, loader, device):
         "pred_std": pred_std,
         "target_std": target_std
     }
+
+    # Finding H1: full-bank retrieval is the honest metric. Rank each prediction
+    # against the entire unique-image bank (not just the val set). within-val
+    # metrics above are kept but clearly labelled as diagnostic/inflated.
+    if bank is not None and image_id_to_bank_idx is not None:
+        positive_index = torch.tensor(
+            [image_id_to_bank_idx[img_id] for img_id in all_image_ids], dtype=torch.long
+        )
+        full = retrieval_topk_full_bank(all_preds, bank, positive_index)
+        eval_metrics.update({
+            "val_mrr_full": full["mrr"],
+            "val_top1_full": full["top1"],
+            "val_top5_full": full["top5"],
+            "val_top10_full": full["top10"],
+            "val_median_rank_full": full["median_rank"],
+            "bank_size": full["bank_size"],
+        })
     return eval_metrics
 
 @torch.no_grad()
-def save_eval_metadata(model, loader, device, out_path):
+def save_eval_metadata(model, loader, device, out_path, bank=None, image_id_to_bank_idx=None):
     model.eval()
     all_preds = []
     all_targets = []
@@ -379,7 +477,7 @@ def save_eval_metadata(model, loader, device, out_path):
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
     
-    # Compute rank and top10 hit against the entire set of targets
+    # Within-val rank (diagnostic / inflated): rank against the other val samples.
     pred_n = F.normalize(all_preds, dim=-1)
     tgt_n = F.normalize(all_targets, dim=-1)
     
@@ -396,9 +494,25 @@ def save_eval_metadata(model, loader, device, out_path):
         "image_id": image_ids,
         "pred": all_preds,
         "target": all_targets,
+        # within-val (diagnostic, inflated) rank kept for backward compatibility
         "rank": rank_of_truth,
-        "top10_hit": top10_hit
+        "top10_hit": top10_hit,
     }
+
+    # Finding H1: also store the honest full-bank rank/hit so the grid gate can
+    # consume the metric the docs mandate.
+    if bank is not None and image_id_to_bank_idx is not None:
+        positive_index = torch.tensor(
+            [image_id_to_bank_idx[img_id] for img_id in image_ids], dtype=torch.long
+        )
+        bank_n = F.normalize(bank, dim=-1)
+        full_logits = pred_n @ bank_n.T  # [N, M]
+        pos_sim = full_logits.gather(1, positive_index[:, None]).squeeze(1)
+        rank_full = (full_logits > pos_sim[:, None]).sum(dim=1).float()
+        data["rank_full"] = rank_full
+        data["top10_hit_full"] = (rank_full < 10).float()
+        data["bank_size"] = int(bank.shape[0])
+
     torch.save(data, out_path)
     print(f"Saved evaluation metadata to {out_path}")
 
@@ -416,6 +530,8 @@ def main():
     parser.add_argument("--val-runs", type=str, default=None, help="Val run list/range, e.g. 25-28")
     parser.add_argument("--test-runs", type=str, default=None, help="Test run list/range, e.g. 29-32")
     parser.add_argument("--subjects", type=str, default=None, help="Comma-separated subject IDs (e.g. 'sub-01') to filter")
+    parser.add_argument("--require-image-disjoint", action="store_true",
+                        help="Hard-fail if train shares any image_id with val/test (finding M3).")
 
     # Temporal windowing
     parser.add_argument("--temporal-window", action="store_true", default=True,
@@ -438,6 +554,20 @@ def main():
     parser.add_argument("--no-output-layernorm", action="store_false", dest="output_layernorm")
     parser.add_argument("--force-unit-output", action="store_true", default=True, help="Enable L2 normalization in final head")
     parser.add_argument("--no-force-unit-output", action="store_false", dest="force_unit_output")
+
+    # Reconstruction / luminance grounding (opt-in; overrides HANDOVER non-negotiable #3
+    # by explicit decision — see docs/HANDOVER.md). When --recon-luma-weight > 0 the QFormer
+    # predicts an RAE token grid, decodes it through the frozen RAE, and matches the decoded
+    # image's global + region luminance to the stimulus image.
+    parser.add_argument("--recon-luma-weight", type=float, default=0.0,
+                        help="Weight of the stimulus-vs-generated luminance-grid loss. 0 disables reconstruction (pure retrieval).")
+    parser.add_argument("--recon-grid-px", type=int, default=3, help="Spatial luminance grid size (3 -> 3x3 regions + global)")
+    parser.add_argument("--recon-token-dim", type=int, default=768, help="RAE token dim for the reconstruction grid head")
+    parser.add_argument("--recon-grid-size", type=int, default=16, help="RAE token grid size G (G x G tokens)")
+    parser.add_argument("--stimuli-dir", type=str, default="data/raw/nod/stimuli/ImageNet",
+                        help="Directory of stimulus images (used only when --recon-luma-weight > 0)")
+    parser.add_argument("--rae-model-id", type=str, default="nyu-visionx/RAE-dinov2-wReg-base-ViTXL-n08",
+                        help="RAE decoder model id for differentiable decode")
 
     # Optimization
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs")
@@ -477,6 +607,7 @@ def main():
         target_space_key = "common"
 
     # Load dataset
+    use_recon = args.recon_luma_weight > 0.0
     full_dataset = ZunaLatentTargetDataset(
         latents_pt_path=args.latents_pt,
         targets_pt_path=args.targets_pt,
@@ -488,6 +619,7 @@ def main():
         use_temporal_window=args.temporal_window,
         latent_tc_start=args.latent_tc_start,
         latent_tc_end=args.latent_tc_end,
+        stimuli_dir=args.stimuli_dir if use_recon else None,
     )
     
     # Explicit splits determination
@@ -580,6 +712,38 @@ def main():
         torch.save(pca_params, run_dir / "pca_params.pt")
         print(f"Saved PCA parameters to {run_dir / 'pca_params.pt'}")
 
+    # Build the full unique-image target bank (finding H1). After any PCA transform
+    # above, image_id_to_target holds the final target vectors. Dedup by image_id so
+    # each image appears once; predictions are ranked against this whole bank.
+    bank_image_ids = list(full_dataset.image_id_to_target.keys())
+    image_id_to_bank_idx = {img_id: i for i, img_id in enumerate(bank_image_ids)}
+    full_bank = torch.stack(
+        [full_dataset.image_id_to_target[img_id].float() for img_id in bank_image_ids]
+    )
+    print(f"Full retrieval bank: {full_bank.shape[0]} unique images, dim {full_bank.shape[1]}")
+
+    # Finding M3: quantify (and optionally forbid) train/val/test image overlap.
+    def _img_set(indices):
+        return {full_dataset.valid_records[i]["image_id"] for i in indices}
+
+    train_imgs = _img_set(train_indices)
+    val_imgs = _img_set(val_indices)
+    test_imgs = _img_set(test_indices)
+    tv_overlap = len(train_imgs & val_imgs)
+    tt_overlap = len(train_imgs & test_imgs)
+    print(
+        f"[split] image overlap — train∩val={tv_overlap} "
+        f"({100.0 * tv_overlap / max(len(val_imgs), 1):.1f}% of val images), "
+        f"train∩test={tt_overlap} "
+        f"({100.0 * tt_overlap / max(len(test_imgs), 1):.1f}% of test images)"
+    )
+    if args.require_image_disjoint and (tv_overlap > 0 or tt_overlap > 0):
+        raise ValueError(
+            f"--require-image-disjoint set but train shares {tv_overlap} image(s) with val and "
+            f"{tt_overlap} with test. Full-bank retrieval would be optimistic. Use an "
+            f"image-disjoint split or drop the flag to accept the leakage."
+        )
+
     # Compute target_std from train split targets
     train_targets_list = []
     for idx in train_indices:
@@ -608,6 +772,15 @@ def main():
     with open(run_dir / "config.json", "w") as f:
         json.dump(config_dict, f, indent=2)
         
+    # Finding M2: size the FiLM table from the actual cohort, not a possibly-wrong
+    # --num-subjects. The dataset remaps raw subject ids to contiguous 0..K-1 indices.
+    effective_num_subjects = full_dataset.num_subjects
+    if args.num_subjects != effective_num_subjects:
+        print(
+            f"[warn] --num-subjects={args.num_subjects} but cohort has "
+            f"{effective_num_subjects} distinct subject(s); using {effective_num_subjects} for FiLM."
+        )
+
     # Instantiate stabilized QFormer adapter
     model = ZunaToVisionQFormer(
         d_in=full_dataset.latent_dim,
@@ -618,14 +791,25 @@ def main():
         num_query_tokens=args.num_query_tokens,
         pooling_mode=args.pooling_mode,
         dropout=args.dropout,
-        num_subjects=args.num_subjects,
+        num_subjects=effective_num_subjects,
         output_layernorm=args.output_layernorm,
         force_unit_output=args.force_unit_output,
-        normalize_output=False # disable old L2 normalizer
+        normalize_output=False, # disable old L2 normalizer
+        recon_grid=use_recon,
+        recon_grid_size=args.recon_grid_size,
+        recon_token_dim=args.recon_token_dim,
     ).to(device)
-    
+
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Initialized ZunaToVisionQFormer with {num_params:,} trainable parameters.")
+
+    # Frozen RAE decoder for the luminance-grounding loss (only when reconstruction is on).
+    rae_backend = None
+    if use_recon:
+        from mindseye.generation.rae_backend import RaeDecoderBackend
+        print(f"Reconstruction enabled (luma weight={args.recon_luma_weight}). Loading frozen RAE decoder...")
+        rae_backend = RaeDecoderBackend(model_id=args.rae_model_id, device=str(device), apply_patch=True)
+        rae_backend.load()
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -636,19 +820,30 @@ def main():
     patience_counter = 0
     
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, args.temperature, target_std, device)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, args.temperature, target_std, device,
+            rae_backend=rae_backend, recon_luma_weight=args.recon_luma_weight,
+            recon_grid_px=args.recon_grid_px,
+        )
         scheduler.step()
-        val_metrics = evaluate_model(model, val_loader, device)
+        val_metrics = evaluate_model(
+            model, val_loader, device,
+            bank=full_bank, image_id_to_bank_idx=image_id_to_bank_idx,
+        )
         
         val_mrr = val_metrics["val_mrr_norm"]
         val_top10 = val_metrics["val_top10_norm"]
         val_cosine = val_metrics["val_cosine_norm"]
         std_ratio = val_metrics["val_pred_std_ratio"]
         collapse_pct = val_metrics["collapse_pct"]
+        val_mrr_full = val_metrics.get("val_mrr_full", float("nan"))
+        val_top10_full = val_metrics.get("val_top10_full", float("nan"))
         
         print(f"Epoch {epoch:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | "
               f"Val Cosine (Norm): {val_cosine:.4f} | Val MRR (Norm): {val_mrr:.4f} | "
-              f"Val Top-10 (Norm): {val_top10:.4f} | StdRatio: {std_ratio:.3f} | Collapse: {collapse_pct:.1f}%")
+              f"Val Top-10 (Norm): {val_top10:.4f} | "
+              f"MRR(full): {val_mrr_full:.4f} | Top-10(full): {val_top10_full:.4f} | "
+              f"StdRatio: {std_ratio:.3f} | Collapse: {collapse_pct:.1f}%")
               
         history_row = {
             "epoch": epoch,
@@ -703,9 +898,15 @@ def main():
     model.eval()
     print(f"Reloaded best checkpoint (epoch {best_ckpt['epoch']}) for eval prediction saving.")
 
-    save_eval_metadata(model, val_loader, device, run_dir / "val_eval_preds.pt")
+    save_eval_metadata(
+        model, val_loader, device, run_dir / "val_eval_preds.pt",
+        bank=full_bank, image_id_to_bank_idx=image_id_to_bank_idx,
+    )
     if len(test_dataset) > 0:
-        save_eval_metadata(model, test_loader, device, run_dir / "test_eval_preds.pt")
+        save_eval_metadata(
+            model, test_loader, device, run_dir / "test_eval_preds.pt",
+            bank=full_bank, image_id_to_bank_idx=image_id_to_bank_idx,
+        )
 
     print(f"Results saved in: {run_dir}")
 

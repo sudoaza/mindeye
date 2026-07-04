@@ -303,6 +303,46 @@ def retrieval_topk(
     return out
 
 
+def retrieval_topk_full_bank(
+    pred: torch.Tensor,
+    bank: torch.Tensor,
+    positive_index: torch.Tensor,
+    *,
+    ks: tuple[int, ...] = (1, 5, 10),
+) -> dict[str, float]:
+    """Rank each prediction against a full (deduped) image bank.
+
+    Unlike :func:`retrieval_topk`, which ranks queries only against the other
+    queries in the set (within-val, inflated), this ranks every prediction
+    against the entire unique-image bank — the honest, docs-mandated metric.
+
+    Args:
+        pred:            [N, D] predicted embeddings.
+        bank:            [M, D] unique-image target bank (M ≈ full image count).
+        positive_index:  [N] index into ``bank`` of each prediction's true image.
+        ks:              top-k cutoffs.
+
+    Returns top-k accuracy, MRR, and median rank over the full bank.
+    """
+    pred_n = F.normalize(pred, dim=-1)
+    bank_n = F.normalize(bank, dim=-1)
+    logits = pred_n @ bank_n.T  # [N, M]
+
+    positive_index = positive_index.to(logits.device).long()
+    # Similarity of each query to its own true image.
+    pos_sim = logits.gather(1, positive_index[:, None]).squeeze(1)  # [N]
+    # 0-based rank = number of bank items strictly more similar than the positive.
+    rank_of_truth = (logits > pos_sim[:, None]).sum(dim=1).float()
+
+    out: dict[str, float] = {}
+    for k in ks:
+        out[f"top{k}"] = (rank_of_truth < k).float().mean().item()
+    out["mrr"] = (1.0 / (rank_of_truth + 1.0)).mean().item()
+    out["median_rank"] = float(rank_of_truth.median().item() + 1)  # 1-indexed
+    out["bank_size"] = int(bank.shape[0])
+    return out
+
+
 class DualHeadTemporalAttnEncoder(nn.Module):
     """
     Dual-head Temporal Attention Encoder.

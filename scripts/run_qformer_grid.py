@@ -28,33 +28,44 @@ def compute_paired_bootstrap(metric_real, metric_control, n_bootstrap=10000, see
     return float(mean_diff), (float(ci_lower), float(ci_upper)), float(sign_rate)
 
 def align_and_compute_deltas(real_data, control_data):
+    # Prefer the honest full-bank rank/hit when available (finding H1); fall back
+    # to within-val rank for older eval files.
+    def _cols(data):
+        if "rank_full" in data and "top10_hit_full" in data:
+            return data["rank_full"].numpy(), data["top10_hit_full"].numpy(), "full"
+        return data["rank"].numpy(), data["top10_hit"].numpy(), "within_val"
+
+    real_rank, real_top10, real_scope = _cols(real_data)
+    ctrl_rank, ctrl_top10, ctrl_scope = _cols(control_data)
+    scope = real_scope if real_scope == ctrl_scope else "mixed"
+
     # Align trials by sample_id to ensure exact pairing
     real_df = pd.DataFrame({
         "sample_id": real_data["sample_id"],
-        "rank_real": real_data["rank"].numpy(),
-        "top10_real": real_data["top10_hit"].numpy()
+        "rank_real": real_rank,
+        "top10_real": real_top10,
     })
     real_df["mrr_real"] = 1.0 / (real_df["rank_real"] + 1.0)
-    
+
     control_df = pd.DataFrame({
         "sample_id": control_data["sample_id"],
-        "rank_ctrl": control_data["rank"].numpy(),
-        "top10_ctrl": control_data["top10_hit"].numpy()
+        "rank_ctrl": ctrl_rank,
+        "top10_ctrl": ctrl_top10,
     })
     control_df["mrr_ctrl"] = 1.0 / (control_df["rank_ctrl"] + 1.0)
-    
+
     merged = pd.merge(real_df, control_df, on="sample_id", how="inner")
     if len(merged) == 0:
         raise ValueError("Could not align sample IDs between real and control runs!")
-        
+
     diff_mrr = (merged["mrr_real"] - merged["mrr_ctrl"]).values
     diff_top10 = (merged["top10_real"] - merged["top10_ctrl"]).values
-    return diff_mrr, diff_top10
+    return diff_mrr, diff_top10, scope
 
 def main():
     parser = argparse.ArgumentParser(description="Run minimal QFormer training grid with bootstrap evaluation.")
-    parser.add_argument("--latents-pt", type=str, default="/workspace/mindeye/data/processed/zuna_latents/sub01_runs01_32")
-    parser.add_argument("--rae-pt", type=str, default="/workspace/mindeye/data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt")
+    parser.add_argument("--latents-pt", type=str, default="data/processed/zuna_latents/cohort")
+    parser.add_argument("--rae-pt", type=str, default="data/processed/rae_embeddings/rae_dinov2_base_bank.pt")
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs per run")
     parser.add_argument("--patience", type=int, default=8, help="Early stopping patience")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -75,6 +86,14 @@ def main():
     parser.add_argument("--latent-tc-start", type=int, default=20, help="Latent time slice start index")
     parser.add_argument("--latent-tc-end", type=int, default=36, help="Latent time slice end index (exclusive)")
     parser.add_argument("--num-subjects", type=int, default=1, help="Number of subjects in the cohort (enables subject FiLM in the QFormer when > 1)")
+    # Reconstruction / luminance grounding (opt-in). When > 0, each run additionally
+    # predicts an RAE token grid, decodes it through the frozen RAE, and adds a
+    # stimulus-vs-generated luminance-grid loss. Overrides HANDOVER non-negotiable #3
+    # by explicit decision — see docs/HANDOVER.md.
+    parser.add_argument("--recon-luma-weight", type=float, default=0.0,
+                        help="Weight of stimulus-vs-generated luminance-grid loss (0 = pure retrieval, unchanged behaviour)")
+    parser.add_argument("--stimuli-dir", type=str, default="data/raw/nod/stimuli/ImageNet",
+                        help="Stimulus image dir for the luminance loss (used only when --recon-luma-weight > 0)")
     args = parser.parse_args()
     
     # --- Smoke-test overrides ---
@@ -147,6 +166,11 @@ def main():
                     "--slug", slug,
                     "--num-subjects", str(args.num_subjects),
                 ]
+                if args.recon_luma_weight > 0.0:
+                    cmd += [
+                        "--recon-luma-weight", str(args.recon_luma_weight),
+                        "--stimuli-dir", args.stimuli_dir,
+                    ]
                 # Pass temporal window flag
                 if args.temporal_window:
                     cmd += [
@@ -167,14 +191,24 @@ def main():
                 env = {**os.environ, "PYTHONPATH": "src"}
                 
                 print(f"Launching subprocess: Layer={layer} | Target={target_name} | Mode={mode}")
-                process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                processes.append((mode, slug, process))
+                # Finding L1: stream child output to a log file rather than a PIPE, so a
+                # child that fills the 64KB stdout pipe buffer can't deadlock before we
+                # call communicate() on the others.
+                log_path = grid_dir / f"{slug}.log"
+                log_fh = open(log_path, "w")
+                process = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT, text=True)
+                processes.append((mode, slug, process, log_fh, log_path))
                 
             # Wait for all modes in this target group to complete
-            for mode, slug, process in processes:
+            for mode, slug, process, log_fh, log_path in processes:
                 print(f"\nWaiting for {target_name} ({mode}) to finish...")
-                stdout, _ = process.communicate()
-                print(f"=== Subprocess Output for {target_name} ({mode}) ===")
+                process.wait()
+                log_fh.close()
+                try:
+                    stdout = log_path.read_text()
+                except OSError:
+                    stdout = ""
+                print(f"=== Subprocess Output for {target_name} ({mode}) (log: {log_path}) ===")
                 print(stdout)
                 
                 if process.returncode != 0:
@@ -202,6 +236,9 @@ def main():
                         "MRR_Norm": best_m.get("val_mrr_norm", 0.0),
                         "Top1_Norm": best_m.get("val_top1_norm", 0.0),
                         "Top10_Norm": best_m.get("val_top10_norm", 0.0),
+                        "MRR_Full": best_m.get("val_mrr_full"),
+                        "Top10_Full": best_m.get("val_top10_full"),
+                        "BankSize": best_m.get("bank_size"),
                         "Cosine_Norm": best_m.get("val_cosine_norm", 0.0),
                         "StdRatio": best_m.get("val_pred_std_ratio", 0.0),
                         "NormMean": best_m.get("val_pred_norm_mean", 0.0),
@@ -228,97 +265,117 @@ def main():
             
         real_dir = runs_paths[real_key]
         real_data = torch.load(real_dir / "val_eval_preds.pt", map_location="cpu")
-        
-        # Shuffled comparison
-        shuf_mrr_delta = shuf_mrr_ci = shuf_mrr_sig = "N/A"
-        shuf_t10_delta = shuf_t10_ci = shuf_t10_sig = "N/A"
-        if shuf_key in runs_paths:
-            shuf_dir = runs_paths[shuf_key]
-            shuf_data = torch.load(shuf_dir / "val_eval_preds.pt", map_location="cpu")
-            try:
-                diff_mrr, diff_t10 = align_and_compute_deltas(real_data, shuf_data)
-                
-                shuf_mrr_delta, mrr_ci, shuf_mrr_sig = compute_paired_bootstrap(diff_mrr, 0.0)
-                shuf_mrr_ci = f"[{mrr_ci[0]:+.4f}, {mrr_ci[1]:+.4f}]"
-                
-                shuf_t10_delta, t10_ci, shuf_t10_sig = compute_paired_bootstrap(diff_t10, 0.0)
-                shuf_t10_ci = f"[{t10_ci[0]:+.4f}, {t10_ci[1]:+.4f}]"
-            except Exception as e:
-                print(f"Error during shuffled bootstrap: {e}")
-                
-        # Random comparison
-        rand_mrr_delta = rand_mrr_ci = rand_mrr_sig = "N/A"
-        rand_t10_delta = rand_t10_ci = rand_t10_sig = "N/A"
-        if rand_key in runs_paths:
-            rand_dir = runs_paths[rand_key]
-            rand_data = torch.load(rand_dir / "val_eval_preds.pt", map_location="cpu")
-            try:
-                diff_mrr, diff_t10 = align_and_compute_deltas(real_data, rand_data)
-                
-                rand_mrr_delta, mrr_ci, rand_mrr_sig = compute_paired_bootstrap(diff_mrr, 0.0)
-                rand_mrr_ci = f"[{mrr_ci[0]:+.4f}, {mrr_ci[1]:+.4f}]"
-                
-                rand_t10_delta, t10_ci, rand_t10_sig = compute_paired_bootstrap(diff_t10, 0.0)
-                rand_t10_ci = f"[{t10_ci[0]:+.4f}, {t10_ci[1]:+.4f}]"
-            except Exception as e:
-                print(f"Error during random bootstrap: {e}")
-                
+
+        # Numeric results per control (finding M5: keep numbers, not formatted strings).
+        # A missing control is recorded explicitly rather than silently coerced to 0.0.
+        def _compare_control(control_key, control_name):
+            if control_key not in runs_paths:
+                return {"present": False, "reason": f"{control_name} run missing"}
+            control_data = torch.load(runs_paths[control_key] / "val_eval_preds.pt", map_location="cpu")
+            diff_mrr, diff_t10, scope = align_and_compute_deltas(real_data, control_data)
+            mrr_delta, mrr_ci, mrr_sig = compute_paired_bootstrap(diff_mrr, 0.0)
+            t10_delta, t10_ci, t10_sig = compute_paired_bootstrap(diff_t10, 0.0)
+            return {
+                "present": True,
+                "scope": scope,
+                "mrr_delta": mrr_delta, "mrr_ci": mrr_ci, "mrr_sig": mrr_sig,
+                "t10_delta": t10_delta, "t10_ci": t10_ci, "t10_sig": t10_sig,
+            }
+
+        shuf = _compare_control(shuf_key, "shuffled")
+        rand = _compare_control(rand_key, "random")
+
         # Evaluate Gate Criteria
-        # Load best metrics for real run
         real_metrics = next((r for r in runs_metrics if r["Target"] == target_name and r["Mode"] == "real"), None)
         shuf_metrics = next((r for r in runs_metrics if r["Target"] == target_name and r["Mode"] == "shuffled"), None)
         rand_metrics = next((r for r in runs_metrics if r["Target"] == target_name and r["Mode"] == "random"), None)
-        
+
         gate_passed = False
         gate_reasons = []
-        
-        if real_metrics and shuf_metrics and rand_metrics:
-            # 1. Delta MRR > +0.005 for both controls
-            shuf_mrr_val = float(shuf_mrr_delta) if isinstance(shuf_mrr_delta, float) else 0.0
-            rand_mrr_val = float(rand_mrr_delta) if isinstance(rand_mrr_delta, float) else 0.0
-            
-            cond_mrr_delta = (shuf_mrr_val > 0.005) and (rand_mrr_val > 0.005)
+
+        # Prefer the honest full-bank metrics for the "real > controls" comparison,
+        # falling back to within-val when full-bank is unavailable (finding H1).
+        def _pick(m, full_key, norm_key):
+            if m is None:
+                return None
+            v = m.get(full_key)
+            return v if v is not None else m.get(norm_key, 0.0)
+
+        if not (real_metrics and shuf_metrics and rand_metrics):
+            gate_reasons.append("Missing one or more of real/shuffled/random runs (cannot gate)")
+        elif not (shuf["present"] and rand["present"]):
+            gate_reasons.append(
+                "; ".join(c["reason"] for c in (shuf, rand) if not c["present"])
+            )
+        else:
+            # 1. Paired Δ MRR > +0.005 for both controls (numeric, full-bank when present)
+            cond_mrr_delta = (shuf["mrr_delta"] > 0.005) and (rand["mrr_delta"] > 0.005)
             if not cond_mrr_delta:
-                gate_reasons.append(f"Paired delta MRR below +0.005 (shuffled={shuf_mrr_val:+.4f}, random={rand_mrr_val:+.4f})")
-                
-            # 2. CI excludes 0 (meaning lower bound > 0 for both)
-            try:
-                shuf_mrr_lower = float(shuf_mrr_ci.strip("[]").split(",")[0])
-                rand_mrr_lower = float(rand_mrr_ci.strip("[]").split(",")[0])
-                cond_ci = (shuf_mrr_lower > 0.0) and (rand_mrr_lower > 0.0)
-            except Exception:
-                cond_ci = False
+                gate_reasons.append(
+                    f"Paired delta MRR below +0.005 (shuffled={shuf['mrr_delta']:+.4f}, random={rand['mrr_delta']:+.4f})"
+                )
+
+            # 2. CI lower bound > 0 for both controls — using the numeric CI directly
+            cond_ci = (shuf["mrr_ci"][0] > 0.0) and (rand["mrr_ci"][0] > 0.0)
             if not cond_ci:
-                gate_reasons.append(f"Confidence interval includes 0 (shuffled={shuf_mrr_ci}, random={rand_mrr_ci})")
-                
-            # 3. Real > Shuffled and Random on MRR and Top10
-            cond_better = (real_metrics["MRR_Norm"] > shuf_metrics["MRR_Norm"]) and \
-                          (real_metrics["MRR_Norm"] > rand_metrics["MRR_Norm"]) and \
-                          (real_metrics["Top10_Norm"] > shuf_metrics["Top10_Norm"]) and \
-                          (real_metrics["Top10_Norm"] > rand_metrics["Top10_Norm"])
+                gate_reasons.append(
+                    f"Confidence interval includes 0 (shuffled=[{shuf['mrr_ci'][0]:+.4f}, {shuf['mrr_ci'][1]:+.4f}], "
+                    f"random=[{rand['mrr_ci'][0]:+.4f}, {rand['mrr_ci'][1]:+.4f}])"
+                )
+
+            # 3. Paired Δ Top10 > 0 for both controls (finding M5: actually gate on it)
+            cond_t10_delta = (shuf["t10_delta"] > 0.0) and (rand["t10_delta"] > 0.0)
+            if not cond_t10_delta:
+                gate_reasons.append(
+                    f"Paired delta Top10 not > 0 (shuffled={shuf['t10_delta']:+.4f}, random={rand['t10_delta']:+.4f})"
+                )
+
+            # 4. Real > Shuffled and Random on MRR and Top10 (full-bank when available)
+            real_mrr = _pick(real_metrics, "MRR_Full", "MRR_Norm")
+            shuf_mrr = _pick(shuf_metrics, "MRR_Full", "MRR_Norm")
+            rand_mrr = _pick(rand_metrics, "MRR_Full", "MRR_Norm")
+            real_t10 = _pick(real_metrics, "Top10_Full", "Top10_Norm")
+            shuf_t10 = _pick(shuf_metrics, "Top10_Full", "Top10_Norm")
+            rand_t10 = _pick(rand_metrics, "Top10_Full", "Top10_Norm")
+            cond_better = (real_mrr > shuf_mrr) and (real_mrr > rand_mrr) and \
+                          (real_t10 > shuf_t10) and (real_t10 > rand_t10)
             if not cond_better:
                 gate_reasons.append("Real performance not superior to both controls on MRR and Top10")
-                
-            # 4. StdRatio between 0.3 and 2.0
+
+            # 5. StdRatio between 0.3 and 2.0
             cond_ratio = 0.3 <= real_metrics["StdRatio"] <= 2.0
             if not cond_ratio:
                 gate_reasons.append(f"StdRatio out of bounds [0.3, 2.0] (value={real_metrics['StdRatio']:.3f})")
-                
-            # 5. collapse_pct < 20.0
+
+            # 6. collapse_pct < 20.0
             cond_collapse = real_metrics["CollapsePct"] < 20.0
             if not cond_collapse:
                 gate_reasons.append(f"Collapse percentage too high (value={real_metrics['CollapsePct']:.1f}%)")
-                
-            gate_passed = cond_mrr_delta and cond_ci and cond_better and cond_ratio and cond_collapse
-            
+
+            gate_passed = (cond_mrr_delta and cond_ci and cond_t10_delta
+                           and cond_better and cond_ratio and cond_collapse)
+
+        def _fmt_delta(c, key):
+            return f"{c[key]:+.4f}" if c.get("present") else "N/A"
+
+        def _fmt_ci(c, key):
+            return f"[{c[key][0]:+.4f}, {c[key][1]:+.4f}]" if c.get("present") else "N/A"
+
+        def _fmt_sig(c, key):
+            return f"{c[key]:.1%}" if c.get("present") else "N/A"
+
+        scope_tag = shuf.get("scope") if shuf.get("present") else (rand.get("scope") if rand.get("present") else "n/a")
         bootstrap_results.append({
             "Target": target_name,
-            "Shuf MRR Δ": f"{shuf_mrr_delta:.4f}" if isinstance(shuf_mrr_delta, float) else "N/A",
-            "Shuf MRR 95% CI": shuf_mrr_ci,
-            "Shuf Sign Rate": f"{shuf_mrr_sig:.1%}" if isinstance(shuf_mrr_sig, float) else "N/A",
-            "Rand MRR Δ": f"{rand_mrr_delta:.4f}" if isinstance(rand_mrr_delta, float) else "N/A",
-            "Rand MRR 95% CI": rand_mrr_ci,
-            "Rand Sign Rate": f"{rand_mrr_sig:.1%}" if isinstance(rand_mrr_sig, float) else "N/A",
+            "Rank Scope": scope_tag,
+            "Shuf MRR Δ": _fmt_delta(shuf, "mrr_delta"),
+            "Shuf MRR 95% CI": _fmt_ci(shuf, "mrr_ci"),
+            "Shuf Sign Rate": _fmt_sig(shuf, "mrr_sig"),
+            "Shuf Top10 Δ": _fmt_delta(shuf, "t10_delta"),
+            "Rand MRR Δ": _fmt_delta(rand, "mrr_delta"),
+            "Rand MRR 95% CI": _fmt_ci(rand, "mrr_ci"),
+            "Rand Sign Rate": _fmt_sig(rand, "mrr_sig"),
+            "Rand Top10 Δ": _fmt_delta(rand, "t10_delta"),
             "Gate Status": "PASS ✅" if gate_passed else "FAIL ❌",
             "Fail Reasons": "; ".join(gate_reasons) if not gate_passed else "None"
         })
@@ -342,11 +399,14 @@ Experiment Root: `{grid_dir}`
 {df_boot.to_markdown(index=False)}
 
 ## Gate Criteria Reminder
-- **Normalized paired Δ MRR**: > +0.005
-- **Confidence Interval**: Excludes 0
+- **Rank scope**: full-bank retrieval when available (honest), else within-val (inflated, diagnostic)
+- **Paired Δ MRR**: > +0.005 for both controls (numeric CI, no string parsing)
+- **Confidence Interval**: lower bound > 0 for both controls
+- **Paired Δ Top10**: > 0 for both controls
 - **Comparisons**: Real > Shuffled and Random on MRR and Top10
 - **StdRatio**: Between 0.3 and 2.0
 - **Dimension Collapse**: < 20% collapse percentage
+- A missing control run is an explicit gate failure (never silently coerced to 0).
 """
         with open(grid_dir / "README.md", "w") as f:
             f.write(report_md)

@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--layers", type=str, default="all", help="Layers to cache (comma-separated, e.g. 'layer_8,post_mmd') or 'all'")
     parser.add_argument("--max-trials", type=int, default=None, help="Maximum number of trials to cache (for Phase 0.5 sweep)")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for extraction")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size for extraction. ZUNA packs the whole batch into one document and builds a dense (B*orig_seqlen)^2 flex-attention mask, so cost grows with B^2. orig_seqlen=62*40=2480, so B=4 keeps the mask ~O((4*2480)^2) which fits 80GB; B=32 OOMs (187GiB mask). Keep this small.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -77,6 +77,9 @@ def main():
         
     print(f"Layers to cache: {layers_to_cache}")
 
+    # tc-downsample factor: 1280 samples -> num_fine_time_pts coarse-time steps.
+    tc_downsample_factor = int(1280 // extractor.model_args.num_fine_time_pts)
+
     # Group metadata by source dir + NPZ file to load them efficiently. Different
     # subjects can share an npz basename, so include the dir in the grouping key.
     grouped = metadata_df.groupby(["_epochs_dir", "npz_file"])
@@ -115,6 +118,7 @@ def main():
         # Match channel names and get 3D coordinates
         ch_pos_dict = montage.get_positions()["ch_pos"]
         ch_coords = []
+        unmatched = []
         for name in ch_names:
             # Clean name (e.g. strip whitespace, uppercase)
             clean_name = name.strip()
@@ -124,14 +128,32 @@ def main():
             elif clean_name.upper() in ch_pos_dict:
                 pos = ch_pos_dict[clean_name.upper()]
             else:
-                pos = [0.0, 0.0, 0.0]  # fallback
+                pos = None
+                unmatched.append(str(name))
             ch_coords.append(pos)
-            
+
+        # Finding M4: a silent [0,0,0] fallback corrupts ZUNA's 4D-RoPE spatial
+        # encoding for the unmatched channel(s). Fail loudly instead so the montage
+        # mismatch is fixed rather than silently degrading every latent.
+        if unmatched:
+            raise ValueError(
+                f"[{epochs_dir}/{npz_filename}] {len(unmatched)} channel(s) not found in "
+                f"standard_1005 montage: {unmatched}. These would fall back to [0,0,0] and "
+                f"corrupt ZUNA's spatial position encoding. Fix the channel naming or montage."
+            )
+
         ch_pos_template = torch.tensor(ch_coords, dtype=torch.float32) # [n_channels, 3]
         
         # Process in batches
         num_epochs = len(group_df)
-        
+
+        # Harden the metadata-order == npz-row-order assumption (finding M/latent-dims):
+        # group_df rows must correspond 1:1 to npz epoch rows, in order.
+        if eeg_all.shape[0] != num_epochs:
+            raise ValueError(
+                f"[{epochs_dir}/{npz_filename}] npz has {eeg_all.shape[0]} epochs but metadata "
+                f"group has {num_epochs} rows. Row-order pairing would be wrong."
+            )
         for idx_start in range(0, num_epochs, args.batch_size):
             idx_end = min(idx_start + args.batch_size, num_epochs)
             batch_df = group_df.iloc[idx_start:idx_end]
@@ -169,7 +191,8 @@ def main():
                 image_id = str(row.get('image_id', 'MISSING'))
                 class_id = str(row.get('class_id', 'MISSING'))
                 onset_offset_s = float(row.get('event_offset_s', 3.0))
-                onset_tc = int(row.get('anchor_sample', 768) / 32) # e.g. 768 / 32 = 24
+                # tc-downsample factor = 1280 / num_fine_time_pts (e.g. 1280/40 = 32).
+                onset_tc = int(round(float(row.get('anchor_sample', 768)) / tc_downsample_factor))
                 
                 record = {
                     "sample_id": sample_id,
@@ -214,12 +237,15 @@ def main():
         torch.save(latent_records, out_pt_path)
     
     # Save metadata.json
+    # Derive onset_tc from the cached records (anchor_sample / tc-downsample) rather
+    # than hardcoding 24, so it stays correct if the crop window changes.
+    onset_tcs = sorted({int(r["onset_tc"]) for r in latent_records}) if latent_records else [24]
     meta_info = {
         "n_channels": n_channels,
-        "tc": int(1280 // extractor.model_args.num_fine_time_pts),
+        "tc": tc_downsample_factor,
         "tf": int(extractor.model_args.num_fine_time_pts),
         "D": int(extractor.model_args.encoder_output_dim),
-        "onset_tc": 24,
+        "onset_tc": onset_tcs[0] if len(onset_tcs) == 1 else onset_tcs,
         "n_trials": len(latent_records),
         "cached_layers": layers_to_cache
     }

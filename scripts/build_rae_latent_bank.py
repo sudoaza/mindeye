@@ -12,7 +12,7 @@ from mindseye.generation.rae_backend import RaeDecoderBackend
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--image-dir", default="data/raw/nod/stimuli/ImageNet", help="Path to ImageNet stimulus images")
-    p.add_argument("--output", default="data/processed/rae_embeddings/rae_dinov2_base_sub01_04_runs01_40.pt", help="Output path")
+    p.add_argument("--output", default="data/processed/rae_embeddings/rae_dinov2_base_bank.pt", help="Output path")
     p.add_argument("--batch-size", type=int, default=64)
     return p.parse_args()
 

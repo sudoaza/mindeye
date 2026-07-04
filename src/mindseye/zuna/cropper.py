@@ -51,6 +51,10 @@ class CropConfig:
     resample_sfreq: float = 256.0   # target sfreq for "resample" mode
     window_mode: str = "crop"
     has_event_marker: bool = False
+    # Alignment guardrails (see crop_run_to_epochs). When the CSV carries an
+    # `onset` column, onsets are matched by time; otherwise pairing is positional.
+    onset_match_tol_s: float = 0.100   # max |csv_onset - fif_onset| to accept a time-join
+    strict_align: bool = True          # hard-fail on count/time-alignment mismatch
 
 
 @dataclass(frozen=True)
@@ -89,12 +93,29 @@ def events_for_run(
     *,
     session: str | None = None,
     run: int,
+    event_name: str = "stim_on",
 ) -> pd.DataFrame:
-    """Filter the NOD detailed-events CSV to one session/run."""
+    """Filter the NOD detailed-events CSV to one session/run's stimulus events.
+
+    The rows are returned sorted by the CSV's own ``onset`` column (when present)
+    so their order matches the FIF annotation stream. Only stimulus rows are kept
+    when a ``trial_type`` column is available, so non-stimulus markers do not shift
+    the positional pairing with annotation onsets.
+    """
     mask = events_df["run"].astype(int) == int(run)
     if session is not None and "session" in events_df.columns:
         mask &= events_df["session"].astype(str) == session
-    return events_df.loc[mask].reset_index(drop=True).copy()
+    # Keep only stimulus events so counts line up with `stim_on` annotations.
+    if "trial_type" in events_df.columns:
+        trial_type = events_df["trial_type"].astype(str).str.lower()
+        stim_like = trial_type.isin({"stimulus", "stim", event_name.lower()})
+        # Only apply the filter if it actually matches rows; some CSVs use other labels.
+        if bool((mask & stim_like).any()):
+            mask &= stim_like
+    out = events_df.loc[mask].copy()
+    if "onset" in out.columns:
+        out = out.sort_values("onset", kind="stable")
+    return out.reset_index(drop=True)
 
 
 def build_mne_events_for_source(
@@ -178,11 +199,51 @@ def crop_run_to_epochs(
     onset_seconds = stim_onsets_from_raw(raw_fif_path, config.event_name)
     event_offset_s = abs(config.tmin)
     anchor_sample = int(round(event_offset_s * source_sfreq))
-    
-    metadata = events_for_run(events_df, session=session, run=run)
-    n = min(len(onset_seconds), len(metadata))
+
+    metadata = events_for_run(
+        events_df, session=session, run=run, event_name=config.event_name
+    )
+
+    # --- Alignment guardrail (finding H2) -------------------------------------
+    # `onset_seconds` come from the FIF annotation stream (sorted by sample).
+    # `metadata` rows are sorted by the CSV's own `onset` column (when present),
+    # so positional pairing below only holds if counts match and, when a CSV
+    # onset column exists, the two onset series agree within tolerance.
+    n_onsets, n_meta = len(onset_seconds), len(metadata)
+    if n_onsets != n_meta:
+        msg = (
+            f"[Cropper] Onset/metadata count mismatch for {subject} {session} run {run}: "
+            f"{n_onsets} FIF annotation onsets vs {n_meta} events-CSV rows. "
+            f"Positional pairing would mislabel this run."
+        )
+        if config.strict_align:
+            raise ValueError(msg)
+        print(f"  [WARN] {msg} Proceeding with positional min() pairing.")
+
+    n = min(n_onsets, n_meta)
     onset_seconds = onset_seconds[:n]
-    
+    metadata = metadata.iloc[:n].copy()
+
+    # When the CSV exposes its own onset column, verify the time-join rather than
+    # trusting positional order alone.
+    if n > 0 and "onset" in metadata.columns:
+        csv_onsets = metadata["onset"].to_numpy(dtype=float)
+        # Align both series to their own run start so absolute-clock offsets
+        # (annotation stream vs CSV) do not defeat the comparison.
+        fif_rel = onset_seconds - onset_seconds[0]
+        csv_rel = csv_onsets - csv_onsets[0]
+        max_dev = float(np.max(np.abs(fif_rel - csv_rel))) if n > 1 else 0.0
+        if max_dev > config.onset_match_tol_s:
+            msg = (
+                f"[Cropper] Onset time-join failed for {subject} {session} run {run}: "
+                f"max |fif-csv| inter-onset deviation {max_dev:.3f}s "
+                f"> tol {config.onset_match_tol_s:.3f}s. Labels may be shifted/misordered."
+            )
+            if config.strict_align:
+                raise ValueError(msg)
+            print(f"  [WARN] {msg}")
+        else:
+            print(f"  [Cropper] Onset time-join OK (max dev {max_dev:.3f}s over {n} events)")
     previous_counts = []
     future_counts = []
     other_counts = []
@@ -213,7 +274,6 @@ def crop_run_to_epochs(
     if avg_others > 1.0:
         print(f"  [WARN] High label noise! windows contain multiple stimuli on average.")
 
-    metadata = metadata.iloc[:n].copy()
     metadata.insert(0, "has_event_marker", config.has_event_marker)
     metadata.insert(0, "window_mode", config.window_mode)
     metadata.insert(0, "window_tmax", config.tmax)

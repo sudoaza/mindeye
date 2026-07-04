@@ -77,7 +77,7 @@ class ZunaToVisionQFormer(nn.Module):
     def __init__(
         self,
         *,
-        d_in: int = 1024,
+        d_in: int = 32,
         d_out: int = 512,
         hidden_dim: int = 256,
         nhead: int = 8,
@@ -89,6 +89,9 @@ class ZunaToVisionQFormer(nn.Module):
         normalize_output: bool = True,
         output_layernorm: bool = True,
         force_unit_output: bool = True,
+        recon_grid: bool = False,
+        recon_grid_size: int = 16,
+        recon_token_dim: int = 768,
     ):
         super().__init__()
         self.d_in = d_in
@@ -98,6 +101,13 @@ class ZunaToVisionQFormer(nn.Module):
         self.force_unit_output = force_unit_output
         self.hidden_dim = hidden_dim
         self.num_subjects = num_subjects
+        # Reconstruction path: predict the full RAE token grid [B, recon_token_dim, G, G]
+        # so the prediction can be decoded to an image (luminance grounding loss). This
+        # closes the retrieval->reconstruction gap documented in docs/HANDOVER.md §3.
+        # It is opt-in and additive: the pooled retrieval vector is still produced.
+        self.recon_grid = recon_grid
+        self.recon_grid_size = recon_grid_size
+        self.recon_token_dim = recon_token_dim
 
         # Input projection: maps ZUNA latents [B, N, d_in] -> [B, N, hidden_dim]
         self.input_proj = nn.Sequential(
@@ -141,7 +151,22 @@ class ZunaToVisionQFormer(nn.Module):
         )
         if self.output_layernorm:
             self.final_norm = nn.LayerNorm(d_out)
-            
+
+        # Reconstruction token-grid head: map every query token to the RAE token grid.
+        # We produce G*G spatial slots, each a recon_token_dim vector, from the pooled
+        # query features broadcast over learned spatial position queries. This is the
+        # minimal decodable bridge — a [B, recon_token_dim, G, G] grid for AutoencoderRAE.
+        if self.recon_grid:
+            g = self.recon_grid_size
+            self.recon_pos = nn.Parameter(torch.randn(1, g * g, hidden_dim) * 0.02)
+            self.recon_attn = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout, batch_first=True)
+            self.recon_norm = nn.LayerNorm(hidden_dim)
+            self.recon_proj = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.recon_token_dim),
+            )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -154,13 +179,16 @@ class ZunaToVisionQFormer(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, zuna_latents: torch.Tensor, subject_id: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, zuna_latents: torch.Tensor, subject_id: torch.Tensor | None = None, return_grid: bool = False):
         """
         Args:
             zuna_latents: [B, N, d_in]
             subject_id:   [B] containing subject index (optional)
+            return_grid:  if True (requires recon_grid=True), also return the decodable
+                          RAE token grid [B, recon_token_dim, G, G].
         Returns:
-            [B, d_out] normalized target embedding
+            [B, d_out] pooled retrieval embedding, or a tuple
+            ([B, d_out], [B, recon_token_dim, G, G]) when return_grid is set.
         """
         # Bug 3 fix: assert input is [B, N, D]
         assert zuna_latents.ndim == 3, (
@@ -210,5 +238,16 @@ class ZunaToVisionQFormer(nn.Module):
             
         if self.force_unit_output or self.normalize_output:
             out = F.normalize(out, dim=-1)
-            
+
+        if return_grid:
+            if not self.recon_grid:
+                raise RuntimeError("return_grid=True requires the model to be built with recon_grid=True")
+            g = self.recon_grid_size
+            spatial_q = self.recon_pos.expand(b, -1, -1)  # [B, G*G, hidden_dim]
+            grid_feat, _ = self.recon_attn(spatial_q, queries, queries)  # [B, G*G, hidden_dim]
+            grid_feat = self.recon_norm(grid_feat)
+            grid = self.recon_proj(grid_feat)  # [B, G*G, recon_token_dim]
+            grid = grid.transpose(1, 2).reshape(b, self.recon_token_dim, g, g)  # [B, D, G, G]
+            return out, grid
+
         return out
