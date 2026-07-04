@@ -12,18 +12,19 @@ This document summarises the current project state, remote environment, and step
 
 **Goal of this run**: past experience is that positive results only emerge at scale, so we are training a **single combined-cohort QFormer** over **9 subjects × 32 runs** (not per-subject models). Cohort is `sub-01..sub-09` — these are the only NOD ds005811 subjects with full 32-run (4 session × 8) coverage; `sub-10+` have just 16 runs, so there are **no 40-run subjects** (the old `_runs01_40` naming was always a misnomer).
 
-**Where**: RunPod Secure Cloud pod **`0w6hgf17v0xs46`**, A100 80GB PCIe, EU-RO-1, 200GB volume at `/workspace`, torch 2.8.0+cu128. Repo at `/workspace/mindeye`, HEAD should be the latest `master`.
+**Where**: RunPod Secure Cloud pod **`0w6hgf17v0xs46`**, A100 80GB PCIe, EU-RO-1, 200GB **pod-local** disk at `/workspace` (⚠️ NOT a detachable network volume — see §2; data is tied to this pod, so a "small pod for data / big pod for GPU" swap is not possible without first migrating to a real network volume). torch 2.8.0+cu128. Repo at `/workspace/mindeye`, HEAD should be the latest `master`. SSH endpoint changes on every stop/start — current: `213.173.105.4:30108` (update `pod-exec` `pod.json` after each restart).
 
-**How it was launched** (backgrounded, survives disconnects):
+**How it was launched** (backgrounded, survives disconnects). NOTE `ZUNA_CACHE_BATCH=4` — the caching step OOMs at the default and even at B=8 (see §8):
 ```bash
 cd /workspace/mindeye
 export HF_HOME=/workspace/hf_cache
-nohup env SKIP_ENV=1 HF_HOME=$HF_HOME bash scripts/prepare_multisubject_data.sh > /workspace/cohort9.log 2>&1 &
+nohup env SKIP_ENV=1 HF_HOME=$HF_HOME ZUNA_CACHE_BATCH=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  bash scripts/prepare_multisubject_data.sh > /workspace/cohort9.log 2>&1 &
 ```
 
-**Progress at last update** (2026-07-03, checked live): step **[3/7] cropping** — sub-01..04 done, now cropping **sub-05** of 9 (epochs correctly `[N, 62, 1281]`). Steps already complete and reusable if the run dies: raw download (~6GB), 288 ZUNA-denoised runs (`data/processed/zuna_real/4_fif_output/`), the 14GB RAE bank (`rae_dinov2_base_all.pt`), and 35,466 stimulus images. ZUNA denoising **skips already-processed files**, so relaunching is cheap.
+**Progress at last update** (2026-07-04, checked live): the earlier run **died** — the pod was stopped (out of credit) AND step **[6/7] `cache_zuna_latents` OOM'd** (187 GiB flex-attention mask, see §8). Pod restarted, container was fresh so deps were reinstalled (torch stayed 2.8.0+cu128, no re-pin needed), the batch-size bug was fixed (B=4), and the pipeline was **relaunched** (PID 1589). **All 9 subjects are cropped** (sub-01..09, ~34,900 epochs total), 288 ZUNA runs, 14GB RAE bank, and stimuli all persist on the disk and fast-skip on relaunch. The run is re-verifying downloads then heading to caching.
 
-**Remaining steps**: [4/7] stimulus sync (skips, images present) → [5/7] rebuild RAE bank → [6/7] cache ZUNA latents into ONE merged cohort dir → [7/7] QFormer grid (real/shuffled/random × DINO targets, `--num-subjects 9`).
+**Remaining steps**: [1-5] all skip (data present) → [6/7] cache ZUNA latents (B=4, ~11h for 34.9k epochs — the O((B·N)²) mask makes this slow but B=4 is the only size that fits 80GB) → [7/7] QFormer grid (real/shuffled/random × DINO targets, `--num-subjects 9`).
 
 **Monitor / drive the pod** via the `pod-exec` MCP (see §2) — e.g. tail `/workspace/cohort9.log`, check `outputs/qformer_cohort9_grid/`.
 
@@ -358,6 +359,9 @@ Grid: add `--recon-luma-weight 0.5` to `run_qformer_grid.py` (forwarded to every
 ### Operational lessons from the 9-subject run (2026-07-03)
 
 - **Crop-window bug**: the multi-subject pipeline initially cropped tight `-0.2/+1.0` (~308-sample) epochs (copied from the deprecated semantic path). `cache_zuna_latents.py` → `ZunaLatentExtractor` asserts 1280 timepoints and crashed with *"Expected 1280 timepoints, got 308"*. Fix: `--full5s-backaligned`. Lesson: the ZUNA latent path and the old semantic-classifier path use **different** crop windows; don't copy invocations between them.
+- **ZUNA caching OOM (the real [6/7] crash, 2026-07-04)**: `cache_zuna_latents.py` at the default `--batch-size 32` OOM'd trying to allocate **187 GiB**. Root cause: `ZunaLatentExtractor.forward` packs the *entire batch* into one flex-attention "document" (`encoder_input` = `[1, B*orig_seqlen, tf]`), and ZUNA's `create_document_mask` calls `create_block_mask(..., lengths.sum(), lengths.sum())` — a dense **`(B·orig_seqlen)²`** mask. With `orig_seqlen = 62 ch × 40 tc = 2480`, cost is **O(B²)**: B=32 → 187 GiB, B=16/8 → ~47 GiB (still OOM, only ~30 GiB free after the model loads), **B=4 → fits** (~13.5 s / 12 trials). Fix: default `--batch-size` lowered to **4** in `cache_zuna_latents.py`, and `prepare_multisubject_data.sh` passes `ZUNA_CACHE_BATCH` (default 4). **Do not raise above 4 on an 80GB A100.** Trade-off: B=4 makes the full 34.9k-epoch cache slow (~11 h) but it's the only size that fits. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+- **Pod disk is NOT a network volume**: `0w6hgf17v0xs46`'s `/workspace` is a **pod-local persistent disk** (`get-pod` → `mounts.persistent`), not a detachable network volume. It can't be moved to another pod, and the runpod MCP can't attach network volumes anyway (web UI only). So the "cheap small pod for data-prep + big pod for GPU" swap is **not currently possible** — it needs a real network volume created in the web UI in EU-RO-1 first. Also: **container disk (deps/venv) is wiped on stop/start** while the volume data survives, so after every restart you must reinstall the non-torch deps (§4); torch usually stays 2.8.0+cu128 (image-provided) but re-check.
+- **SSH port changes on every stop/start**: after `start-pod`, `get-pod --includeMachine` gives a new `runtime.ports` public port for `22/tcp`. Update `pod-exec` `pod.json` (via the `pod_config` tool) before running commands, or SSH is refused with the stale port.
 - **Dataset reality (NOD ds005811)**: 30 subjects total, but only **sub-01..sub-09 have 32 runs** (4 sessions × 8); sub-10+ have 16. There are **no 40-run subjects** — historical `_runs01_40` names are misnomers. Verify coverage before assuming a cohort size.
 - **Data is small**: ~605 MB raw per subject (run FIF ~11 MB, subject epoch FIF ~215 MB). 9 subjects raw ≈ 6 GB. The RAE bank (~14 GB) dominates disk. 200 GB volume is ample; don't over-request (large volumes fail on host availability).
 - **Multi-subject correctness fixes** (this run):
