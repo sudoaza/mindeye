@@ -26,6 +26,9 @@ RUNS_SEQ="${RUNS_SEQ:-$(seq 1 32)}"            # cropper expects space-separated
 RUN_TAG="${RUN_TAG:-runs01_32}"
 DIFFUSION_STEPS="${DIFFUSION_STEPS:-15}"
 DEVICE="${DEVICE:-cuda}"
+# ZUNA packs a whole batch into one flex-attention document -> dense (B*2480)^2 mask,
+# so caching cost is O(B^2). B=4 fits an 80GB A100; B=32 OOMs (187GiB). Keep small.
+ZUNA_CACHE_BATCH="${ZUNA_CACHE_BATCH:-4}"
 RAE_BANK="${RAE_BANK:-data/processed/rae_embeddings/rae_dinov2_base_all.pt}"
 MERGED_LATENTS="${MERGED_LATENTS:-data/processed/zuna_latents/cohort9_${RUN_TAG}}"
 OUT_DIR="${OUT_DIR:-outputs/qformer_cohort9_grid}"
@@ -83,6 +86,7 @@ echo "=== [6/7] Caching ZUNA latents into ONE merged cohort dir ==="
 python scripts/cache_zuna_latents.py \
   --epochs-dir "${EPOCHS_DIRS[@]}" \
   --output-dir "$MERGED_LATENTS" \
+  --batch-size "$ZUNA_CACHE_BATCH" \
   --layers post_mmd --device "$DEVICE"
 
 echo "=== [7/7] QFormer grid over the combined cohort (real/shuffled/random) ==="
