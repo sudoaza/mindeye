@@ -1,7 +1,7 @@
 # MindEye Handover Document
 
 > **Current Phase**: QFormer Bridge — ZUNA → QFormer → RAE retrieval grid
-> **Updated**: 2026-07-03
+> **Updated**: 2026-07-04 (16:20 UTC-3)
 > **Active run**: 9-subject full-cohort grid on RunPod pod `0w6hgf17v0xs46` (A100 80GB) — see §0.
 
 This document summarises the current project state, remote environment, and step-by-step instructions to resume work. Keep this file updated when major milestones are reached.
@@ -12,7 +12,7 @@ This document summarises the current project state, remote environment, and step
 
 **Goal of this run**: past experience is that positive results only emerge at scale, so we are training a **single combined-cohort QFormer** over **9 subjects × 32 runs** (not per-subject models). Cohort is `sub-01..sub-09` — these are the only NOD ds005811 subjects with full 32-run (4 session × 8) coverage; `sub-10+` have just 16 runs, so there are **no 40-run subjects** (the old `_runs01_40` naming was always a misnomer).
 
-**Where**: RunPod Secure Cloud pod **`0w6hgf17v0xs46`**, A100 80GB PCIe, EU-RO-1, 200GB **pod-local** disk at `/workspace` (⚠️ NOT a detachable network volume — see §2; data is tied to this pod, so a "small pod for data / big pod for GPU" swap is not possible without first migrating to a real network volume). torch 2.8.0+cu128. Repo at `/workspace/mindeye`, HEAD should be the latest `master`. SSH endpoint changes on every stop/start — current: `213.173.105.4:30108` (update `pod-exec` `pod.json` after each restart).
+**Where**: RunPod Secure Cloud pod **`0w6hgf17v0xs46`**, A100 80GB PCIe, EU-RO-1, 200GB **pod-local** disk at `/workspace` (⚠️ NOT a detachable network volume — see §2; data is tied to this pod, so a "small pod for data / big pod for GPU" swap is not possible without first migrating to a real network volume). torch 2.8.0+cu128. Repo at `/workspace/mindeye` (⚠️ currently on OLD HEAD `0fa2287` — see the git-sync warning below; the working branch is `cursor/fix-qformer-pipeline-review-findings`). SSH endpoint changes on every stop/start — current: `213.173.105.4:30108` (update `pod-exec` `pod.json` after each restart).
 
 **How it was launched** (backgrounded, survives disconnects). NOTE `ZUNA_CACHE_BATCH=4` — the caching step OOMs at the default and even at B=8 (see §8):
 ```bash
@@ -22,9 +22,15 @@ nohup env SKIP_ENV=1 HF_HOME=$HF_HOME ZUNA_CACHE_BATCH=4 PYTORCH_CUDA_ALLOC_CONF
   bash scripts/prepare_multisubject_data.sh > /workspace/cohort9.log 2>&1 &
 ```
 
-**Progress at last update** (2026-07-04, checked live): the earlier run **died** — the pod was stopped (out of credit) AND step **[6/7] `cache_zuna_latents` OOM'd** (187 GiB flex-attention mask, see §8). Pod restarted, container was fresh so deps were reinstalled (torch stayed 2.8.0+cu128, no re-pin needed), the batch-size bug was fixed (B=4), and the pipeline was **relaunched** (PID 1589). **All 9 subjects are cropped** (sub-01..09, ~34,900 epochs total), 288 ZUNA runs, 14GB RAE bank, and stimuli all persist on the disk and fast-skip on relaunch. The run is re-verifying downloads then heading to caching.
+**Progress at last update** (2026-07-04 16:20, checked live): step **[6/7] `cache_zuna_latents` is running** (PID 1589 → child PID 3904), batch-size 4, GPU 42 GB / 80 GB at 100% util — the OOM fix is holding. Progress **~101/288 runs (~35%)** at ~122 s/run, **ETA ~6h** to finish caching, then step [7/7] grid launches automatically. Steps [1–5] all completed this run (download re-verify, ZUNA skip, all 9 subjects cropped ≈ 34,900 epochs, stimulus sync, and a fresh 14 GB RAE bank rebuild). Everything persists on the pod disk.
 
-**Remaining steps**: [1-5] all skip (data present) → [6/7] cache ZUNA latents (B=4, ~11h for 34.9k epochs — the O((B·N)²) mask makes this slow but B=4 is the only size that fits 80GB) → [7/7] QFormer grid (real/shuffled/random × DINO targets, `--num-subjects 9`).
+> ⚠️ **The caching output is written only at the very end.** `cache_zuna_latents.py` accumulates all records in memory and saves `latents_post_mmd.pt` / `metadata.pt` in one shot after all 288 runs finish — so `data/processed/zuna_latents/cohort9_runs01_32/` stays **empty until ~100% complete**. A pod stop/crash before then loses the whole ~9h of caching. If credit is tight, this is the window to watch.
+
+> 🚨 **CRITICAL — the pod is running OLD code + a runtime patch.** The pod's git HEAD is `0fa2287`; it does **NOT** contain the new branch commits (`2dffef2` QFormer review fixes, `db60224` luminance path, `2c0d371`/`f2c676a` OOM fix + this handover). The running caching step was **manually patched** to batch-size 4 at runtime (not from git). **Before step [7/7] runs the grid — and before trusting any grid result — you MUST sync the pod to the branch**, or the grid will run without the correctness fixes (full-bank retrieval, cropper onset-join hard-fail, FiLM subject remap, montage hard-fail). The safe move: let caching finish, then **kill the pipeline before [7/7]**, `git fetch && git reset --hard origin/cursor/fix-qformer-pipeline-review-findings` (data/outputs are untracked and survive), and relaunch **only** the grid step (§5) by hand. Do NOT re-run the whole `prepare_multisubject_data.sh` after syncing unless you want to recrop.
+
+**Remaining steps**: [6/7] finish caching (~6h) → **sync pod to branch (see 🚨 above)** → [7/7] QFormer grid (real/shuffled/random × DINO targets, `--num-subjects 9`).
+
+**Latest branch state** (all pushed to `origin/cursor/fix-qformer-pipeline-review-findings`): three bodies of work landed since the run started — (1) QFormer pipeline **correctness fixes** from an architecture review (`docs/QFORMER_PIPELINE_REVIEW.md`: full-bank retrieval, cropper onset↔metadata time-join with hard-fail, contiguous FiLM subject indices, image-overlap guard, montage hard-fail), (2) the opt-in **luminance-grounding reconstruction path** (§6b, disabled by default), and (3) the **ZUNA caching OOM fix** (§8). None of these are validated on the pod yet.
 
 **Monitor / drive the pod** via the `pod-exec` MCP (see §2) — e.g. tail `/workspace/cohort9.log`, check `outputs/qformer_cohort9_grid/`.
 
