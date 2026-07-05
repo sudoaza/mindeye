@@ -60,7 +60,21 @@ def align_and_compute_deltas(real_data, control_data):
 
     diff_mrr = (merged["mrr_real"] - merged["mrr_ctrl"]).values
     diff_top10 = (merged["top10_real"] - merged["top10_ctrl"]).values
-    return diff_mrr, diff_top10, scope
+    # Paired rank delta: positive means the real model ranks the true image BETTER
+    # (lower rank) than the control. This is the metric that surfaces a diffuse
+    # median-rank win that the MRR/Top10 gate (dominated by the very top ranks)
+    # cannot see for an EEG signal that shifts the whole distribution left.
+    diff_rank = (merged["rank_ctrl"] - merged["rank_real"]).values
+    median_rank_real = float(np.median(merged["rank_real"].values)) + 1.0
+    median_rank_ctrl = float(np.median(merged["rank_ctrl"].values)) + 1.0
+    return {
+        "diff_mrr": diff_mrr,
+        "diff_top10": diff_top10,
+        "diff_rank": diff_rank,
+        "median_rank_real": median_rank_real,
+        "median_rank_ctrl": median_rank_ctrl,
+        "scope": scope,
+    }
 
 def main():
     parser = argparse.ArgumentParser(description="Run minimal QFormer training grid with bootstrap evaluation.")
@@ -79,6 +93,9 @@ def main():
     # Smoke-test mode: RAE-only (DINO-Unit-768), 8 runs, fixed splits, fast epochs
     parser.add_argument("--smoke-test", action="store_true", default=False,
                         help="Smoke test: RAE DINO-Unit-768 only, 8 runs (1-6 train, 7-8 val), 25 epochs, batch 32")
+    parser.add_argument("--target-spaces", type=str, default=None,
+                        help="Comma-separated target spaces to run (e.g. 'DINO-Unit-768,DINO-CLS-768'). "
+                             "Overrides the default 3-target list; each is loaded from --rae-pt.")
     # Temporal windowing
     parser.add_argument("--temporal-window", action="store_true", default=True,
                         help="Enable temporal windowing in train script (default: on)")
@@ -115,11 +132,16 @@ def main():
         train_runs = args.train_runs
         val_runs   = args.val_runs
         test_runs  = args.test_runs
-        targets = [
-            ("DINO-Unit-768", "DINO-Unit-768", args.rae_pt),
-            ("DINO-PCA-256-Unit", "DINO-PCA-256-Unit", args.rae_pt),
-            ("DINO-PCA-128-Unit", "DINO-PCA-128-Unit", args.rae_pt)
-        ]
+        if args.target_spaces:
+            names = [s.strip() for s in args.target_spaces.split(",") if s.strip()]
+            targets = [(n, n, args.rae_pt) for n in names]
+            print(f"[targets] using custom target spaces: {names}")
+        else:
+            targets = [
+                ("DINO-Unit-768", "DINO-Unit-768", args.rae_pt),
+                ("DINO-PCA-256-Unit", "DINO-PCA-256-Unit", args.rae_pt),
+                ("DINO-PCA-128-Unit", "DINO-PCA-128-Unit", args.rae_pt)
+            ]
 
     # 12-run minimal grid configuration
     layers = ["post_mmd"]
@@ -200,6 +222,13 @@ def main():
                     print(f" Preparing: Layer={layer} | Target={target_name} | Mode={mode}")
                     print(f"==================================================")
 
+                    # Control runs (shuffled/random) only establish the chance
+                    # baseline and plateau within a few epochs, so cap them at <=8
+                    # epochs to avoid wasting compute. Real runs the full schedule.
+                    mode_epochs = epochs if mode == "real" else min(epochs, 8)
+                    if mode_epochs != epochs:
+                        print(f"[epochs] {mode} control capped at {mode_epochs} epochs (real uses {epochs})")
+
                     cmd = [
                         sys.executable,
                         "scripts/train_zuna_to_vision.py",
@@ -208,7 +237,7 @@ def main():
                         "--target-space", target_space,
                         "--target-mode", mode,
                         "--layer-name", layer,
-                        "--epochs", str(epochs),
+                        "--epochs", str(mode_epochs),
                         "--patience", str(args.patience),
                         "--batch-size", str(batch_size),
                         "--lr", str(args.lr),
@@ -303,14 +332,19 @@ def main():
             if control_key not in runs_paths:
                 return {"present": False, "reason": f"{control_name} run missing"}
             control_data = torch.load(runs_paths[control_key] / "val_eval_preds.pt", map_location="cpu")
-            diff_mrr, diff_t10, scope = align_and_compute_deltas(real_data, control_data)
-            mrr_delta, mrr_ci, mrr_sig = compute_paired_bootstrap(diff_mrr, 0.0)
-            t10_delta, t10_ci, t10_sig = compute_paired_bootstrap(diff_t10, 0.0)
+            deltas = align_and_compute_deltas(real_data, control_data)
+            mrr_delta, mrr_ci, mrr_sig = compute_paired_bootstrap(deltas["diff_mrr"], 0.0)
+            t10_delta, t10_ci, t10_sig = compute_paired_bootstrap(deltas["diff_top10"], 0.0)
+            rank_delta, rank_ci, rank_sig = compute_paired_bootstrap(deltas["diff_rank"], 0.0)
             return {
                 "present": True,
-                "scope": scope,
+                "scope": deltas["scope"],
                 "mrr_delta": mrr_delta, "mrr_ci": mrr_ci, "mrr_sig": mrr_sig,
                 "t10_delta": t10_delta, "t10_ci": t10_ci, "t10_sig": t10_sig,
+                # Rank delta (positive = real ranks the true image better than control).
+                "rank_delta": rank_delta, "rank_ci": rank_ci, "rank_sig": rank_sig,
+                "median_rank_real": deltas["median_rank_real"],
+                "median_rank_ctrl": deltas["median_rank_ctrl"],
             }
 
         shuf = _compare_control(shuf_key, "shuffled")
@@ -383,8 +417,19 @@ def main():
             if not cond_collapse:
                 gate_reasons.append(f"Collapse percentage too high (value={real_metrics['CollapsePct']:.1f}%)")
 
+            # 7. Paired rank-delta CI excludes 0 for both controls: the real model
+            # ranks the true image strictly better than each control. This catches a
+            # diffuse median-rank win invisible to the MRR/Top10 conditions above.
+            cond_rank = (shuf["rank_ci"][0] > 0.0) and (rand["rank_ci"][0] > 0.0)
+            if not cond_rank:
+                gate_reasons.append(
+                    f"Paired rank-delta CI includes 0 "
+                    f"(shuffled=[{shuf['rank_ci'][0]:+.1f}, {shuf['rank_ci'][1]:+.1f}], "
+                    f"random=[{rand['rank_ci'][0]:+.1f}, {rand['rank_ci'][1]:+.1f}])"
+                )
+
             gate_passed = (cond_mrr_delta and cond_ci and cond_t10_delta
-                           and cond_better and cond_ratio and cond_collapse)
+                           and cond_better and cond_ratio and cond_collapse and cond_rank)
 
         def _fmt_delta(c, key):
             return f"{c[key]:+.4f}" if c.get("present") else "N/A"
@@ -396,9 +441,26 @@ def main():
             return f"{c[key]:.1%}" if c.get("present") else "N/A"
 
         scope_tag = shuf.get("scope") if shuf.get("present") else (rand.get("scope") if rand.get("present") else "n/a")
+
+        def _fmt_rank(c, key):
+            return f"{c[key]:.0f}" if c.get("present") else "N/A"
+
+        # Real median rank is identical across controls (same real run); take it from
+        # whichever control is present for reporting.
+        real_median_rank = (
+            shuf.get("median_rank_real") if shuf.get("present")
+            else (rand.get("median_rank_real") if rand.get("present") else None)
+        )
         bootstrap_results.append({
             "Target": target_name,
             "Rank Scope": scope_tag,
+            "Real MedianRank": f"{real_median_rank:.0f}" if real_median_rank is not None else "N/A",
+            "Shuf MedianRank": _fmt_rank(shuf, "median_rank_ctrl"),
+            "Rand MedianRank": _fmt_rank(rand, "median_rank_ctrl"),
+            "Shuf RankΔ": _fmt_delta(shuf, "rank_delta"),
+            "Shuf RankΔ 95% CI": _fmt_ci(shuf, "rank_ci"),
+            "Rand RankΔ": _fmt_delta(rand, "rank_delta"),
+            "Rand RankΔ 95% CI": _fmt_ci(rand, "rank_ci"),
             "Shuf MRR Δ": _fmt_delta(shuf, "mrr_delta"),
             "Shuf MRR 95% CI": _fmt_ci(shuf, "mrr_ci"),
             "Shuf Sign Rate": _fmt_sig(shuf, "mrr_sig"),
@@ -434,6 +496,7 @@ Experiment Root: `{grid_dir}`
 - **Paired Δ MRR**: > +0.005 for both controls (numeric CI, no string parsing)
 - **Confidence Interval**: lower bound > 0 for both controls
 - **Paired Δ Top10**: > 0 for both controls
+- **Paired rank-delta**: 95% CI lower bound > 0 for both controls (real ranks true image better; catches a diffuse median-rank win invisible to MRR/Top10)
 - **Comparisons**: Real > Shuffled and Random on MRR and Top10
 - **StdRatio**: Between 0.3 and 2.0
 - **Dimension Collapse**: < 20% collapse percentage

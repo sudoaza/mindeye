@@ -133,6 +133,8 @@ class ZunaLatentTargetDataset(Dataset):
         if "PCA" in target_space:
             self.pca_dims = int(target_space.split("-")[2])
             target_space_key = "rae_unit"
+        elif target_space in ("DINO-CLS-768", "DINO-CLS"):
+            target_space_key = "dino_cls"
         elif target_space in ("DINO-Unit-768", "DINO-Unit"):
             target_space_key = "rae_unit"
         elif target_space in ("CLIP-Common-512", "CLIP-Common"):
@@ -601,6 +603,8 @@ def main():
     if is_pca:
         pca_dims = int(args.target_space.split("-")[2])
         target_space_key = "rae_unit"
+    elif args.target_space in ("DINO-CLS-768", "DINO-CLS"):
+        target_space_key = "dino_cls"
     elif args.target_space in ("DINO-Unit-768", "DINO-Unit"):
         target_space_key = "rae_unit"
     elif args.target_space in ("CLIP-Common-512", "CLIP-Common"):
@@ -838,6 +842,16 @@ def main():
         collapse_pct = val_metrics["collapse_pct"]
         val_mrr_full = val_metrics.get("val_mrr_full", float("nan"))
         val_top10_full = val_metrics.get("val_top10_full", float("nan"))
+
+        # Model selection uses the honest full-bank MRR — the metric the gate/docs
+        # mandate. The full retrieval bank is always built above, so val_mrr_full is
+        # always present; if it ever isn't, warn loudly and name the path taken
+        # instead of silently selecting on the inflated within-val metric.
+        if "val_mrr_full" in val_metrics:
+            select_metric = val_metrics["val_mrr_full"]
+        else:
+            print("[warn] selection metric val_mrr_full absent — selecting on val_mrr_norm")
+            select_metric = val_mrr
         
         print(f"Epoch {epoch:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | "
               f"Val Cosine (Norm): {val_cosine:.4f} | Val MRR (Norm): {val_mrr:.4f} | "
@@ -852,10 +866,10 @@ def main():
         }
         history.append(history_row)
         
-        # Save checkpoint if MRR improves
-        is_best = val_mrr > best_mrr
+        # Save checkpoint if the selection metric (full-bank MRR) improves
+        is_best = select_metric > best_mrr
         if is_best:
-            best_mrr = val_mrr
+            best_mrr = select_metric
             patience_counter = 0
             checkpoint_path = run_dir / "checkpoint_best.pt"
             torch.save({
@@ -863,6 +877,8 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_mrr": val_mrr,
+                "val_mrr_full": val_mrr_full,
+                "select_metric": select_metric,
                 "config": config_dict
             }, checkpoint_path)
         else:
@@ -878,11 +894,16 @@ def main():
     df_history = pd.DataFrame(history)
     df_history.to_csv(run_dir / "history.csv", index=False)
     
-    # Save final metrics summary
+    # Save final metrics summary. The "best" row must reflect the checkpoint we
+    # actually saved, which is selected on the full-bank MRR (val_mrr_full).
     final_metrics = history[-1]
-    best_epoch_idx = df_history["val_mrr_norm"].idxmax()
+    if "val_mrr_full" in df_history.columns and df_history["val_mrr_full"].notna().any():
+        best_epoch_idx = df_history["val_mrr_full"].idxmax()
+    else:
+        print("[warn] selection metric val_mrr_full absent — picking best row on val_mrr_norm")
+        best_epoch_idx = df_history["val_mrr_norm"].idxmax()
     best_metrics = history[best_epoch_idx]
-    
+
     summary = {
         "final": final_metrics,
         "best": best_metrics
@@ -890,7 +911,7 @@ def main():
     with open(run_dir / "metrics.json", "w") as f:
         json.dump(summary, f, indent=2)
         
-    print(f"\n✓ Training complete! Best Validation MRR (Norm): {best_mrr:.4f} at epoch {best_metrics['epoch']}.")
+    print(f"\n✓ Training complete! Best Validation MRR (Full-bank): {best_mrr:.4f} at epoch {best_metrics['epoch']}.")
 
     # Bug 1 fix: reload best checkpoint before saving eval predictions
     best_ckpt = torch.load(run_dir / "checkpoint_best.pt", map_location=device)
