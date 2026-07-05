@@ -94,6 +94,10 @@ def main():
                         help="Weight of stimulus-vs-generated luminance-grid loss (0 = pure retrieval, unchanged behaviour)")
     parser.add_argument("--stimuli-dir", type=str, default="data/raw/nod/stimuli/ImageNet",
                         help="Stimulus image dir for the luminance loss (used only when --recon-luma-weight > 0)")
+    # Recover a completed-but-crashed grid: skip all training and rebuild the
+    # summary + paired-bootstrap gate from an existing grid dir's run outputs.
+    parser.add_argument("--analyze-only", type=str, default=None,
+                        help="Path to an existing grid_<ts> dir; skip training and (re)run analysis over its run dirs.")
     args = parser.parse_args()
     
     # --- Smoke-test overrides ---
@@ -121,131 +125,158 @@ def main():
     layers = ["post_mmd"]
     modes = ["real", "shuffled", "random"]
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    grid_dir = Path(args.out_dir) / f"grid_{timestamp}"
-    grid_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Starting stabilized QFormer minimal grid training...")
-    print(f"Grid Output Root: {grid_dir}\n")
-    
-    # Check if input latents exist
-    if not os.path.exists(args.latents_pt):
-        print(f"Error: Latents path {args.latents_pt} not found. Please wait for caching to complete.")
-        sys.exit(1)
-        
     runs_paths = {}
     runs_metrics = []
-    
-    for layer in layers:
-        for target_name, target_space, target_path in targets:
-            processes = []
-            for mode in modes:
-                if not os.path.exists(target_path):
-                    print(f"Warning: Target path {target_path} not found. Skipping {target_name} ({mode}).")
-                    continue
-                    
-                slug = f"grid_{layer}_{target_name}_{mode}"
-                print(f"\n==================================================")
-                print(f" Preparing: Layer={layer} | Target={target_name} | Mode={mode}")
-                print(f"==================================================")
-                
-                cmd = [
-                    sys.executable,
-                    "scripts/train_zuna_to_vision.py",
-                    "--latents-pt", args.latents_pt,
-                    "--targets-pt", target_path,
-                    "--target-space", target_space,
-                    "--target-mode", mode,
-                    "--layer-name", layer,
-                    "--epochs", str(epochs),
-                    "--patience", str(args.patience),
-                    "--batch-size", str(batch_size),
-                    "--lr", str(args.lr),
-                    "--device", args.device,
-                    "--out-dir", str(grid_dir),
-                    "--slug", slug,
-                    "--num-subjects", str(args.num_subjects),
-                ]
-                if args.recon_luma_weight > 0.0:
-                    cmd += [
-                        "--recon-luma-weight", str(args.recon_luma_weight),
-                        "--stimuli-dir", args.stimuli_dir,
+
+    def _load_run_metrics(target_name, mode, run_dir):
+        """Populate runs_metrics from a completed run dir's metrics.json (DRY: same
+        shape as the training-loop path below)."""
+        metrics_path = run_dir / "metrics.json"
+        if not metrics_path.exists():
+            print(f"Warning: {metrics_path} missing; skipping {target_name} ({mode}).")
+            return
+        with open(metrics_path, "r") as f:
+            metrics_data = json.load(f)
+        best_m = metrics_data["best"]
+        runs_metrics.append({
+            "Target": target_name,
+            "Mode": mode,
+            "MRR_Norm": best_m.get("val_mrr_norm", 0.0),
+            "Top1_Norm": best_m.get("val_top1_norm", 0.0),
+            "Top10_Norm": best_m.get("val_top10_norm", 0.0),
+            "MRR_Full": best_m.get("val_mrr_full"),
+            "Top10_Full": best_m.get("val_top10_full"),
+            "BankSize": best_m.get("bank_size"),
+            "Cosine_Norm": best_m.get("val_cosine_norm", 0.0),
+            "StdRatio": best_m.get("val_pred_std_ratio", 0.0),
+            "NormMean": best_m.get("val_pred_norm_mean", 0.0),
+            "NormStd": best_m.get("val_pred_norm_std", 0.0),
+            "CollapsePct": best_m.get("collapse_pct", 0.0),
+            "BestEpoch": best_m.get("epoch", 0),
+        })
+
+    if args.analyze_only:
+        # Recovery path: rebuild runs_paths/runs_metrics from an existing grid dir,
+        # then fall through to the shared bootstrap-analysis + reporting block.
+        grid_dir = Path(args.analyze_only)
+        if not grid_dir.is_dir():
+            print(f"Error: --analyze-only dir {grid_dir} not found.")
+            sys.exit(1)
+        print(f"=== ANALYZE-ONLY: rebuilding gate from existing runs in {grid_dir} ===")
+        for layer in layers:
+            for target_name, _, _ in targets:
+                for mode in modes:
+                    slug = f"grid_{layer}_{target_name}_{mode}"
+                    run_dirs = [d for d in grid_dir.glob(f"*{slug}*") if d.is_dir()]
+                    if not run_dirs:
+                        print(f"Warning: no run dir for {slug}.")
+                        continue
+                    newest_run = max(run_dirs, key=lambda d: d.stat().st_mtime)
+                    runs_paths[(target_name, mode)] = newest_run
+                    _load_run_metrics(target_name, mode, newest_run)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        grid_dir = Path(args.out_dir) / f"grid_{timestamp}"
+        grid_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Starting stabilized QFormer minimal grid training...")
+        print(f"Grid Output Root: {grid_dir}\n")
+
+        # Check if input latents exist
+        if not os.path.exists(args.latents_pt):
+            print(f"Error: Latents path {args.latents_pt} not found. Please wait for caching to complete.")
+            sys.exit(1)
+
+        for layer in layers:
+            for target_name, target_space, target_path in targets:
+                processes = []
+                for mode in modes:
+                    if not os.path.exists(target_path):
+                        print(f"Warning: Target path {target_path} not found. Skipping {target_name} ({mode}).")
+                        continue
+
+                    slug = f"grid_{layer}_{target_name}_{mode}"
+                    print(f"\n==================================================")
+                    print(f" Preparing: Layer={layer} | Target={target_name} | Mode={mode}")
+                    print(f"==================================================")
+
+                    cmd = [
+                        sys.executable,
+                        "scripts/train_zuna_to_vision.py",
+                        "--latents-pt", args.latents_pt,
+                        "--targets-pt", target_path,
+                        "--target-space", target_space,
+                        "--target-mode", mode,
+                        "--layer-name", layer,
+                        "--epochs", str(epochs),
+                        "--patience", str(args.patience),
+                        "--batch-size", str(batch_size),
+                        "--lr", str(args.lr),
+                        "--device", args.device,
+                        "--out-dir", str(grid_dir),
+                        "--slug", slug,
+                        "--num-subjects", str(args.num_subjects),
                     ]
-                # Pass temporal window flag
-                if args.temporal_window:
-                    cmd += [
-                        "--temporal-window",
-                        "--latent-tc-start", str(args.latent_tc_start),
-                        "--latent-tc-end", str(args.latent_tc_end),
-                    ]
-                else:
-                    cmd.append("--no-temporal-window")
-                # Pass run splits if specified
-                if train_runs:
-                    cmd += ["--train-runs", train_runs]
-                if val_runs:
-                    cmd += ["--val-runs", val_runs]
-                if test_runs:
-                    cmd += ["--test-runs", test_runs]
-                
-                env = {**os.environ, "PYTHONPATH": "src"}
-                
-                print(f"Launching subprocess: Layer={layer} | Target={target_name} | Mode={mode}")
-                # Finding L1: stream child output to a log file rather than a PIPE, so a
-                # child that fills the 64KB stdout pipe buffer can't deadlock before we
-                # call communicate() on the others.
-                log_path = grid_dir / f"{slug}.log"
-                log_fh = open(log_path, "w")
-                process = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT, text=True)
-                processes.append((mode, slug, process, log_fh, log_path))
-                
-            # Wait for all modes in this target group to complete
-            for mode, slug, process, log_fh, log_path in processes:
-                print(f"\nWaiting for {target_name} ({mode}) to finish...")
-                process.wait()
-                log_fh.close()
-                try:
-                    stdout = log_path.read_text()
-                except OSError:
-                    stdout = ""
-                print(f"=== Subprocess Output for {target_name} ({mode}) (log: {log_path}) ===")
-                print(stdout)
-                
-                if process.returncode != 0:
-                    print(f"❌ {target_name} ({mode}) failed with code {process.returncode}")
-                    continue
-                    
-                # Find output directory
-                run_dirs = list(grid_dir.glob(f"*{slug}*"))
-                if not run_dirs:
-                    print(f"Warning: Could not find output directory for {slug}")
-                    continue
-                newest_run = max(run_dirs, key=lambda d: d.stat().st_mtime)
-                
-                runs_paths[(target_name, mode)] = newest_run
-                
-                # Load metrics.json
-                metrics_path = newest_run / "metrics.json"
-                if metrics_path.exists():
-                    with open(metrics_path, "r") as f:
-                        metrics_data = json.load(f)
-                    best_m = metrics_data["best"]
-                    runs_metrics.append({
-                        "Target": target_name,
-                        "Mode": mode,
-                        "MRR_Norm": best_m.get("val_mrr_norm", 0.0),
-                        "Top1_Norm": best_m.get("val_top1_norm", 0.0),
-                        "Top10_Norm": best_m.get("val_top10_norm", 0.0),
-                        "MRR_Full": best_m.get("val_mrr_full"),
-                        "Top10_Full": best_m.get("val_top10_full"),
-                        "BankSize": best_m.get("bank_size"),
-                        "Cosine_Norm": best_m.get("val_cosine_norm", 0.0),
-                        "StdRatio": best_m.get("val_pred_std_ratio", 0.0),
-                        "NormMean": best_m.get("val_pred_norm_mean", 0.0),
-                        "NormStd": best_m.get("val_pred_norm_std", 0.0),
-                        "CollapsePct": best_m.get("collapse_pct", 0.0),
-                        "BestEpoch": best_m.get("epoch", 0)
-                    })
+                    if args.recon_luma_weight > 0.0:
+                        cmd += [
+                            "--recon-luma-weight", str(args.recon_luma_weight),
+                            "--stimuli-dir", args.stimuli_dir,
+                        ]
+                    # Pass temporal window flag
+                    if args.temporal_window:
+                        cmd += [
+                            "--temporal-window",
+                            "--latent-tc-start", str(args.latent_tc_start),
+                            "--latent-tc-end", str(args.latent_tc_end),
+                        ]
+                    else:
+                        cmd.append("--no-temporal-window")
+                    # Pass run splits if specified
+                    if train_runs:
+                        cmd += ["--train-runs", train_runs]
+                    if val_runs:
+                        cmd += ["--val-runs", val_runs]
+                    if test_runs:
+                        cmd += ["--test-runs", test_runs]
+
+                    env = {**os.environ, "PYTHONPATH": "src"}
+
+                    print(f"Launching subprocess: Layer={layer} | Target={target_name} | Mode={mode}")
+                    # Finding L1: stream child output to a log file rather than a PIPE, so a
+                    # child that fills the 64KB stdout pipe buffer can't deadlock before we
+                    # call communicate() on the others.
+                    log_path = grid_dir / f"{slug}.log"
+                    log_fh = open(log_path, "w")
+                    process = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT, text=True)
+                    processes.append((mode, slug, process, log_fh, log_path))
+
+                # Wait for all modes in this target group to complete
+                for mode, slug, process, log_fh, log_path in processes:
+                    print(f"\nWaiting for {target_name} ({mode}) to finish...")
+                    process.wait()
+                    log_fh.close()
+                    try:
+                        stdout = log_path.read_text()
+                    except OSError:
+                        stdout = ""
+                    print(f"=== Subprocess Output for {target_name} ({mode}) (log: {log_path}) ===")
+                    print(stdout)
+
+                    if process.returncode != 0:
+                        print(f"❌ {target_name} ({mode}) failed with code {process.returncode}")
+                        continue
+
+                    # Find output directory. Restrict to directories so the per-mode
+                    # "<slug>.log" file (also matched by the glob) can never win the
+                    # most-recent-mtime selection and get treated as a run dir.
+                    run_dirs = [d for d in grid_dir.glob(f"*{slug}*") if d.is_dir()]
+                    if not run_dirs:
+                        print(f"Warning: Could not find output directory for {slug}")
+                        continue
+                    newest_run = max(run_dirs, key=lambda d: d.stat().st_mtime)
+
+                    runs_paths[(target_name, mode)] = newest_run
+                    _load_run_metrics(target_name, mode, newest_run)
 
     # 2. Paired Bootstrap Analysis
     bootstrap_results = []
