@@ -79,7 +79,7 @@ class ZunaToVisionQFormer(nn.Module):
         *,
         d_in: int = 32,
         d_out: int = 512,
-        hidden_dim: int = 256,
+        hidden_dim: int = 1024,
         nhead: int = 8,
         num_layers: int = 4,
         num_query_tokens: int = 32,

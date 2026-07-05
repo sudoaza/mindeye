@@ -545,7 +545,7 @@ def main():
     # QFormer architecture
     parser.add_argument("--num-query-tokens", type=int, default=32, help="Number of query tokens")
     parser.add_argument("--pooling-mode", choices=("cls", "attention", "mean"), default="cls", help="Query pooling mode")
-    parser.add_argument("--hidden-dim", type=int, default=256, help="QFormer hidden dimension")
+    parser.add_argument("--hidden-dim", type=int, default=1024, help="QFormer hidden dimension")
     parser.add_argument("--nhead", type=int, default=8, help="QFormer attention heads")
     parser.add_argument("--num-layers", type=int, default=4, help="Number of QFormer layers")
     parser.add_argument("--dropout", type=float, default=0.15, help="QFormer dropout")

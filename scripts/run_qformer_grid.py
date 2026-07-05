@@ -103,6 +103,7 @@ def main():
     parser.add_argument("--latent-tc-start", type=int, default=20, help="Latent time slice start index")
     parser.add_argument("--latent-tc-end", type=int, default=36, help="Latent time slice end index (exclusive)")
     parser.add_argument("--num-subjects", type=int, default=1, help="Number of subjects in the cohort (enables subject FiLM in the QFormer when > 1)")
+    parser.add_argument("--hidden-dim", type=int, default=1024, help="QFormer hidden dimension (trunk width) forwarded to the train script")
     # Reconstruction / luminance grounding (opt-in). When > 0, each run additionally
     # predicts an RAE token grid, decodes it through the frozen RAE, and adds a
     # stimulus-vs-generated luminance-grid loss. Overrides HANDOVER non-negotiable #3
@@ -245,6 +246,7 @@ def main():
                         "--out-dir", str(grid_dir),
                         "--slug", slug,
                         "--num-subjects", str(args.num_subjects),
+                        "--hidden-dim", str(args.hidden_dim),
                     ]
                     if args.recon_luma_weight > 0.0:
                         cmd += [
