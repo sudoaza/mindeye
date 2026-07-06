@@ -44,6 +44,52 @@ def variance_floor_loss(pred: torch.Tensor, target_std: torch.Tensor) -> torch.T
     return torch.mean(F.relu(target_std - pred_std))
 
 
+class NegativeBank:
+    """FIFO queue of detached, L2-normalized target embeddings + their int image
+    ids, used as extra InfoNCE negatives (MoCo-style).
+
+    Stores negatives without paying the activation-memory cost of a huge batch.
+    Only meaningful when the enqueued targets are the true image embeddings that
+    align with their image ids (i.e. the ``real`` target mode); enable it there.
+    """
+
+    def __init__(self, size: int, dim: int, device):
+        self.size = int(size)
+        self.device = device
+        self._targets = torch.zeros(self.size, dim, device=device)
+        self._ids = torch.full((self.size,), -1, dtype=torch.long, device=device)
+        self._ptr = 0
+        self._count = 0
+
+    def __len__(self) -> int:
+        return self._count
+
+    @torch.no_grad()
+    def enqueue(self, targets: torch.Tensor, image_ids: torch.Tensor) -> None:
+        targets = targets.to(self.device)
+        image_ids = image_ids.to(self.device)
+        b = targets.shape[0]
+        if b == 0:
+            return
+        if b >= self.size:
+            self._targets.copy_(targets[-self.size:])
+            self._ids.copy_(image_ids[-self.size:])
+            self._ptr = 0
+            self._count = self.size
+            return
+        idx = (self._ptr + torch.arange(b, device=self.device)) % self.size
+        self._targets[idx] = targets
+        self._ids[idx] = image_ids
+        self._ptr = int((self._ptr + b) % self.size)
+        self._count = min(self._count + b, self.size)
+
+    def get(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the currently-filled (targets, image_ids)."""
+        if self._count < self.size:
+            return self._targets[: self._count], self._ids[: self._count]
+        return self._targets, self._ids
+
+
 def crop_zuna_latent(
     latent: torch.Tensor,
     n_channels: int = 62,
@@ -176,6 +222,12 @@ class ZunaLatentTargetDataset(Dataset):
         self.subject_id_to_index = {sid: i for i, sid in enumerate(unique_subject_ids)}
         self.num_subjects = len(unique_subject_ids)
         print(f"Cohort subjects (raw ids): {unique_subject_ids} -> FiLM indices 0..{self.num_subjects - 1}")
+
+        # Stable string image_id -> contiguous int id, used to mask same-image
+        # false negatives in the contrastive loss (NOD repeats stimuli across
+        # subjects/runs). Sorted for determinism across processes.
+        unique_image_ids = sorted({str(r["image_id"]) for r in self.valid_records})
+        self.image_id_to_int = {img_id: i for i, img_id in enumerate(unique_image_ids)}
             
         # Expose dimensions
         self.layer_name = layer_name
@@ -301,6 +353,9 @@ class ZunaLatentTargetDataset(Dataset):
             ),
             "run_id": record["run_id"],
             "image_id": record["image_id"],
+            "image_int_id": torch.tensor(
+                self.image_id_to_int[str(record["image_id"])], dtype=torch.long
+            ),
             "class_id": record["class_id"],
             "sample_id": record["sample_id"],
             # Stimulus image for luminance grounding (mid-gray placeholder when disabled).
@@ -318,7 +373,9 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 def train_epoch(model, loader, optimizer, temperature, target_std, device,
-                rae_backend=None, recon_luma_weight=0.0, recon_grid_px=3):
+                rae_backend=None, recon_luma_weight=0.0, recon_grid_px=3,
+                nce_weight=1.0, cos_weight=0.2, var_weight=0.05,
+                negative_bank=None):
     model.train()
     total_loss = 0
     num_batches = 0
@@ -328,22 +385,39 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
         latents = batch["latent"].to(device)
         targets = batch["target"].to(device)
         subject_ids = batch["subject_id"].to(device)
-        
+        image_int_ids = batch["image_int_id"].to(device)
+
         optimizer.zero_grad()
         if use_recon:
             preds, pred_grid = model(latents, subject_id=subject_ids, return_grid=True)
         else:
             preds = model(latents, subject_id=subject_ids)
-        
+
         # InfoNCE + Cosine + Variance Floor Loss
         pred_u = F.normalize(preds, dim=-1)
         target_u = F.normalize(targets, dim=-1)
-        
-        loss_nce = clip_contrastive_loss(pred_u, target_u, temperature=temperature)
+
+        # Extra negatives from the MoCo-style queue (detached, no grad), plus
+        # same-image false-negative masking within the batch and the queue.
+        queue_targets = None
+        queue_image_ids = None
+        if negative_bank is not None and len(negative_bank) > 0:
+            queue_targets, queue_image_ids = negative_bank.get()
+
+        loss_nce = clip_contrastive_loss(
+            pred_u, target_u, temperature=temperature,
+            image_ids=image_int_ids,
+            queue_targets=queue_targets,
+            queue_image_ids=queue_image_ids,
+        )
         loss_cos = 0.5 * (1.0 - F.cosine_similarity(pred_u, target_u, dim=-1).mean())
         loss_var = variance_floor_loss(preds, target_std.to(device))
-        
-        loss = loss_nce + loss_cos + 0.05 * loss_var
+
+        loss = nce_weight * loss_nce + cos_weight * loss_cos + var_weight * loss_var
+
+        # Enqueue this batch's (detached) real targets for future negatives.
+        if negative_bank is not None:
+            negative_bank.enqueue(target_u.detach(), image_int_ids.detach())
 
         # Luminance grounding: decode the predicted RAE token grid to an image and
         # match its global + 3x3 region luminance to the stimulus image. This is the
@@ -576,8 +650,22 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay")
     parser.add_argument("--patience", type=int, default=8, help="Early stopping patience")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size (larger = more in-batch InfoNCE negatives; A100 has ample headroom)")
     parser.add_argument("--temperature", type=float, default=0.05, help="Contrastive InfoNCE temperature")
+
+    # Loss weighting (fine-tuning knobs). The cosine term pulls each prediction
+    # toward its own target (hubness pressure) and competes with InfoNCE's
+    # separation; its default is lowered from the old hard-coded 1.0 to 0.2 to
+    # soften that pull. Pass --cos-weight 1.0 to recover the previous loss.
+    parser.add_argument("--nce-weight", type=float, default=1.0, help="Weight on the InfoNCE contrastive term")
+    parser.add_argument("--cos-weight", type=float, default=0.2, help="Weight on the per-sample cosine pull (was 1.0)")
+    parser.add_argument("--var-weight", type=float, default=0.05, help="Weight on the variance-floor anti-collapse term")
+
+    # Extra negatives: MoCo-style FIFO queue of detached real target embeddings
+    # appended to the InfoNCE denominator. 0 disables (current behavior). Only
+    # active in the real target mode (queue ids must align with targets).
+    parser.add_argument("--negative-bank-size", type=int, default=0,
+                        help="Size K of the negative queue of past target embeddings (0 = off). Real mode only.")
     
     # Output and execution
     parser.add_argument("--device", type=str, default="cuda", help="Torch device")
@@ -817,7 +905,26 @@ def main():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    
+
+    # Negative queue (MoCo-style extra negatives). Only valid in the real target
+    # mode, where the enqueued target aligns with its image id; in shuffled/random
+    # the training target belongs to a different image, so masking would be wrong.
+    negative_bank = None
+    if args.negative_bank_size > 0:
+        if args.target_mode == "real":
+            negative_bank = NegativeBank(args.negative_bank_size, full_dataset.target_dim, device)
+            print(f"Negative queue enabled: size={args.negative_bank_size}, dim={full_dataset.target_dim}")
+        else:
+            print(
+                f"[warn] --negative-bank-size={args.negative_bank_size} ignored in "
+                f"target_mode={args.target_mode} (queue is real-mode only)."
+            )
+
+    print(
+        f"Loss weights: nce={args.nce_weight} cos={args.cos_weight} var={args.var_weight} "
+        f"| temperature={args.temperature}"
+    )
+
     # Training loop
     best_mrr = -1.0
     history = []
@@ -828,6 +935,8 @@ def main():
             model, train_loader, optimizer, args.temperature, target_std, device,
             rae_backend=rae_backend, recon_luma_weight=args.recon_luma_weight,
             recon_grid_px=args.recon_grid_px,
+            nce_weight=args.nce_weight, cos_weight=args.cos_weight, var_weight=args.var_weight,
+            negative_bank=negative_bank,
         )
         scheduler.step()
         val_metrics = evaluate_model(

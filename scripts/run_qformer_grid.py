@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--rae-pt", type=str, default="data/processed/rae_embeddings/rae_dinov2_base_bank.pt")
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs per run")
     parser.add_argument("--patience", type=int, default=8, help="Early stopping patience")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size (larger = more in-batch InfoNCE negatives)")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device")
     parser.add_argument("--out-dir", type=str, default="outputs/qformer_aligned_grid", help="Parent outputs directory")
@@ -104,6 +104,14 @@ def main():
     parser.add_argument("--latent-tc-end", type=int, default=36, help="Latent time slice end index (exclusive)")
     parser.add_argument("--num-subjects", type=int, default=1, help="Number of subjects in the cohort (enables subject FiLM in the QFormer when > 1)")
     parser.add_argument("--hidden-dim", type=int, default=1024, help="QFormer hidden dimension (trunk width) forwarded to the train script")
+    # Loss weighting + extra negatives, forwarded to every run so the grid is
+    # self-documenting. Defaults match the train script (cos lowered to 0.2).
+    parser.add_argument("--temperature", type=float, default=0.05, help="Contrastive InfoNCE temperature")
+    parser.add_argument("--nce-weight", type=float, default=1.0, help="Weight on the InfoNCE contrastive term")
+    parser.add_argument("--cos-weight", type=float, default=0.2, help="Weight on the per-sample cosine pull (was 1.0)")
+    parser.add_argument("--var-weight", type=float, default=0.05, help="Weight on the variance-floor anti-collapse term")
+    parser.add_argument("--negative-bank-size", type=int, default=0,
+                        help="Size of the MoCo-style negative queue forwarded to each run (0 = off; real mode only)")
     # Reconstruction / luminance grounding (opt-in). When > 0, each run additionally
     # predicts an RAE token grid, decodes it through the frozen RAE, and adds a
     # stimulus-vs-generated luminance-grid loss. Overrides HANDOVER non-negotiable #3
@@ -122,7 +130,7 @@ def main():
     if args.smoke_test:
         print("=== SMOKE TEST MODE: RAE DINO-Unit-768 only, runs 1-6 train / 7-8 val, 25 epochs ===")
         epochs = args.epochs if args.epochs != 40 else 25
-        batch_size = args.batch_size if args.batch_size != 64 else 32
+        batch_size = args.batch_size if args.batch_size != 256 else 32
         train_runs = args.train_runs or "1-6"
         val_runs   = args.val_runs   or "7-8"
         test_runs  = args.test_runs  or ""
@@ -247,6 +255,11 @@ def main():
                         "--slug", slug,
                         "--num-subjects", str(args.num_subjects),
                         "--hidden-dim", str(args.hidden_dim),
+                        "--temperature", str(args.temperature),
+                        "--nce-weight", str(args.nce_weight),
+                        "--cos-weight", str(args.cos_weight),
+                        "--var-weight", str(args.var_weight),
+                        "--negative-bank-size", str(args.negative_bank_size),
                     ]
                     if args.recon_luma_weight > 0.0:
                         cmd += [

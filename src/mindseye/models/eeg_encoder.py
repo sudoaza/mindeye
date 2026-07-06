@@ -237,7 +237,41 @@ def cosine_mse_loss(pred: torch.Tensor, target: torch.Tensor, *, mse_weight: flo
     return cosine + mse_weight * mse
 
 
-def clip_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, *, temperature: float = 0.07) -> torch.Tensor:
+def _same_image_offdiag_mask(
+    row_ids: torch.Tensor, col_ids: torch.Tensor, *, diagonal_is_positive: bool
+) -> torch.Tensor:
+    """Boolean mask of entries that must be treated as false negatives.
+
+    An entry ``[i, j]`` is a false negative when it shares the query's image id
+    but is not the intended positive.  NOD repeats the same stimulus across
+    subjects/runs, so without this mask a duplicate of the query's own image
+    (whether elsewhere in the batch or in the negative queue) would be pushed
+    away as a negative, which actively hurts training.
+
+    Args:
+        row_ids: [N] integer image ids for the rows (queries).
+        col_ids: [M] integer image ids for the columns (candidate targets).
+        diagonal_is_positive: when True (in-batch square logits) the diagonal is
+            the positive pair and is never masked; when False (queue columns)
+            every same-image entry is a false negative to mask.
+    """
+    same = row_ids[:, None] == col_ids[None, :]  # [N, M]
+    if diagonal_is_positive:
+        n = row_ids.shape[0]
+        eye = torch.eye(n, dtype=torch.bool, device=row_ids.device)
+        same = same & ~eye
+    return same
+
+
+def clip_contrastive_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    temperature: float = 0.07,
+    image_ids: torch.Tensor | None = None,
+    queue_targets: torch.Tensor | None = None,
+    queue_image_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Symmetric CLIP-style InfoNCE loss for paired EEG and image embeddings.
 
     Direct cosine/MSE regression can collapse toward a generic CLIP-space hub: all
@@ -245,6 +279,16 @@ def clip_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, *, temperatu
     separate the other images in the batch.  This loss treats the diagonal as the
     positive pairs and all off-diagonal items in the batch as negatives, matching
     the usual CLIP training objective.
+
+    Optional extensions (both default off, preserving the original behavior):
+
+    - ``image_ids``: integer image id per batch item.  When provided, off-diagonal
+      entries that share a query's image id are masked out of the denominator so
+      repeated stimuli are not counted as (false) negatives.
+    - ``queue_targets`` / ``queue_image_ids``: an external bank of detached target
+      embeddings (MoCo-style) appended as extra negatives to the eeg->img
+      direction only (there are no queued predictions for the img->eeg direction).
+      Same-image queue entries are masked when ``image_ids`` is also given.
     """
     if pred.shape != target.shape:
         raise ValueError(f"pred and target must have matching shape, got {pred.shape} and {target.shape}")
@@ -252,9 +296,33 @@ def clip_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, *, temperatu
         raise ValueError("contrastive loss needs at least two items per batch")
     pred = F.normalize(pred, dim=-1)
     target = F.normalize(target, dim=-1)
-    logits = pred @ target.T / temperature
-    labels = torch.arange(pred.shape[0], device=pred.device)
-    eeg_to_img = F.cross_entropy(logits, labels)
+
+    n = pred.shape[0]
+    labels = torch.arange(n, device=pred.device)
+
+    # In-batch square logits (shared by both directions).
+    logits = pred @ target.T / temperature  # [N, N]
+
+    if image_ids is not None:
+        batch_fn_mask = _same_image_offdiag_mask(image_ids, image_ids, diagonal_is_positive=True)
+        # Symmetric: false negatives in eeg->img (rows) are also false negatives
+        # in img->eeg (its transpose), so mask both consistently.
+        logits = logits.masked_fill(batch_fn_mask, float("-inf"))
+
+    # eeg->img direction: optionally extend the denominator with the queue.
+    if queue_targets is not None and queue_targets.shape[0] > 0:
+        queue_targets = F.normalize(queue_targets.to(pred.dtype), dim=-1)
+        queue_logits = pred @ queue_targets.T / temperature  # [N, K]
+        if image_ids is not None and queue_image_ids is not None:
+            queue_fn_mask = _same_image_offdiag_mask(
+                image_ids, queue_image_ids.to(image_ids.device), diagonal_is_positive=False
+            )
+            queue_logits = queue_logits.masked_fill(queue_fn_mask, float("-inf"))
+        eeg_logits = torch.cat([logits, queue_logits], dim=1)  # [N, N+K]
+    else:
+        eeg_logits = logits
+
+    eeg_to_img = F.cross_entropy(eeg_logits, labels)
     img_to_eeg = F.cross_entropy(logits.T, labels)
     return 0.5 * (eeg_to_img + img_to_eeg)
 
