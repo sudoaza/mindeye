@@ -44,6 +44,26 @@ def variance_floor_loss(pred: torch.Tensor, target_std: torch.Tensor) -> torch.T
     return torch.mean(F.relu(target_std - pred_std))
 
 
+def batch_std_hinge_loss(pred_u: torch.Tensor, gamma: float | None = None) -> torch.Tensor:
+    """VICReg-style anti-collapse on the *normalized* prediction batch.
+
+    ``variance_floor_loss`` compares each vector's per-dim magnitude against a raw
+    target std, but under ``force_unit_output`` every prediction is already a unit
+    vector, so that floor is trivially met even when all predictions point the same
+    direction (hub collapse). This term instead penalizes low *cross-sample* std of
+    the normalized predictions per dimension, directly forcing the batch to spread
+    over the sphere — the same quantity the ``collapse_pct`` metric measures.
+
+    gamma defaults to 1/sqrt(D), the per-dim std of a well-spread set of unit
+    vectors, so the hinge only pushes when predictions are more collapsed than that.
+    """
+    d = pred_u.shape[-1]
+    if gamma is None:
+        gamma = 1.0 / (d ** 0.5)
+    std_per_dim = torch.sqrt(pred_u.var(dim=0) + 1e-6)
+    return torch.mean(F.relu(gamma - std_per_dim))
+
+
 class NegativeBank:
     """FIFO queue of detached, L2-normalized target embeddings + their int image
     ids, used as extra InfoNCE negatives (MoCo-style).
@@ -375,6 +395,7 @@ def set_seed(seed):
 def train_epoch(model, loader, optimizer, temperature, target_std, device,
                 rae_backend=None, recon_luma_weight=0.0, recon_grid_px=3,
                 nce_weight=1.0, cos_weight=0.2, var_weight=0.05,
+                spread_weight=1.0,
                 negative_bank=None):
     model.train()
     total_loss = 0
@@ -412,8 +433,12 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
         )
         loss_cos = 0.5 * (1.0 - F.cosine_similarity(pred_u, target_u, dim=-1).mean())
         loss_var = variance_floor_loss(preds, target_std.to(device))
+        # Cross-sample spread on the normalized preds: the effective anti-hub-collapse
+        # term (variance_floor is blind to directional collapse under force_unit_output).
+        loss_spread = batch_std_hinge_loss(pred_u)
 
-        loss = nce_weight * loss_nce + cos_weight * loss_cos + var_weight * loss_var
+        loss = (nce_weight * loss_nce + cos_weight * loss_cos
+                + var_weight * loss_var + spread_weight * loss_spread)
 
         # Enqueue this batch's (detached) real targets for future negatives.
         if negative_bank is not None:
@@ -660,6 +685,9 @@ def main():
     parser.add_argument("--nce-weight", type=float, default=1.0, help="Weight on the InfoNCE contrastive term")
     parser.add_argument("--cos-weight", type=float, default=0.2, help="Weight on the per-sample cosine pull (was 1.0)")
     parser.add_argument("--var-weight", type=float, default=0.05, help="Weight on the variance-floor anti-collapse term")
+    parser.add_argument("--spread-weight", type=float, default=1.0,
+                        help="Weight on the VICReg-style cross-sample spread term on normalized preds "
+                             "(effective anti-hub-collapse; 0 recovers the old blind-floor-only behavior)")
 
     # Extra negatives: MoCo-style FIFO queue of detached real target embeddings
     # appended to the InfoNCE denominator. 0 disables (current behavior). Only
@@ -922,7 +950,7 @@ def main():
 
     print(
         f"Loss weights: nce={args.nce_weight} cos={args.cos_weight} var={args.var_weight} "
-        f"| temperature={args.temperature}"
+        f"spread={args.spread_weight} | temperature={args.temperature}"
     )
 
     # Training loop
@@ -936,6 +964,7 @@ def main():
             rae_backend=rae_backend, recon_luma_weight=args.recon_luma_weight,
             recon_grid_px=args.recon_grid_px,
             nce_weight=args.nce_weight, cos_weight=args.cos_weight, var_weight=args.var_weight,
+            spread_weight=args.spread_weight,
             negative_bank=negative_bank,
         )
         scheduler.step()

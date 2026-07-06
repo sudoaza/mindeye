@@ -110,6 +110,8 @@ def main():
     parser.add_argument("--nce-weight", type=float, default=1.0, help="Weight on the InfoNCE contrastive term")
     parser.add_argument("--cos-weight", type=float, default=0.2, help="Weight on the per-sample cosine pull (was 1.0)")
     parser.add_argument("--var-weight", type=float, default=0.05, help="Weight on the variance-floor anti-collapse term")
+    parser.add_argument("--spread-weight", type=float, default=1.0,
+                        help="Weight on the VICReg-style cross-sample spread term (effective anti-hub-collapse)")
     parser.add_argument("--negative-bank-size", type=int, default=0,
                         help="Size of the MoCo-style negative queue forwarded to each run (0 = off; real mode only)")
     # Reconstruction / luminance grounding (opt-in). When > 0, each run additionally
@@ -259,6 +261,7 @@ def main():
                         "--nce-weight", str(args.nce_weight),
                         "--cos-weight", str(args.cos_weight),
                         "--var-weight", str(args.var_weight),
+                        "--spread-weight", str(args.spread_weight),
                         "--negative-bank-size", str(args.negative_bank_size),
                     ]
                     if args.recon_luma_weight > 0.0:
