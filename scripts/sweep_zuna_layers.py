@@ -6,6 +6,49 @@ import pandas as pd
 from sklearn.model_selection import KFold
 from tqdm import tqdm
 
+
+# Coarse ImageNet-synset -> high-level category via WordNet hypernym lexnames.
+# EEG is expected to carry coarse semantics (animal/vehicle/food...) more than fine
+# identity, so a category probe is the sensitive test for "any semantic signal".
+_CAT_CACHE: dict[str, str] = {}
+
+
+def synset_category(class_id: str) -> str:
+    """Map an ImageNet WordNet id (e.g. 'n01983481') to its lexicographer file
+    name (e.g. 'noun.animal'), a ~20-way coarse semantic category."""
+    if class_id in _CAT_CACHE:
+        return _CAT_CACHE[class_id]
+    try:
+        from nltk.corpus import wordnet as wn
+        offset = int(class_id[1:])
+        ss = wn.synset_from_pos_and_offset("n", offset)
+        cat = ss.lexname()
+    except Exception:
+        cat = "unknown"
+    _CAT_CACHE[class_id] = cat
+    return cat
+
+
+def category_probe(X: torch.Tensor, cats: list[str], kf) -> tuple[float, float, int]:
+    """5-fold logistic-regression accuracy predicting coarse category from X.
+    Returns (mean_acc, majority_baseline, n_categories)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    import collections
+
+    Xn = X.cpu().numpy()
+    y = np.array(cats)
+    counts = collections.Counter(y.tolist())
+    majority = max(counts.values()) / len(y)
+    accs = []
+    for tr, te in kf.split(Xn):
+        sc = StandardScaler().fit(Xn[tr])
+        clf = LogisticRegression(max_iter=300, C=1.0)
+        clf.fit(sc.transform(Xn[tr]), y[tr])
+        accs.append(float((clf.predict(sc.transform(Xn[te])) == y[te]).mean()))
+    return float(np.mean(accs)), float(majority), len(counts)
+
+
 def ridge_regression_fit_predict(X_train, Y_train, X_test, alpha=1.0):
     # Closed-form Ridge Regression: W = (X_train^T X_train + alpha I)^(-1) X_train^T Y_train
     # X_train: [N, D_in], Y_train: [N, D_out]
@@ -113,6 +156,16 @@ def main():
                     x = latent_reshaped[:, args.onset_lo:args.onset_hi, :].mean(dim=(0, 1))
                 X_list.append(x)
             X = torch.stack(X_list).to(device)
+
+            # Coarse-category probe (semantic signal detector) — once per pooled X.
+            cats = [synset_category(r["class_id"]) for r in valid_records]
+            cat_acc, cat_base, n_cat = category_probe(X, cats, kf)
+            print(f"Layer: {layer:8s} | Pooling: {pool_mode:5s} | Category({n_cat}-way) "
+                  f"acc={cat_acc:.4f} (majority baseline={cat_base:.4f})")
+            results.append({
+                "Layer": layer, "Pooling": pool_mode, "Target": f"Category-{n_cat}way",
+                "Test Cosine": float("nan"), "Top-10 Acc": cat_acc,
+            })
 
             for target_name, target_dict in target_spaces.items():
                 if target_dict is None:
