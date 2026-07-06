@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ZUNA -> vision QFormer control matrix: real vs shuffled vs random.
-# Uses the full cohort9 ZUNA cache and the corrected onset window (tc 20-36,
-# centered on the true onset tc=24). The gate is whether target-mode=real beats
+# Uses the full cohort9 ZUNA cache. Window tc 15-31 matches this cache's recorded
+# onset (onset_tc=19); this is exactly how ZUNA was being used in prior sweeps. The gate is whether target-mode=real beats
 # the shuffled/random controls on val retrieval (val_mrr_full / top-k). If real
 # only matches the controls, the bridge is not extracting stimulus signal.
 # Usage: bash scripts/sweep_cos_negbank.sh 2>&1 | tee /workspace/matrix.log
@@ -28,7 +28,7 @@ for MODE in real shuffled random; do
     --target-mode "$MODE" \
     --layer-name post_mmd \
     --num-subjects 9 \
-    --temporal-window --latent-tc-start 20 --latent-tc-end 36 \
+    --temporal-window --latent-tc-start 15 --latent-tc-end 31 \
     --batch-size 256 \
     --epochs 20 \
     --patience 20 \
