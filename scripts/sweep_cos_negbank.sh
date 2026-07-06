@@ -20,7 +20,7 @@ OUT_ROOT="outputs/qformer_spread_sweep"
 
 mkdir -p "$OUT_ROOT"
 
-for SPREAD in 1.0 4.0; do
+for SPREAD in 1.0 5.0; do
   CELL="spread${SPREAD}"
   echo "======================================================================"
   echo "  SWEEP CELL: spread-weight=$SPREAD  (cos=0.2, real only)"

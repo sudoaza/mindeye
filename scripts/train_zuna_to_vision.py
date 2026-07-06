@@ -55,13 +55,16 @@ def batch_std_hinge_loss(pred_u: torch.Tensor, gamma: float | None = None) -> to
     over the sphere — the same quantity the ``collapse_pct`` metric measures.
 
     gamma defaults to 1/sqrt(D), the per-dim std of a well-spread set of unit
-    vectors, so the hinge only pushes when predictions are more collapsed than that.
+    vectors. The hinge is *scale-normalized* (``1 - std/gamma``) so a fully
+    collapsed batch yields ~1.0 per dim regardless of D, making the loss weight
+    meaningful against the O(1..10) InfoNCE term. Raw per-dim std is O(1/sqrt(D))
+    ~= 0.036 for D=768, which is why an un-normalized hinge was far too weak.
     """
     d = pred_u.shape[-1]
     if gamma is None:
         gamma = 1.0 / (d ** 0.5)
     std_per_dim = torch.sqrt(pred_u.var(dim=0) + 1e-6)
-    return torch.mean(F.relu(gamma - std_per_dim))
+    return torch.mean(F.relu(1.0 - std_per_dim / gamma))
 
 
 class NegativeBank:
