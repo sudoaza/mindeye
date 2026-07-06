@@ -72,7 +72,9 @@ def _load_raw_epochs(epochs_dir: str, train_runs: set[int], val_runs: set[int],
 
     Xtr, ytr, Xva, yva = [], [], [], []
     npzs = sorted(glob.glob(os.path.join(epochs_dir, "*_zuna_semantic.npz")))
-    for npz_path in npzs:
+    for gidx, npz_path in enumerate(npzs, start=1):
+        # Per-file metadata carries only a session-local `run` (1..8). Use the sorted
+        # file position as a stable global run index (1..N) for a clean train/val split.
         meta_path = npz_path.replace("_zuna_semantic.npz", "_metadata.csv")
         if not os.path.exists(meta_path):
             continue
@@ -85,13 +87,16 @@ def _load_raw_epochs(epochs_dir: str, train_runs: set[int], val_runs: set[int],
         # Post-onset crop in *samples*, then per-channel mean over the window + per-channel std.
         win = eeg[:, :, samp_lo:samp_hi]  # [N, 62, W]
         feat = np.concatenate([win.mean(axis=2), win.std(axis=2)], axis=1)  # [N, 124]
+        in_train = gidx in train_runs
+        in_val = gidx in val_runs
+        if not (in_train or in_val):
+            continue
         for i in range(len(df)):
             row = df.iloc[i]
-            run = int(row.get("run", row.get("run_id", -1)))
             cls = str(row.get("class_id", row.get("image_id", "MISSING")))
-            if run in train_runs:
+            if in_train:
                 Xtr.append(feat[i]); ytr.append(cls)
-            elif run in val_runs:
+            else:
                 Xva.append(feat[i]); yva.append(cls)
     return np.stack(Xtr), np.array(ytr), np.stack(Xva), np.array(yva)
 
