@@ -327,6 +327,101 @@ def clip_contrastive_loss(
     return 0.5 * (eeg_to_img + img_to_eeg)
 
 
+def soft_dino_contrastive_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    temperature: float = 0.07,
+    teacher_temperature: float = 0.07,
+    rkd_weight: float = 0.0,
+    hard_weight: float = 0.0,
+    image_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Relational contrastive loss using the *continuous geometry* of DINO space.
+
+    Hard InfoNCE (``clip_contrastive_loss``) treats every stimulus as its own
+    discrete class: the model must resolve 34k images as distinct points and every
+    non-matching image is a hard negative — even a near-identical one. On EEG that
+    is a punishingly low-signal target and creates false negatives for visually
+    similar stimuli.
+
+    This loss instead supervises with the *teacher* (DINO) pairwise similarity
+    structure. Two components, both computed over the in-batch target embeddings:
+
+    - **Soft-target cross-entropy (distillation):** the "correct" distribution over
+      the batch is ``softmax(target @ target.T / teacher_temperature)`` — a soft
+      label reflecting how visually similar each other stimulus is — matched by
+      ``log_softmax(pred @ target.T / temperature)``. A perfect batch of near
+      duplicates is rewarded for predicting similar embeddings instead of being
+      punished as false negatives. The teacher row is a proper distribution, so this
+      is a KL / soft cross-entropy that reduces to standard InfoNCE only when the
+      teacher is one-hot (all stimuli mutually orthogonal).
+    - **RKD relational term (optional):** directly matches the prediction similarity
+      *matrix* to the target similarity matrix (``mse(pred@pred.T, target@target.T)``)
+      so the geometry of predictions mirrors DINO geometry, not just the rows.
+
+    The EEG then only needs to place each trial in the right *neighborhood* of visual
+    space — a far easier, information-richer target than pinpoint identity.
+
+    Args:
+        pred, target: [N, D] paired prediction / DINO target embeddings.
+        temperature: student softmax temperature (prediction rows).
+        teacher_temperature: teacher softmax temperature (DINO rows); lower = sharper
+            soft labels (closer to hard InfoNCE), higher = smoother neighborhoods.
+        rkd_weight: weight on the relational similarity-matrix MSE term.
+        hard_weight: optional blend of the original hard-label InfoNCE (diagonal is
+            the sole positive), for a soft/hard curriculum. 0 = pure soft.
+        image_ids: when given, exact-duplicate stimuli (same image id) are collapsed
+            into a shared soft-label mass rather than competing, avoiding residual
+            false negatives among literal repeats.
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"pred and target must have matching shape, got {pred.shape} and {target.shape}")
+    if pred.shape[0] < 2:
+        raise ValueError("contrastive loss needs at least two items per batch")
+    pred = F.normalize(pred, dim=-1)
+    target = F.normalize(target, dim=-1)
+    n = pred.shape[0]
+
+    # Teacher soft labels from DINO geometry. Detach: the teacher defines the target
+    # distribution and must not receive gradient.
+    with torch.no_grad():
+        teacher_logits = target @ target.T / teacher_temperature  # [N, N]
+        # Exact duplicates share label mass instead of splitting it: give same-image
+        # off-diagonal entries the same (large) teacher logit as the self entry so the
+        # soft label spreads evenly across literal repeats of the stimulus.
+        if image_ids is not None:
+            same = image_ids[:, None] == image_ids[None, :]  # [N, N] incl. diagonal
+            diag_val = teacher_logits.diagonal().unsqueeze(1)  # self-similarity per row
+            teacher_logits = torch.where(same, diag_val.expand_as(teacher_logits), teacher_logits)
+        teacher = F.softmax(teacher_logits, dim=-1)  # [N, N] rows sum to 1
+
+    # Student log-probs over the same in-batch target bank, both directions.
+    student_logits = pred @ target.T / temperature  # [N, N]
+    log_student = F.log_softmax(student_logits, dim=-1)
+    # Soft cross-entropy (eeg->img). Symmetric img->eeg uses the transpose.
+    soft_ce = -(teacher * log_student).sum(dim=-1).mean()
+    log_student_t = F.log_softmax(student_logits.T, dim=-1)
+    soft_ce_t = -(teacher * log_student_t).sum(dim=-1).mean()
+    loss = 0.5 * (soft_ce + soft_ce_t)
+
+    if hard_weight > 0.0:
+        labels = torch.arange(n, device=pred.device)
+        hard = 0.5 * (F.cross_entropy(student_logits, labels)
+                      + F.cross_entropy(student_logits.T, labels))
+        loss = loss + hard_weight * hard
+
+    if rkd_weight > 0.0:
+        pred_sim = pred @ pred.T
+        with torch.no_grad():
+            tgt_sim = target @ target.T
+        # Match relational geometry off-diagonal (diagonal is trivially 1).
+        off = ~torch.eye(n, dtype=torch.bool, device=pred.device)
+        loss = loss + rkd_weight * F.mse_loss(pred_sim[off], tgt_sim[off])
+
+    return loss
+
+
 def retrieval_topk(
     pred: torch.Tensor,
     targets: torch.Tensor,

@@ -21,6 +21,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "s
 from mindseye.adapters.qformer import ZunaToVisionQFormer
 from mindseye.models.eeg_encoder import (
     clip_contrastive_loss,
+    soft_dino_contrastive_loss,
     retrieval_topk,
     retrieval_topk_full_bank,
 )
@@ -403,6 +404,8 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
                 rae_backend=None, recon_luma_weight=0.0, recon_grid_px=3,
                 nce_weight=1.0, cos_weight=0.2, var_weight=0.05,
                 spread_weight=1.0, spread_gamma=None,
+                soft_dino_weight=0.0, soft_dino_teacher_temp=0.07,
+                soft_dino_rkd_weight=0.0, soft_dino_hard_weight=0.0,
                 negative_bank=None):
     model.train()
     total_loss = 0
@@ -438,6 +441,19 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
             queue_targets=queue_targets,
             queue_image_ids=queue_image_ids,
         )
+        if soft_dino_weight > 0.0:
+            # Relational loss on DINO geometry: reward predicting embeddings in the
+            # right *neighborhood* of visual space instead of pinpoint identity.
+            loss_soft = soft_dino_contrastive_loss(
+                pred_u, target_u,
+                temperature=temperature,
+                teacher_temperature=soft_dino_teacher_temp,
+                rkd_weight=soft_dino_rkd_weight,
+                hard_weight=soft_dino_hard_weight,
+                image_ids=image_int_ids,
+            )
+        else:
+            loss_soft = torch.zeros((), device=device)
         loss_cos = 0.5 * (1.0 - F.cosine_similarity(pred_u, target_u, dim=-1).mean())
         loss_var = variance_floor_loss(preds, target_std.to(device))
         # Cross-sample spread on the normalized preds: the effective anti-hub-collapse
@@ -445,7 +461,8 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
         loss_spread = batch_std_hinge_loss(pred_u, spread_gamma.to(device))
 
         loss = (nce_weight * loss_nce + cos_weight * loss_cos
-                + var_weight * loss_var + spread_weight * loss_spread)
+                + var_weight * loss_var + spread_weight * loss_spread
+                + soft_dino_weight * loss_soft)
 
         # Enqueue this batch's (detached) real targets for future negatives.
         if negative_bank is not None:
@@ -695,6 +712,19 @@ def main():
     parser.add_argument("--spread-weight", type=float, default=1.0,
                         help="Weight on the VICReg-style cross-sample spread term on normalized preds "
                              "(effective anti-hub-collapse; 0 recovers the old blind-floor-only behavior)")
+    parser.add_argument("--soft-dino-weight", type=float, default=0.0,
+                        help="Weight on the relational soft-DINO contrastive loss (soft-target InfoNCE "
+                             "using the DINO teacher similarity matrix instead of hard image-id labels; "
+                             "0 = off, pure hard InfoNCE)")
+    parser.add_argument("--soft-dino-teacher-temp", type=float, default=0.07,
+                        help="Teacher softmax temperature for soft-DINO labels; lower=sharper (closer to "
+                             "hard InfoNCE), higher=smoother visual neighborhoods")
+    parser.add_argument("--soft-dino-rkd-weight", type=float, default=0.0,
+                        help="Weight on the RKD relational term inside soft-DINO loss (match pred vs DINO "
+                             "similarity-matrix geometry directly)")
+    parser.add_argument("--soft-dino-hard-weight", type=float, default=0.0,
+                        help="Blend of hard-label InfoNCE inside soft-DINO loss for a soft/hard curriculum "
+                             "(0 = pure soft)")
 
     # Extra negatives: MoCo-style FIFO queue of detached real target embeddings
     # appended to the InfoNCE denominator. 0 disables (current behavior). Only
@@ -962,7 +992,9 @@ def main():
 
     print(
         f"Loss weights: nce={args.nce_weight} cos={args.cos_weight} var={args.var_weight} "
-        f"spread={args.spread_weight} | temperature={args.temperature}"
+        f"spread={args.spread_weight} soft_dino={args.soft_dino_weight} "
+        f"(teacher_temp={args.soft_dino_teacher_temp} rkd={args.soft_dino_rkd_weight} "
+        f"hard={args.soft_dino_hard_weight}) | temperature={args.temperature}"
     )
 
     # Training loop
@@ -977,6 +1009,10 @@ def main():
             recon_grid_px=args.recon_grid_px,
             nce_weight=args.nce_weight, cos_weight=args.cos_weight, var_weight=args.var_weight,
             spread_weight=args.spread_weight, spread_gamma=spread_gamma,
+            soft_dino_weight=args.soft_dino_weight,
+            soft_dino_teacher_temp=args.soft_dino_teacher_temp,
+            soft_dino_rkd_weight=args.soft_dino_rkd_weight,
+            soft_dino_hard_weight=args.soft_dino_hard_weight,
             negative_bank=negative_bank,
         )
         scheduler.step()
