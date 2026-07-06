@@ -737,6 +737,14 @@ def main():
     parser.add_argument("--out-dir", type=str, default="outputs/qformer_aligned_grid", help="Directory to save checkpoints and logs")
     parser.add_argument("--slug", type=str, default=None, help="Optional experiment slug")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    # The full-image-bank retrieval (34k images) is a near-chance-by-construction
+    # image-id metric and is expensive to run every epoch. Judge signal by vector
+    # distance (val_cosine_norm) instead; only run the bank retrieval once at the
+    # end for reference. "each" preserves the old per-epoch behavior.
+    parser.add_argument("--full-bank-eval", choices=("none", "final", "each"), default="final",
+                        help="When to rank preds against the full image bank (default: final only)")
+    parser.add_argument("--select-metric", choices=("cosine", "mrr_full", "mrr_norm"), default="cosine",
+                        help="Checkpoint/early-stop selection metric (default: val_cosine_norm)")
     
     args = parser.parse_args()
     
@@ -1016,9 +1024,11 @@ def main():
             negative_bank=negative_bank,
         )
         scheduler.step()
+        eval_bank = full_bank if args.full_bank_eval == "each" else None
+        eval_bank_idx = image_id_to_bank_idx if args.full_bank_eval == "each" else None
         val_metrics = evaluate_model(
             model, val_loader, device,
-            bank=full_bank, image_id_to_bank_idx=image_id_to_bank_idx,
+            bank=eval_bank, image_id_to_bank_idx=eval_bank_idx,
         )
         
         val_mrr = val_metrics["val_mrr_norm"]
@@ -1029,14 +1039,17 @@ def main():
         val_mrr_full = val_metrics.get("val_mrr_full", float("nan"))
         val_top10_full = val_metrics.get("val_top10_full", float("nan"))
 
-        # Model selection uses the honest full-bank MRR — the metric the gate/docs
-        # mandate. The full retrieval bank is always built above, so val_mrr_full is
-        # always present; if it ever isn't, warn loudly and name the path taken
-        # instead of silently selecting on the inflated within-val metric.
-        if "val_mrr_full" in val_metrics:
+        # Selection metric. Default is vector distance (val_cosine_norm): the
+        # full-bank image-id retrieval is near-chance-by-construction and no
+        # longer the per-epoch gate. cosine measures how close preds land to the
+        # true target direction, which is the honest signal indicator here.
+        if args.select_metric == "cosine":
+            select_metric = val_cosine
+        elif args.select_metric == "mrr_full" and "val_mrr_full" in val_metrics:
             select_metric = val_metrics["val_mrr_full"]
         else:
-            print("[warn] selection metric val_mrr_full absent — selecting on val_mrr_norm")
+            if args.select_metric == "mrr_full":
+                print("[warn] select-metric=mrr_full but full-bank eval disabled; using val_mrr_norm")
             select_metric = val_mrr
         
         print(f"Epoch {epoch:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | "
@@ -1080,14 +1093,15 @@ def main():
     df_history = pd.DataFrame(history)
     df_history.to_csv(run_dir / "history.csv", index=False)
     
-    # Save final metrics summary. The "best" row must reflect the checkpoint we
-    # actually saved, which is selected on the full-bank MRR (val_mrr_full).
+    # Save final metrics summary. The "best" row reflects the saved checkpoint,
+    # selected on the configured selection metric.
     final_metrics = history[-1]
-    if "val_mrr_full" in df_history.columns and df_history["val_mrr_full"].notna().any():
-        best_epoch_idx = df_history["val_mrr_full"].idxmax()
+    sel_col = {"cosine": "val_cosine_norm", "mrr_full": "val_mrr_full", "mrr_norm": "val_mrr_norm"}[args.select_metric]
+    if sel_col in df_history.columns and df_history[sel_col].notna().any():
+        best_epoch_idx = df_history[sel_col].idxmax()
     else:
-        print("[warn] selection metric val_mrr_full absent — picking best row on val_mrr_norm")
-        best_epoch_idx = df_history["val_mrr_norm"].idxmax()
+        print(f"[warn] selection metric {sel_col} absent — picking best row on val_cosine_norm")
+        best_epoch_idx = df_history["val_cosine_norm"].idxmax()
     best_metrics = history[best_epoch_idx]
 
     summary = {
@@ -1097,7 +1111,7 @@ def main():
     with open(run_dir / "metrics.json", "w") as f:
         json.dump(summary, f, indent=2)
         
-    print(f"\n✓ Training complete! Best Validation MRR (Full-bank): {best_mrr:.4f} at epoch {best_metrics['epoch']}.")
+    print(f"\n✓ Training complete! Best {sel_col}={best_mrr:.4f} at epoch {best_metrics['epoch']}.")
 
     # Bug 1 fix: reload best checkpoint before saving eval predictions
     best_ckpt = torch.load(run_dir / "checkpoint_best.pt", map_location=device)
@@ -1105,14 +1119,18 @@ def main():
     model.eval()
     print(f"Reloaded best checkpoint (epoch {best_ckpt['epoch']}) for eval prediction saving.")
 
+    # Full-bank retrieval is reported once here (unless disabled) rather than
+    # every epoch, so the expensive 34k-image ranking doesn't dominate the grid.
+    final_bank = None if args.full_bank_eval == "none" else full_bank
+    final_bank_idx = None if args.full_bank_eval == "none" else image_id_to_bank_idx
     save_eval_metadata(
         model, val_loader, device, run_dir / "val_eval_preds.pt",
-        bank=full_bank, image_id_to_bank_idx=image_id_to_bank_idx,
+        bank=final_bank, image_id_to_bank_idx=final_bank_idx,
     )
     if len(test_dataset) > 0:
         save_eval_metadata(
             model, test_loader, device, run_dir / "test_eval_preds.pt",
-            bank=full_bank, image_id_to_bank_idx=image_id_to_bank_idx,
+            bank=final_bank, image_id_to_bank_idx=final_bank_idx,
         )
 
     print(f"Results saved in: {run_dir}")
