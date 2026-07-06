@@ -1,34 +1,35 @@
 #!/usr/bin/env bash
-# Anti-collapse fix validation (real-mode only, sequential, unbuffered):
-# does the VICReg-style cross-sample spread term break hub collapse?
+# Target-space sweep: with the loss now healthy (no collapse), does ANY visual
+# target space give the EEG->vision bridge above-chance *generalization* on val?
 #
-# The cos-weight sweep showed hub collapse persists even at cos=1.0 (all preds
-# converge to the mean-target direction; the old variance-floor is blind to this
-# under force_unit_output). This sweep tests the new --spread-weight term.
-# spread=0 already reproduced the collapse; here we test spread>0.
+# The spread-weight sweep showed the loss is fixed (collapse 100%->0%, StdRatio in
+# band) but EEG->DINO-Unit-768 overfits: train loss falls while val MRR stays at
+# chance. This sweep varies the target space smaller<->richer to locate signal:
+#   DINO-PCA-128-Unit  (128-d, easiest)
+#   DINO-PCA-256-Unit  (256-d)
+#   DINO-Unit-768      (768-d mean-pool, baseline)
+#   DINO-CLS-768       (768-d CLS token, richer/different)
+# (CLIP-Common-512 is NOT in this bank; would need re-caching, skipped.)
 #
-# NOTE: /workspace overlay disk is small; each checkpoint is ~830MB. We delete
-# each cell's heavy checkpoints right after the run (history.csv/metrics.json,
-# which hold collapse_pct/StdRatio, are tiny and kept).
-#
+# real-only, spread=0.3 (best balance), 20 epochs. Watch val_mrr_norm / mrr_full.
 # Usage: bash scripts/sweep_cos_negbank.sh 2>&1 | tee /workspace/sweep.log
 set -euo pipefail
 
 LATENTS="data/processed/zuna_latents/cohort9_runs01_32"
 RAE="data/processed/rae_embeddings/rae_dinov2_base_all.pt"
-OUT_ROOT="outputs/qformer_spread_sweep"
+OUT_ROOT="outputs/qformer_target_sweep"
 
 mkdir -p "$OUT_ROOT"
 
-for SPREAD in 0.3 0.5 1.0; do
-  CELL="spread${SPREAD}"
+for TSPACE in DINO-PCA-128-Unit DINO-PCA-256-Unit DINO-Unit-768 DINO-CLS-768; do
+  CELL="$TSPACE"
   echo "======================================================================"
-  echo "  SWEEP CELL: spread-weight=$SPREAD  (cos=0.2, target-anchored gamma, real only)"
+  echo "  SWEEP CELL: target-space=$TSPACE  (spread=0.3, cos=0.2, real only)"
   echo "======================================================================"
   PYTHONPATH=src python -u scripts/train_zuna_to_vision.py \
     --latents-pt "$LATENTS" \
     --targets-pt "$RAE" \
-    --target-space "DINO-Unit-768" \
+    --target-space "$TSPACE" \
     --target-mode real \
     --layer-name post_mmd \
     --num-subjects 9 \
@@ -42,7 +43,7 @@ for SPREAD in 0.3 0.5 1.0; do
     --nce-weight 1.0 \
     --cos-weight 0.2 \
     --var-weight 0.05 \
-    --spread-weight "$SPREAD" \
+    --spread-weight 0.3 \
     --negative-bank-size 0 \
     --out-dir "$OUT_ROOT/$CELL" \
     --slug "$CELL"
@@ -51,9 +52,5 @@ for SPREAD in 0.3 0.5 1.0; do
 done
 
 echo "======================================================================"
-echo "  SWEEP COMPLETE — per-cell final-epoch collapse/StdRatio:"
+echo "  SWEEP COMPLETE"
 echo "======================================================================"
-for h in "$OUT_ROOT"/*/*/history.csv; do
-  echo "--- $h ---"
-  head -1 "$h"; tail -1 "$h"
-done
