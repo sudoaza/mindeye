@@ -58,10 +58,25 @@ def main():
     metadata_df = pd.concat(per_dir_frames, ignore_index=True)
     print(f"Total trials across {len(args.epochs_dir)} dir(s): {len(metadata_df)}")
 
-    # If max_trials is set, truncate metadata
+    # If max_trials is set, truncate metadata — but only on whole-npz boundaries.
+    # A mid-file cut would leave a run whose npz has more epochs than the kept
+    # metadata rows, and the row-order pairing guard below would (correctly) abort.
     if args.max_trials is not None:
-        metadata_df = metadata_df.iloc[:args.max_trials].copy()
-        print(f"Truncated metadata to {args.max_trials} trials for debug sweep.")
+        if "npz_file" in metadata_df.columns:
+            kept = []
+            total = 0
+            for (_d, _f), g in metadata_df.groupby(["_epochs_dir", "npz_file"], sort=False):
+                if total >= args.max_trials:
+                    break
+                kept.append(g)
+                total += len(g)
+            metadata_df = pd.concat(kept, ignore_index=True).copy()
+            print(f"Truncated metadata to {len(metadata_df)} trials "
+                  f"({len(kept)} whole npz file(s)) for debug sweep "
+                  f"[requested ~{args.max_trials}].")
+        else:
+            metadata_df = metadata_df.iloc[:args.max_trials].copy()
+            print(f"Truncated metadata to {args.max_trials} trials for debug sweep.")
 
     # Initialize Extractor
     print(f"Initializing ZunaLatentExtractor on {args.device}...")
