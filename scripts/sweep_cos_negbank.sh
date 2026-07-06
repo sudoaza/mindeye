@@ -20,10 +20,10 @@ OUT_ROOT="outputs/qformer_spread_sweep"
 
 mkdir -p "$OUT_ROOT"
 
-for SPREAD in 1.0 5.0; do
+for SPREAD in 0.3 0.5 1.0; do
   CELL="spread${SPREAD}"
   echo "======================================================================"
-  echo "  SWEEP CELL: spread-weight=$SPREAD  (cos=0.2, real only)"
+  echo "  SWEEP CELL: spread-weight=$SPREAD  (cos=0.2, target-anchored gamma, real only)"
   echo "======================================================================"
   PYTHONPATH=src python -u scripts/train_zuna_to_vision.py \
     --latents-pt "$LATENTS" \
@@ -34,8 +34,8 @@ for SPREAD in 1.0 5.0; do
     --num-subjects 9 \
     --temporal-window --latent-tc-start 15 --latent-tc-end 31 \
     --batch-size 256 \
-    --epochs 12 \
-    --patience 12 \
+    --epochs 20 \
+    --patience 20 \
     --train-runs "1-6" --val-runs "7-8" \
     --hidden-dim 1024 \
     --temperature 0.05 \

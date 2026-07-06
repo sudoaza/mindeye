@@ -44,7 +44,7 @@ def variance_floor_loss(pred: torch.Tensor, target_std: torch.Tensor) -> torch.T
     return torch.mean(F.relu(target_std - pred_std))
 
 
-def batch_std_hinge_loss(pred_u: torch.Tensor, gamma: float | None = None) -> torch.Tensor:
+def batch_std_hinge_loss(pred_u: torch.Tensor, gamma) -> torch.Tensor:
     """VICReg-style anti-collapse on the *normalized* prediction batch.
 
     ``variance_floor_loss`` compares each vector's per-dim magnitude against a raw
@@ -54,17 +54,21 @@ def batch_std_hinge_loss(pred_u: torch.Tensor, gamma: float | None = None) -> to
     the normalized predictions per dimension, directly forcing the batch to spread
     over the sphere — the same quantity the ``collapse_pct`` metric measures.
 
-    gamma defaults to 1/sqrt(D), the per-dim std of a well-spread set of unit
-    vectors. The hinge is *scale-normalized* (``1 - std/gamma``) so a fully
-    collapsed batch yields ~1.0 per dim regardless of D, making the loss weight
-    meaningful against the O(1..10) InfoNCE term. Raw per-dim std is O(1/sqrt(D))
-    ~= 0.036 for D=768, which is why an un-normalized hinge was far too weak.
+    The hinge is *scale-normalized* (``1 - std/gamma``) so a fully collapsed batch
+    yields ~1.0 per dim (making the loss weight meaningful against the O(1..10)
+    InfoNCE term) and turns fully **off** once the per-dim std reaches ``gamma``.
+
+    gamma should be the target distribution's own per-dim std of the normalized
+    targets (a [D] tensor). Anchoring to the target spread — rather than the
+    theoretical unit-vector value 1/sqrt(D) ~= 0.036 which the DINO targets never
+    reach (their per-dim std ~= 0.027) — lets the term switch off exactly when preds
+    match the target's natural spread, so it stops fighting cosine alignment after
+    collapse is broken.
     """
-    d = pred_u.shape[-1]
-    if gamma is None:
-        gamma = 1.0 / (d ** 0.5)
     std_per_dim = torch.sqrt(pred_u.var(dim=0) + 1e-6)
-    return torch.mean(F.relu(1.0 - std_per_dim / gamma))
+    if not torch.is_tensor(gamma):
+        gamma = torch.as_tensor(gamma, device=pred_u.device, dtype=pred_u.dtype)
+    return torch.mean(F.relu(1.0 - std_per_dim / gamma.clamp_min(1e-6)))
 
 
 class NegativeBank:
@@ -398,7 +402,7 @@ def set_seed(seed):
 def train_epoch(model, loader, optimizer, temperature, target_std, device,
                 rae_backend=None, recon_luma_weight=0.0, recon_grid_px=3,
                 nce_weight=1.0, cos_weight=0.2, var_weight=0.05,
-                spread_weight=1.0,
+                spread_weight=1.0, spread_gamma=None,
                 negative_bank=None):
     model.train()
     total_loss = 0
@@ -438,7 +442,7 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
         loss_var = variance_floor_loss(preds, target_std.to(device))
         # Cross-sample spread on the normalized preds: the effective anti-hub-collapse
         # term (variance_floor is blind to directional collapse under force_unit_output).
-        loss_spread = batch_std_hinge_loss(pred_u)
+        loss_spread = batch_std_hinge_loss(pred_u, spread_gamma.to(device))
 
         loss = (nce_weight * loss_nce + cos_weight * loss_cos
                 + var_weight * loss_var + spread_weight * loss_spread)
@@ -874,6 +878,11 @@ def main():
     train_targets_all = torch.stack(train_targets_list)
     target_std = train_targets_all.std(dim=0).clamp_min(1e-4)
     print(f"Calculated training target_std (mean={target_std.mean().item():.6f}, min={target_std.min().item():.6f}, max={target_std.max().item():.6f})")
+    # Per-dim std of the *normalized* train targets: the anchor the spread hinge
+    # aims for, so the anti-collapse term switches off once preds match the
+    # target's own spread on the sphere (rather than the unreachable 1/sqrt(D)).
+    spread_gamma = F.normalize(train_targets_all, dim=-1).std(dim=0).clamp_min(1e-6)
+    print(f"Spread hinge gamma (normalized-target std): mean={spread_gamma.mean().item():.6f}")
 
     # Subset datasets and dataloaders
     train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
@@ -967,7 +976,7 @@ def main():
             rae_backend=rae_backend, recon_luma_weight=args.recon_luma_weight,
             recon_grid_px=args.recon_grid_px,
             nce_weight=args.nce_weight, cos_weight=args.cos_weight, var_weight=args.var_weight,
-            spread_weight=args.spread_weight,
+            spread_weight=args.spread_weight, spread_gamma=spread_gamma,
             negative_bank=negative_bank,
         )
         scheduler.step()
