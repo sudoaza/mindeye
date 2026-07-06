@@ -103,8 +103,7 @@ def main() -> None:
     Xtr_s = scaler.transform(Xtr); Xva_s = scaler.transform(Xva)
 
     def fit_eval(y_train, tag: str):
-        clf = LogisticRegression(C=args.C, max_iter=args.max_iter, n_jobs=-1,
-                                 multi_class="multinomial")
+        clf = LogisticRegression(C=args.C, max_iter=args.max_iter, n_jobs=-1)
         clf.fit(Xtr_s, y_train)
         proba = clf.predict_proba(Xva_s)
         classes = clf.classes_
