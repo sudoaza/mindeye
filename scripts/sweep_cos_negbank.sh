@@ -5,9 +5,11 @@
 # The cos-weight sweep showed hub collapse persists even at cos=1.0 (all preds
 # converge to the mean-target direction; the old variance-floor is blind to this
 # under force_unit_output). This sweep tests the new --spread-weight term.
+# spread=0 already reproduced the collapse; here we test spread>0.
 #
-# spread=0 reproduces the collapse (control); spread>0 should raise StdRatio into
-# [0.3, 2.0] and drop collapse_pct < 20%. cos fixed at 0.2 (the softer default).
+# NOTE: /workspace overlay disk is small; each checkpoint is ~830MB. We delete
+# each cell's heavy checkpoints right after the run (history.csv/metrics.json,
+# which hold collapse_pct/StdRatio, are tiny and kept).
 #
 # Usage: bash scripts/sweep_cos_negbank.sh 2>&1 | tee /workspace/sweep.log
 set -euo pipefail
@@ -18,7 +20,7 @@ OUT_ROOT="outputs/qformer_spread_sweep"
 
 mkdir -p "$OUT_ROOT"
 
-for SPREAD in 0.0 1.0 4.0; do
+for SPREAD in 1.0 4.0; do
   CELL="spread${SPREAD}"
   echo "======================================================================"
   echo "  SWEEP CELL: spread-weight=$SPREAD  (cos=0.2, real only)"
@@ -44,8 +46,14 @@ for SPREAD in 0.0 1.0 4.0; do
     --negative-bank-size 0 \
     --out-dir "$OUT_ROOT/$CELL" \
     --slug "$CELL"
+  # Free the heavy checkpoints; keep the tiny metrics/history for analysis.
+  find "$OUT_ROOT/$CELL" -name '*.pt' -delete
 done
 
 echo "======================================================================"
-echo "  SWEEP COMPLETE"
+echo "  SWEEP COMPLETE — per-cell final-epoch collapse/StdRatio:"
 echo "======================================================================"
+for h in "$OUT_ROOT"/*/*/history.csv; do
+  echo "--- $h ---"
+  head -1 "$h"; tail -1 "$h"
+done
