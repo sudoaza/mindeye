@@ -92,8 +92,16 @@ def main():
         
     print(f"Layers to cache: {layers_to_cache}")
 
-    # tc-downsample factor: 1280 samples -> num_fine_time_pts coarse-time steps.
-    tc_downsample_factor = int(1280 // extractor.model_args.num_fine_time_pts)
+    # ZUNA chops 1280 samples into tf=num_fine_time_pts-sample chunks, producing
+    # tc = 1280 // tf COARSE time steps (the latent's time dimension). To map a raw
+    # sample index (e.g. anchor_sample=768) onto that coarse grid, divide by the
+    # per-coarse-step sample count = 1280 / tc = tf.
+    # NOTE: the previous code divided by (1280 // tf) which is tc itself (40), not the
+    # per-step sample count (tf=32), putting onset at round(768/40)=19 instead of the
+    # true round(768/32)=24 — a ~0.6s early shift. tf is the correct divisor.
+    tf = int(extractor.model_args.num_fine_time_pts)
+    tc_coarse = 1280 // tf
+    samples_per_coarse_step = tf
 
     # Group metadata by source dir + NPZ file to load them efficiently. Different
     # subjects can share an npz basename, so include the dir in the grouping key.
@@ -206,8 +214,8 @@ def main():
                 image_id = str(row.get('image_id', 'MISSING'))
                 class_id = str(row.get('class_id', 'MISSING'))
                 onset_offset_s = float(row.get('event_offset_s', 3.0))
-                # tc-downsample factor = 1280 / num_fine_time_pts (e.g. 1280/40 = 32).
-                onset_tc = int(round(float(row.get('anchor_sample', 768)) / tc_downsample_factor))
+                # Map anchor sample -> coarse-time step: sample / (samples per coarse step).
+                onset_tc = int(round(float(row.get('anchor_sample', 768)) / samples_per_coarse_step))
                 
                 record = {
                     "sample_id": sample_id,
@@ -257,8 +265,8 @@ def main():
     onset_tcs = sorted({int(r["onset_tc"]) for r in latent_records}) if latent_records else [24]
     meta_info = {
         "n_channels": n_channels,
-        "tc": tc_downsample_factor,
-        "tf": int(extractor.model_args.num_fine_time_pts),
+        "tc": tc_coarse,
+        "tf": tf,
         "D": int(extractor.model_args.encoder_output_dim),
         "onset_tc": onset_tcs[0] if len(onset_tcs) == 1 else onset_tcs,
         "n_trials": len(latent_records),

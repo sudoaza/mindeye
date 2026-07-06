@@ -101,10 +101,20 @@ class ZunaLatentExtractor(nn.Module):
         B, n_channels, n_timepoints = eeg.shape
         assert n_timepoints == 1280, f"Expected 1280 timepoints, got {n_timepoints}"
         
-        # Channel-wise z-scoring and scale by 0.1 to match ZUNA expected input stats
-        mean = eeg.mean(dim=-1, keepdim=True)
-        std = eeg.std(dim=-1, keepdim=True).clamp_min(1e-6)
-        eeg = ((eeg - mean) / std) * 0.1
+        # ZUNA-matched *global* normalization. The official pipeline applies a single
+        # global z-score (one mean/std scalar across all channels+time) offline, then
+        # divides by data_norm=10 at inference to land at std~=0.1 with a +-1 clip.
+        # Per-channel z-scoring (the previous behavior) forces every channel to unit
+        # variance and therefore ERASES the cross-channel amplitude topography — the very
+        # thing that carries the visual evoked response (occipital >> frontal). That
+        # flattening was destroying the stimulus signal (raw-EEG probe decodes coarse
+        # category at +5.5% over baseline; the per-channel-z'd ZUNA latents were at/below
+        # baseline). We reproduce ZUNA's scheme per epoch: global z-score -> std ~= 1, then
+        # *0.1 -> std ~= 0.1, clamp to +-1. This preserves relative channel/time amplitudes.
+        gmean = eeg.mean(dim=(-2, -1), keepdim=True)
+        gstd = eeg.std(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        eeg = ((eeg - gmean) / gstd) * 0.1
+        eeg = eeg.clamp(-1.0, 1.0)
         
         self.intermediate_outputs.clear()
         
