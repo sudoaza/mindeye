@@ -202,6 +202,15 @@ class ZunaLatentExtractor(nn.Module):
             
         res["pre_mmd"] = pre_mmd_reg.squeeze(0).view(B, orig_seqlen, -1) # [B, orig_seqlen, 32]
         res["post_mmd"] = post_mmd.squeeze(0).view(B, orig_seqlen, -1) # [B, orig_seqlen, 32]
+
+        # Raw-EEG pseudo-layer: the encoder INPUT tokens in the exact same
+        # [B, orig_seqlen, tf] layout the bridge consumes, but WITHOUT the ZUNA
+        # encoder. This is the globally-normalized EEG chopped into tf-sample fine
+        # tokens (same preprocessing as ZUNA sees). It lets the identical bridge +
+        # control protocol run on raw EEG, isolating whether the encoder helps or
+        # hurts: if raw beats post_mmd/layer_k, the encoder is destroying signal;
+        # if raw ~= post_mmd ~= shuffled, the signal simply is not decodable here.
+        res["raw"] = encoder_input.squeeze(0).view(B, orig_seqlen, -1) # [B, orig_seqlen, tf]
         
         # Spatial view: reshaped post_mmd
         res["spatial"] = res["post_mmd"].view(B, n_channels, tc, -1)
@@ -218,7 +227,8 @@ class ZunaLatentExtractor(nn.Module):
                 "layer_12": 1024,
                 "layer_16": 1024,
                 "pre_mmd": 32,
-                "post_mmd": 32
+                "post_mmd": 32,
+                "raw": tf,
             }
         }
         

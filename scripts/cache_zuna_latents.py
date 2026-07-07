@@ -34,6 +34,10 @@ def main():
     parser.add_argument("--max-trials", type=int, default=None, help="Maximum number of trials to cache (for Phase 0.5 sweep)")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for extraction. ZUNA packs the whole batch into one document and builds a dense (B*orig_seqlen)^2 flex-attention mask, so cost grows with B^2. orig_seqlen=62*40=2480, so B=4 keeps the mask ~O((4*2480)^2) which fits 80GB; B=32 OOMs (187GiB mask). Keep this small.")
+    parser.add_argument("--tc-window", type=int, nargs=2, default=None, metavar=("START", "END"),
+                        help="Optionally crop each layer to coarse-time steps [START:END) BEFORE saving, "
+                             "so heavy 1024-d layers fit on disk. The saved cache then has tc=END-START and "
+                             "is already onset-windowed; train with --no-temporal-window on it.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -84,7 +88,7 @@ def main():
     print("Extractor initialized.")
 
     # Parse layers list
-    all_supported_layers = ["layer_4", "layer_8", "layer_12", "layer_16", "pre_mmd", "post_mmd"]
+    all_supported_layers = ["layer_4", "layer_8", "layer_12", "layer_16", "pre_mmd", "post_mmd", "raw"]
     if args.layers == "all":
         layers_to_cache = all_supported_layers
     else:
@@ -228,10 +232,19 @@ def main():
                     "onset_tc": onset_tc,
                 }
                 
-                # Save each requested layer as float16 to save disk space
+                # Save each requested layer as float16 to save disk space.
+                # Optionally crop to the onset time-window BEFORE storing so the
+                # heavy 1024-d layers fit on disk. res[l] is [B, N=n_channels*tc, dim];
+                # reshape to [n_channels, tc, dim], slice tc, flatten back.
                 for l in layers_to_cache:
-                    # res[l] shape: [B, N, dim]
-                    record[l] = res[l][b_idx].cpu().half()
+                    lat = res[l][b_idx].cpu()  # [N, dim]
+                    if args.tc_window is not None:
+                        ws, we = args.tc_window
+                        dim = lat.shape[-1]
+                        lat = lat.view(n_channels, tc_coarse, dim)[:, ws:we, :].reshape(
+                            n_channels * (we - ws), dim
+                        )
+                    record[l] = lat.half()
                     
                 latent_records.append(record)
 
@@ -263,12 +276,24 @@ def main():
     # Derive onset_tc from the cached records (anchor_sample / tc-downsample) rather
     # than hardcoding 24, so it stays correct if the crop window changes.
     onset_tcs = sorted({int(r["onset_tc"]) for r in latent_records}) if latent_records else [24]
+    # When the cache is pre-windowed, the stored latents already cover only
+    # tc[START:END). Report the cropped tc and shift onset_tc into that frame so a
+    # consumer that reshapes by (n_channels, tc, D) stays self-consistent. Train on
+    # such a cache with --no-temporal-window (the whole cache IS the window).
+    if args.tc_window is not None:
+        ws, we = args.tc_window
+        saved_tc = we - ws
+        saved_onset = [max(0, o - ws) for o in onset_tcs]
+    else:
+        saved_tc = tc_coarse
+        saved_onset = onset_tcs
     meta_info = {
         "n_channels": n_channels,
-        "tc": tc_coarse,
+        "tc": saved_tc,
         "tf": tf,
         "D": int(extractor.model_args.encoder_output_dim),
-        "onset_tc": onset_tcs[0] if len(onset_tcs) == 1 else onset_tcs,
+        "onset_tc": saved_onset[0] if len(saved_onset) == 1 else saved_onset,
+        "tc_window": list(args.tc_window) if args.tc_window is not None else None,
         "n_trials": len(latent_records),
         "cached_layers": layers_to_cache
     }
