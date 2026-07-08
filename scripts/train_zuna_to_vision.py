@@ -50,6 +50,91 @@ def synset_category(class_id: str) -> str:
     _CAT_CACHE[key] = cat
     return cat
 
+
+_ANIMATE_CACHE: dict[str, int] = {}
+_ANIMATE_LEXNAMES = {"noun.animal", "noun.person", "noun.plant"}
+
+
+def synset_is_animate(class_id: str) -> int:
+    """Tier-1 `is_animate` attribute derived from WordNet lexname (no VLM needed).
+    Returns 1 for living things (animal/person/plant), 0 otherwise, -1 if unknown."""
+    key = str(class_id)
+    if key in _ANIMATE_CACHE:
+        return _ANIMATE_CACHE[key]
+    cat = synset_category(key)
+    val = -1 if cat == "unknown" else int(cat in _ANIMATE_LEXNAMES)
+    _ANIMATE_CACHE[key] = val
+    return val
+
+
+# 11-way coarse color palette (matches the perceptual buckets the CLIP VLM used for
+# dominant_color, minus the rarely-labeled ones). Computed directly from the stimulus
+# image, so labels are exact rather than VLM-noisy.
+_COLOR_NAMES = ["red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink", "black", "white", "gray"]
+_COLOR_TO_IDX = {c: i for i, c in enumerate(_COLOR_NAMES)}
+
+
+def dominant_color_from_image(img: "Image.Image") -> int:
+    """Return the dominant-color class index of a PIL image via mean HSV binning.
+    Grayscale-ish pixels (low saturation) map to black/white/gray by value; otherwise
+    the mean hue is bucketed into the named color wheel."""
+    import colorsys
+    small = img.convert("RGB").resize((32, 32))
+    px = np.asarray(small, dtype=np.float32) / 255.0
+    r, g, b = px[..., 0].mean(), px[..., 1].mean(), px[..., 2].mean()
+    h, s, v = colorsys.rgb_to_hsv(float(r), float(g), float(b))
+    if s < 0.15:  # achromatic -> value determines black/gray/white
+        if v < 0.25:
+            return _COLOR_TO_IDX["black"]
+        if v > 0.80:
+            return _COLOR_TO_IDX["white"]
+        return _COLOR_TO_IDX["gray"]
+    deg = h * 360.0
+    if deg < 15 or deg >= 345:
+        name = "red"
+    elif deg < 45:
+        name = "orange"
+    elif deg < 70:
+        name = "yellow"
+    elif deg < 165:
+        name = "green"
+    elif deg < 195:
+        name = "cyan"
+    elif deg < 255:
+        name = "blue"
+    elif deg < 300:
+        name = "purple"
+    else:
+        name = "pink"
+    # Low-value colored pixels read as their darker selves; keep simple hue mapping.
+    return _COLOR_TO_IDX[name]
+
+
+def brightness_from_image(img: "Image.Image") -> int:
+    """3-way brightness class from mean luma: 0=dark, 1=neutral, 2=bright."""
+    small = img.convert("RGB").resize((32, 32))
+    px = np.asarray(small, dtype=np.float32) / 255.0
+    luma = (0.299 * px[..., 0] + 0.587 * px[..., 1] + 0.114 * px[..., 2]).mean()
+    if luma < 0.33:
+        return 0
+    if luma > 0.66:
+        return 2
+    return 1
+
+
+# Registry of supported auxiliary grounding tasks and their class counts. Classification
+# tasks are trained with cross-entropy (ignore_index=-1). "fine_category" size is resolved
+# at dataset build time from the cohort's distinct synsets, so it is set to None here.
+AUX_CLASSIFICATION_TASKS = {
+    "coarse_category": None,   # WordNet lexname (~8-way in cohort)
+    "fine_category": None,     # 1000-way ImageNet synset (CLIP class_label analog)
+    "is_animate": 2,           # WordNet-derived living/nonliving
+    "dominant_color": len(_COLOR_NAMES),  # image-derived color wheel
+    "brightness": 3,           # image-derived dark/neutral/bright
+}
+IMAGE_DERIVED_AUX_TASKS = {"dominant_color", "brightness"}
+WORDNET_AUX_TASKS = {"coarse_category", "fine_category", "is_animate"}
+
 def parse_runs_spec(spec: str) -> list[int]:
     runs = set()
     for part in spec.split(","):
@@ -184,12 +269,19 @@ class ZunaLatentTargetDataset(Dataset):
         latent_tc_end: int = 36,
         stimuli_dir: str = None,
         stim_size: int = 256,
+        aux_tasks: list | None = None,
+        aux_image_dir: str = None,
     ):
         self.use_temporal_window = use_temporal_window
         self.n_channels = n_channels
         self.tc = tc
         self.latent_tc_start = latent_tc_start
         self.latent_tc_end = latent_tc_end
+        # Auxiliary grounding tasks to build labels for (subset of AUX_TASK_SPECS keys).
+        # Image-derived tasks (dominant_color, brightness) need aux_image_dir; WordNet
+        # tasks (coarse_category, fine_category, is_animate) need no extra data.
+        self.aux_tasks = list(aux_tasks) if aux_tasks else []
+        self.aux_image_dir = Path(aux_image_dir) if aux_image_dir else None
         # Optional stimulus image loading for the luminance-grounding reconstruction loss.
         # Only used when stimuli_dir is set; keeps the retrieval path unaffected.
         self.stimuli_dir = Path(stimuli_dir) if stimuli_dir else None
@@ -287,6 +379,66 @@ class ZunaLatentTargetDataset(Dataset):
         unique_cats = sorted({synset_category(r["class_id"]) for r in self.valid_records})
         self.category_to_int = {c: i for i, c in enumerate(unique_cats)}
         self.num_categories = len(unique_cats)
+
+        # Build auxiliary-task label maps (per-image, deduped) for the multi-task heads.
+        # WordNet tasks are free; image-derived tasks decode each unique stimulus once.
+        self.aux_task_specs: dict[str, int] = {}
+        self.aux_labels: dict[str, dict[str, int]] = {}  # task -> {image_id: class_idx}
+        if self.aux_tasks:
+            unique_imgs = sorted({str(r["image_id"]) for r in self.valid_records})
+            img_to_class = {str(r["image_id"]): str(r["class_id"]) for r in self.valid_records}
+
+            if "coarse_category" in self.aux_tasks:
+                self.aux_task_specs["coarse_category"] = self.num_categories
+                self.aux_labels["coarse_category"] = {
+                    img: self.category_to_int[synset_category(cid)]
+                    for img, cid in img_to_class.items()
+                }
+            if "is_animate" in self.aux_tasks:
+                self.aux_task_specs["is_animate"] = 2
+                self.aux_labels["is_animate"] = {
+                    img: synset_is_animate(cid) for img, cid in img_to_class.items()
+                }
+            if "fine_category" in self.aux_tasks:
+                unique_synsets = sorted({str(r["class_id"]) for r in self.valid_records})
+                synset_to_int = {s: i for i, s in enumerate(unique_synsets)}
+                self.aux_task_specs["fine_category"] = len(unique_synsets)
+                self.aux_labels["fine_category"] = {
+                    img: synset_to_int[cid] for img, cid in img_to_class.items()
+                }
+
+            img_tasks = [t for t in self.aux_tasks if t in IMAGE_DERIVED_AUX_TASKS]
+            if img_tasks:
+                if self.aux_image_dir is None:
+                    raise ValueError(
+                        f"Image-derived aux tasks {img_tasks} require --aux-image-dir "
+                        f"(directory of stimulus JPEGs)."
+                    )
+                for t in img_tasks:
+                    self.aux_task_specs[t] = AUX_CLASSIFICATION_TASKS[t]
+                    self.aux_labels[t] = {}
+                print(f"Precomputing image-derived aux labels {img_tasks} for {len(unique_imgs)} images...")
+                missing = 0
+                for img in unique_imgs:
+                    p = None
+                    for ext in (".JPEG", ".jpg", ".png"):
+                        cand = self.aux_image_dir / f"{img}{ext}"
+                        if cand.exists():
+                            p = cand
+                            break
+                    if p is None:
+                        missing += 1
+                        for t in img_tasks:
+                            self.aux_labels[t][img] = -1
+                        continue
+                    pil = Image.open(p)
+                    if "dominant_color" in img_tasks:
+                        self.aux_labels["dominant_color"][img] = dominant_color_from_image(pil)
+                    if "brightness" in img_tasks:
+                        self.aux_labels["brightness"][img] = brightness_from_image(pil)
+                if missing:
+                    print(f"[warn] {missing}/{len(unique_imgs)} stimulus images missing; those aux labels set to -1 (ignored).")
+            print(f"Auxiliary tasks built: { {k: v for k, v in self.aux_task_specs.items()} }")
             
         # Expose dimensions
         self.layer_name = layer_name
@@ -419,6 +571,10 @@ class ZunaLatentTargetDataset(Dataset):
             "category_id": torch.tensor(
                 self.category_to_int[synset_category(record["class_id"])], dtype=torch.long
             ),
+            "aux_labels": {
+                t: torch.tensor(self.aux_labels[t][str(record["image_id"])], dtype=torch.long)
+                for t in self.aux_task_specs
+            },
             "sample_id": record["sample_id"],
             # Stimulus image for luminance grounding (mid-gray placeholder when disabled).
             "stimulus": (
@@ -441,12 +597,16 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
                 soft_dino_weight=0.0, soft_dino_teacher_temp=0.07,
                 soft_dino_rkd_weight=0.0, soft_dino_hard_weight=0.0,
                 cat_weight=0.0,
+                aux_weight=0.0, aux_task_specs=None,
+                raw_mse_weight=0.0,
                 negative_bank=None):
     model.train()
     total_loss = 0
     num_batches = 0
     use_recon = rae_backend is not None and recon_luma_weight > 0.0
     use_cat = cat_weight > 0.0 and getattr(model, "num_categories", 0) > 0
+    use_aux = aux_weight > 0.0 and bool(getattr(model, "aux_task_specs", {}))
+    use_raw_mse = raw_mse_weight > 0.0 and getattr(model, "raw_mse_dim", 0) > 0
 
     for batch in loader:
         latents = batch["latent"].to(device)
@@ -457,15 +617,22 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
         optimizer.zero_grad()
         cat_logits = None
         pred_grid = None
-        if use_recon or use_cat:
+        aux_logits = None
+        raw_pred = None
+        if use_recon or use_cat or use_aux or use_raw_mse:
             outs = model(latents, subject_id=subject_ids,
-                         return_grid=use_recon, return_category=use_cat)
+                         return_grid=use_recon, return_category=use_cat,
+                         return_aux=use_aux, return_raw_mse=use_raw_mse)
             preds = outs[0]
             extra = list(outs[1:])
             if use_recon:
                 pred_grid = extra.pop(0)
             if use_cat:
                 cat_logits = extra.pop(0)
+            if use_aux:
+                aux_logits = extra.pop(0)
+            if use_raw_mse:
+                raw_pred = extra.pop(0)
         else:
             preds = model(latents, subject_id=subject_ids)
 
@@ -517,6 +684,29 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
             category_ids = batch["category_id"].to(device)
             loss_cat = F.cross_entropy(cat_logits, category_ids, ignore_index=-1)
             loss = loss + cat_weight * loss_cat
+
+        # Multi-task auxiliary grounding: sum of per-task cross-entropies (each ignoring
+        # -1 labels), averaged over tasks. Grounds the shared features on the coarse
+        # semantic/visual structure EEG carries (category, is_animate, color, brightness,
+        # fine synset) — the derivable analog of the old CLIP VLM multitask.
+        if use_aux and aux_logits is not None:
+            batch_aux = batch["aux_labels"]
+            task_losses = []
+            for task in aux_task_specs:
+                labels = batch_aux[task].to(device)
+                if (labels != -1).any():
+                    task_losses.append(
+                        F.cross_entropy(aux_logits[task], labels, ignore_index=-1)
+                    )
+            if task_losses:
+                loss_aux = torch.stack(task_losses).mean()
+                loss = loss + aux_weight * loss_aux
+
+        # Raw-embedding MSE (CLIP dual-head analog): regress the un-normalized target
+        # vector so the model also learns target scale/shape, not just direction.
+        if use_raw_mse and raw_pred is not None:
+            loss_raw = F.mse_loss(raw_pred, targets)
+            loss = loss + raw_mse_weight * loss_raw
 
         # Enqueue this batch's (detached) real targets for future negatives.
         if negative_bank is not None:
@@ -788,6 +978,20 @@ def main():
     parser.add_argument("--cat-weight", type=float, default=0.0,
                         help="Weight on the auxiliary coarse-category cross-entropy loss (0 = off)")
 
+    # Multi-task auxiliary grounding (CLIP-multitask analog, derivable on-pod).
+    # --aux-tasks selects which heads to add; --aux-weight scales their averaged CE.
+    # --raw-mse-weight adds a dual-head raw-target MSE regression (learns target scale).
+    parser.add_argument("--aux-tasks", type=str, default="",
+                        help="Comma-separated auxiliary grounding tasks to enable: any of "
+                             "coarse_category,fine_category,is_animate,dominant_color,brightness. "
+                             "Empty = none. Image-derived tasks (dominant_color,brightness) need --aux-image-dir.")
+    parser.add_argument("--aux-weight", type=float, default=0.0,
+                        help="Weight on the averaged multi-task auxiliary cross-entropy loss (0 = off)")
+    parser.add_argument("--aux-image-dir", type=str, default="data/raw/nod/stimuli/ImageNet",
+                        help="Directory of stimulus JPEGs for image-derived aux labels (color/brightness)")
+    parser.add_argument("--raw-mse-weight", type=float, default=0.0,
+                        help="Weight on the dual-head raw-target MSE regression loss (0 = off)")
+
     # Extra negatives: MoCo-style FIFO queue of detached real target embeddings
     # appended to the InfoNCE denominator. 0 disables (current behavior). Only
     # active in the real target mode (queue ids must align with targets).
@@ -835,6 +1039,11 @@ def main():
 
     # Load dataset
     use_recon = args.recon_luma_weight > 0.0
+    aux_task_list = [t.strip() for t in args.aux_tasks.split(",") if t.strip()]
+    unknown_aux = [t for t in aux_task_list if t not in AUX_CLASSIFICATION_TASKS]
+    if unknown_aux:
+        raise ValueError(f"Unknown --aux-tasks {unknown_aux}; valid: {list(AUX_CLASSIFICATION_TASKS)}")
+    use_aux = args.aux_weight > 0.0 and len(aux_task_list) > 0
     full_dataset = ZunaLatentTargetDataset(
         latents_pt_path=args.latents_pt,
         targets_pt_path=args.targets_pt,
@@ -847,6 +1056,8 @@ def main():
         latent_tc_start=args.latent_tc_start,
         latent_tc_end=args.latent_tc_end,
         stimuli_dir=args.stimuli_dir if use_recon else None,
+        aux_tasks=aux_task_list if use_aux else None,
+        aux_image_dir=args.aux_image_dir,
     )
     
     # Explicit splits determination
@@ -1031,6 +1242,8 @@ def main():
         recon_grid_size=args.recon_grid_size,
         recon_token_dim=args.recon_token_dim,
         num_categories=(full_dataset.num_categories if args.cat_weight > 0.0 else 0),
+        aux_task_specs=(full_dataset.aux_task_specs if use_aux else None),
+        raw_mse_dim=(full_dataset.target_dim if args.raw_mse_weight > 0.0 else 0),
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1072,6 +1285,12 @@ def main():
             f"Auxiliary category grounding ON: cat_weight={args.cat_weight}, "
             f"{full_dataset.num_categories}-way categories -> {sorted(full_dataset.category_to_int)}"
         )
+    if use_aux:
+        print(
+            f"Multi-task aux grounding ON: aux_weight={args.aux_weight}, tasks={full_dataset.aux_task_specs}"
+        )
+    if args.raw_mse_weight > 0.0:
+        print(f"Raw-target MSE dual-head ON: raw_mse_weight={args.raw_mse_weight}, dim={full_dataset.target_dim}")
 
     # Training loop
     best_mrr = -1.0
@@ -1090,6 +1309,9 @@ def main():
             soft_dino_rkd_weight=args.soft_dino_rkd_weight,
             soft_dino_hard_weight=args.soft_dino_hard_weight,
             cat_weight=args.cat_weight,
+            aux_weight=args.aux_weight,
+            aux_task_specs=(full_dataset.aux_task_specs if use_aux else None),
+            raw_mse_weight=args.raw_mse_weight,
             negative_bank=negative_bank,
         )
         scheduler.step()

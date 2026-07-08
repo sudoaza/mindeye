@@ -93,6 +93,8 @@ class ZunaToVisionQFormer(nn.Module):
         recon_grid_size: int = 16,
         recon_token_dim: int = 768,
         num_categories: int = 0,
+        aux_task_specs: dict | None = None,
+        raw_mse_dim: int = 0,
     ):
         super().__init__()
         self.d_in = d_in
@@ -108,7 +110,18 @@ class ZunaToVisionQFormer(nn.Module):
         # the structure the signal actually has — the same role the old CLIP pipeline's
         # frozen semantic probe played. It reads the *pooled features* (pre-projection)
         # so it shapes the representation the retrieval head also consumes. 0 disables.
+        # Kept for backward compat; superseded by the general aux_task_specs below when set.
         self.num_categories = num_categories
+        # General multi-task auxiliary classifier heads. Maps {task_name: num_classes};
+        # every head reads the same pooled features. This is the multi-head grounding
+        # analog of the old CLIP pipeline's semantic-probe + VLM-multitask, but the
+        # tasks are supervised by labels we can derive on-pod (category, is_animate,
+        # dominant color, brightness, fine synset). None/empty disables.
+        self.aux_task_specs = dict(aux_task_specs) if aux_task_specs else {}
+        # Optional raw-embedding MSE regression head (CLIP dual-head analog): predict
+        # the *un-normalized* target vector so the model also learns target scale/shape,
+        # not just direction. 0 disables.
+        self.raw_mse_dim = int(raw_mse_dim)
         # Reconstruction path: predict the full RAE token grid [B, recon_token_dim, G, G]
         # so the prediction can be decoded to an image (luminance grounding loss). This
         # closes the retrieval->reconstruction gap documented in docs/HANDOVER.md §3.
@@ -160,13 +173,36 @@ class ZunaToVisionQFormer(nn.Module):
         if self.output_layernorm:
             self.final_norm = nn.LayerNorm(d_out)
 
-        # Auxiliary category classifier off the pooled hidden features.
+        # Auxiliary category classifier off the pooled hidden features (legacy single-head).
         if self.num_categories > 0:
             self.category_head = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, self.num_categories),
+            )
+
+        # General multi-task auxiliary heads: a small shared trunk feeding one linear
+        # head per task, all reading the pooled features. Mirrors CommonProbeModel's
+        # trunk+heads design so the grounding capacity matches the old CLIP probe.
+        if self.aux_task_specs:
+            self.aux_trunk = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.aux_heads = nn.ModuleDict({
+                name: nn.Linear(hidden_dim, num_classes)
+                for name, num_classes in self.aux_task_specs.items()
+            })
+
+        # Raw-embedding MSE regression head (CLIP dual-head analog).
+        if self.raw_mse_dim > 0:
+            self.raw_mse_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, self.raw_mse_dim),
             )
 
         # Reconstruction token-grid head: map every query token to the RAE token grid.
@@ -196,7 +232,9 @@ class ZunaToVisionQFormer(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, zuna_latents: torch.Tensor, subject_id: torch.Tensor | None = None, return_grid: bool = False, return_category: bool = False):
+    def forward(self, zuna_latents: torch.Tensor, subject_id: torch.Tensor | None = None,
+                return_grid: bool = False, return_category: bool = False,
+                return_aux: bool = False, return_raw_mse: bool = False):
         """
         Args:
             zuna_latents: [B, N, d_in]
@@ -204,10 +242,14 @@ class ZunaToVisionQFormer(nn.Module):
             return_grid:  if True (requires recon_grid=True), also return the decodable
                           RAE token grid [B, recon_token_dim, G, G].
             return_category: if True (requires num_categories>0), also return the
-                          auxiliary category logits [B, num_categories].
+                          legacy single-head category logits [B, num_categories].
+            return_aux:   if True (requires aux_task_specs), also return a dict
+                          {task_name: logits [B, num_classes]} for the multi-task heads.
+            return_raw_mse: if True (requires raw_mse_dim>0), also return the predicted
+                          raw (un-normalized) target vector [B, raw_mse_dim].
         Returns:
-            [B, d_out] pooled retrieval embedding, or a tuple with the requested
-            extra outputs appended in order (grid, then category).
+            [B, d_out] pooled retrieval embedding, or a tuple with the requested extra
+            outputs appended in order (grid, category, aux, raw_mse).
         """
         # Bug 3 fix: assert input is [B, N, D]
         assert zuna_latents.ndim == 3, (
@@ -274,6 +316,17 @@ class ZunaToVisionQFormer(nn.Module):
             if self.num_categories <= 0:
                 raise RuntimeError("return_category=True requires the model to be built with num_categories>0")
             extras.append(self.category_head(features))  # [B, num_categories]
+
+        if return_aux:
+            if not self.aux_task_specs:
+                raise RuntimeError("return_aux=True requires the model to be built with aux_task_specs")
+            aux_feat = self.aux_trunk(features)
+            extras.append({name: head(aux_feat) for name, head in self.aux_heads.items()})
+
+        if return_raw_mse:
+            if self.raw_mse_dim <= 0:
+                raise RuntimeError("return_raw_mse=True requires the model to be built with raw_mse_dim>0")
+            extras.append(self.raw_mse_head(features))  # [B, raw_mse_dim]
 
         if extras:
             return (out, *extras)
