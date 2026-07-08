@@ -92,6 +92,7 @@ class ZunaToVisionQFormer(nn.Module):
         recon_grid: bool = False,
         recon_grid_size: int = 16,
         recon_token_dim: int = 768,
+        num_categories: int = 0,
     ):
         super().__init__()
         self.d_in = d_in
@@ -101,6 +102,13 @@ class ZunaToVisionQFormer(nn.Module):
         self.force_unit_output = force_unit_output
         self.hidden_dim = hidden_dim
         self.num_subjects = num_subjects
+        # Optional auxiliary coarse-category classification head. EEG carries coarse
+        # semantic content (animal/vehicle/food...) far more reliably than per-image
+        # identity, so a jointly-trained category head grounds the shared features on
+        # the structure the signal actually has — the same role the old CLIP pipeline's
+        # frozen semantic probe played. It reads the *pooled features* (pre-projection)
+        # so it shapes the representation the retrieval head also consumes. 0 disables.
+        self.num_categories = num_categories
         # Reconstruction path: predict the full RAE token grid [B, recon_token_dim, G, G]
         # so the prediction can be decoded to an image (luminance grounding loss). This
         # closes the retrieval->reconstruction gap documented in docs/HANDOVER.md §3.
@@ -152,6 +160,15 @@ class ZunaToVisionQFormer(nn.Module):
         if self.output_layernorm:
             self.final_norm = nn.LayerNorm(d_out)
 
+        # Auxiliary category classifier off the pooled hidden features.
+        if self.num_categories > 0:
+            self.category_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, self.num_categories),
+            )
+
         # Reconstruction token-grid head: map every query token to the RAE token grid.
         # We produce G*G spatial slots, each a recon_token_dim vector, from the pooled
         # query features broadcast over learned spatial position queries. This is the
@@ -179,16 +196,18 @@ class ZunaToVisionQFormer(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, zuna_latents: torch.Tensor, subject_id: torch.Tensor | None = None, return_grid: bool = False):
+    def forward(self, zuna_latents: torch.Tensor, subject_id: torch.Tensor | None = None, return_grid: bool = False, return_category: bool = False):
         """
         Args:
             zuna_latents: [B, N, d_in]
             subject_id:   [B] containing subject index (optional)
             return_grid:  if True (requires recon_grid=True), also return the decodable
                           RAE token grid [B, recon_token_dim, G, G].
+            return_category: if True (requires num_categories>0), also return the
+                          auxiliary category logits [B, num_categories].
         Returns:
-            [B, d_out] pooled retrieval embedding, or a tuple
-            ([B, d_out], [B, recon_token_dim, G, G]) when return_grid is set.
+            [B, d_out] pooled retrieval embedding, or a tuple with the requested
+            extra outputs appended in order (grid, then category).
         """
         # Bug 3 fix: assert input is [B, N, D]
         assert zuna_latents.ndim == 3, (
@@ -239,6 +258,7 @@ class ZunaToVisionQFormer(nn.Module):
         if self.force_unit_output or self.normalize_output:
             out = F.normalize(out, dim=-1)
 
+        extras = []
         if return_grid:
             if not self.recon_grid:
                 raise RuntimeError("return_grid=True requires the model to be built with recon_grid=True")
@@ -248,6 +268,13 @@ class ZunaToVisionQFormer(nn.Module):
             grid_feat = self.recon_norm(grid_feat)
             grid = self.recon_proj(grid_feat)  # [B, G*G, recon_token_dim]
             grid = grid.transpose(1, 2).reshape(b, self.recon_token_dim, g, g)  # [B, D, G, G]
-            return out, grid
+            extras.append(grid)
 
+        if return_category:
+            if self.num_categories <= 0:
+                raise RuntimeError("return_category=True requires the model to be built with num_categories>0")
+            extras.append(self.category_head(features))  # [B, num_categories]
+
+        if extras:
+            return (out, *extras)
         return out

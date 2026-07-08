@@ -27,6 +27,29 @@ from mindseye.models.eeg_encoder import (
 )
 from mindseye.generation.luminance import luminance_grid_loss
 
+# Coarse ImageNet-synset -> high-level category via WordNet hypernym lexnames.
+# EEG carries coarse semantics (animal/vehicle/food...) far more reliably than fine
+# per-image identity, so a jointly-trained category head is a grounding task the
+# signal can actually satisfy. Shared with scripts/sweep_zuna_layers.py:synset_category.
+_CAT_CACHE: dict[str, str] = {}
+
+
+def synset_category(class_id: str) -> str:
+    """Map an ImageNet WordNet id (e.g. 'n01983481') to its lexicographer file name
+    (e.g. 'noun.animal'), a ~20-way coarse semantic category."""
+    key = str(class_id)
+    if key in _CAT_CACHE:
+        return _CAT_CACHE[key]
+    try:
+        from nltk.corpus import wordnet as wn
+        offset = int(key[1:])
+        ss = wn.synset_from_pos_and_offset("n", offset)
+        cat = ss.lexname()
+    except Exception:
+        cat = "unknown"
+    _CAT_CACHE[key] = cat
+    return cat
+
 def parse_runs_spec(spec: str) -> list[int]:
     runs = set()
     for part in spec.split(","):
@@ -256,6 +279,14 @@ class ZunaLatentTargetDataset(Dataset):
         # subjects/runs). Sorted for determinism across processes.
         unique_image_ids = sorted({str(r["image_id"]) for r in self.valid_records})
         self.image_id_to_int = {img_id: i for i, img_id in enumerate(unique_image_ids)}
+
+        # Coarse-category labels for the optional auxiliary classification head.
+        # Map each record's WordNet synset -> ~20-way lexname category, then to a
+        # stable contiguous index (sorted for determinism). category_id == -1 marks
+        # an unknown synset so it can be ignored by the CE loss.
+        unique_cats = sorted({synset_category(r["class_id"]) for r in self.valid_records})
+        self.category_to_int = {c: i for i, c in enumerate(unique_cats)}
+        self.num_categories = len(unique_cats)
             
         # Expose dimensions
         self.layer_name = layer_name
@@ -385,6 +416,9 @@ class ZunaLatentTargetDataset(Dataset):
                 self.image_id_to_int[str(record["image_id"])], dtype=torch.long
             ),
             "class_id": record["class_id"],
+            "category_id": torch.tensor(
+                self.category_to_int[synset_category(record["class_id"])], dtype=torch.long
+            ),
             "sample_id": record["sample_id"],
             # Stimulus image for luminance grounding (mid-gray placeholder when disabled).
             "stimulus": (
@@ -406,11 +440,13 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
                 spread_weight=1.0, spread_gamma=None,
                 soft_dino_weight=0.0, soft_dino_teacher_temp=0.07,
                 soft_dino_rkd_weight=0.0, soft_dino_hard_weight=0.0,
+                cat_weight=0.0,
                 negative_bank=None):
     model.train()
     total_loss = 0
     num_batches = 0
     use_recon = rae_backend is not None and recon_luma_weight > 0.0
+    use_cat = cat_weight > 0.0 and getattr(model, "num_categories", 0) > 0
 
     for batch in loader:
         latents = batch["latent"].to(device)
@@ -419,8 +455,17 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
         image_int_ids = batch["image_int_id"].to(device)
 
         optimizer.zero_grad()
-        if use_recon:
-            preds, pred_grid = model(latents, subject_id=subject_ids, return_grid=True)
+        cat_logits = None
+        pred_grid = None
+        if use_recon or use_cat:
+            outs = model(latents, subject_id=subject_ids,
+                         return_grid=use_recon, return_category=use_cat)
+            preds = outs[0]
+            extra = list(outs[1:])
+            if use_recon:
+                pred_grid = extra.pop(0)
+            if use_cat:
+                cat_logits = extra.pop(0)
         else:
             preds = model(latents, subject_id=subject_ids)
 
@@ -463,6 +508,15 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
         loss = (nce_weight * loss_nce + cos_weight * loss_cos
                 + var_weight * loss_var + spread_weight * loss_spread
                 + soft_dino_weight * loss_soft)
+
+        # Auxiliary coarse-category grounding: cross-entropy from the shared pooled
+        # features to the ~20-way semantic category. Grounds the representation on
+        # the coarse structure EEG reliably carries (the working CLIP pipeline used a
+        # frozen semantic probe for the same purpose). ignore_index=-1 skips unknowns.
+        if use_cat and cat_logits is not None:
+            category_ids = batch["category_id"].to(device)
+            loss_cat = F.cross_entropy(cat_logits, category_ids, ignore_index=-1)
+            loss = loss + cat_weight * loss_cat
 
         # Enqueue this batch's (detached) real targets for future negatives.
         if negative_bank is not None:
@@ -726,6 +780,14 @@ def main():
                         help="Blend of hard-label InfoNCE inside soft-DINO loss for a soft/hard curriculum "
                              "(0 = pure soft)")
 
+    # Auxiliary coarse-category grounding head. Adds a jointly-trained classifier
+    # from the QFormer's pooled features to a ~20-way WordNet-lexname category and a
+    # cross-entropy loss weighted by --cat-weight. Grounds the shared representation
+    # on the coarse semantics EEG carries (mirrors the old CLIP pipeline's semantic
+    # probe). 0 = off (no head built, pure retrieval).
+    parser.add_argument("--cat-weight", type=float, default=0.0,
+                        help="Weight on the auxiliary coarse-category cross-entropy loss (0 = off)")
+
     # Extra negatives: MoCo-style FIFO queue of detached real target embeddings
     # appended to the InfoNCE denominator. 0 disables (current behavior). Only
     # active in the real target mode (queue ids must align with targets).
@@ -968,6 +1030,7 @@ def main():
         recon_grid=use_recon,
         recon_grid_size=args.recon_grid_size,
         recon_token_dim=args.recon_token_dim,
+        num_categories=(full_dataset.num_categories if args.cat_weight > 0.0 else 0),
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1004,6 +1067,11 @@ def main():
         f"(teacher_temp={args.soft_dino_teacher_temp} rkd={args.soft_dino_rkd_weight} "
         f"hard={args.soft_dino_hard_weight}) | temperature={args.temperature}"
     )
+    if args.cat_weight > 0.0:
+        print(
+            f"Auxiliary category grounding ON: cat_weight={args.cat_weight}, "
+            f"{full_dataset.num_categories}-way categories -> {sorted(full_dataset.category_to_int)}"
+        )
 
     # Training loop
     best_mrr = -1.0
@@ -1021,6 +1089,7 @@ def main():
             soft_dino_teacher_temp=args.soft_dino_teacher_temp,
             soft_dino_rkd_weight=args.soft_dino_rkd_weight,
             soft_dino_hard_weight=args.soft_dino_hard_weight,
+            cat_weight=args.cat_weight,
             negative_bank=negative_bank,
         )
         scheduler.step()
