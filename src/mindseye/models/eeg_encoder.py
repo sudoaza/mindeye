@@ -506,6 +506,74 @@ def retrieval_topk_full_bank(
     return out
 
 
+def embedding_distance_metrics(
+    pred: torch.Tensor,
+    bank: torch.Tensor,
+    positive_index: torch.Tensor,
+    *,
+    category_index: torch.Tensor | None = None,
+    neighbor_ks: tuple[int, ...] = (10, 50),
+) -> dict[str, float]:
+    """Judge predictions by *embedding distance / neighborhood quality*, not exact ID.
+
+    Per-image top-k retrieval on a 34k bank is near-impossible by construction and a
+    poor success criterion for EEG: landing the prediction near the true embedding (or
+    among the right *category* of images) is a real result even when the exact image is
+    not rank-1. These metrics measure that continuum:
+
+    - ``cos_true``: mean cosine of each prediction to its own true target.
+    - ``cos_rand``: mean cosine to a random (non-matching) bank item — the neutral
+      baseline for this pred distribution.
+    - ``cos_margin`` = ``cos_true - cos_rand``: how much closer the prediction sits to
+      its true image than to a random one. This is the honest "did the embedding land
+      in the right place" signal; > 0 with separation from controls is success.
+    - ``rank_percentile``: mean of ``rank_of_truth / bank_size`` (0 = perfect, 0.5 =
+      chance). A smooth version of retrieval that credits "close but not top-k".
+    - ``neighbor_cat_acc@k``: of the k bank images most similar to each *prediction*,
+      the fraction sharing the true image's coarse category (needs ``category_index``).
+      Chance = category prior. Measures whether we hit the right semantic neighborhood.
+
+    Args:
+        pred:            [N, D] predicted embeddings.
+        bank:            [M, D] unique-image target bank.
+        positive_index:  [N] index into ``bank`` of each prediction's true image.
+        category_index:  [M] coarse-category id per bank image (optional).
+        neighbor_ks:     k values for the neighborhood category-purity metric.
+    """
+    pred_n = F.normalize(pred, dim=-1)
+    bank_n = F.normalize(bank, dim=-1)
+    logits = pred_n @ bank_n.T  # [N, M]
+    n, m = logits.shape
+    positive_index = positive_index.to(logits.device).long()
+
+    pos_sim = logits.gather(1, positive_index[:, None]).squeeze(1)  # [N]
+    out: dict[str, float] = {}
+    out["cos_true"] = float(pos_sim.mean().item())
+    # Mean cosine to all bank items is ~cos to a random item (bank >> 1 so the single
+    # positive barely shifts the mean); use it as the random-target baseline.
+    out["cos_rand"] = float(logits.mean().item())
+    out["cos_margin"] = out["cos_true"] - out["cos_rand"]
+
+    rank_of_truth = (logits > pos_sim[:, None]).sum(dim=1).float()  # 0-based
+    out["rank_percentile"] = float((rank_of_truth / max(m - 1, 1)).mean().item())
+
+    if category_index is not None:
+        category_index = category_index.to(logits.device).long()
+        true_cat = category_index[positive_index]  # [N]
+        maxk = max(neighbor_ks)
+        top_idx = logits.topk(maxk, dim=1).indices  # [N, maxk]
+        top_cat = category_index[top_idx]  # [N, maxk]
+        for k in neighbor_ks:
+            match = (top_cat[:, :k] == true_cat[:, None]).float().mean().item()
+            out[f"neighbor_cat_acc@{k}"] = float(match)
+        # Category prior (chance) so the neighborhood accuracy is interpretable.
+        _, counts = torch.unique(category_index, return_counts=True)
+        p = (counts.float() / counts.sum())
+        out["neighbor_cat_chance"] = float((p * p).sum().item())
+
+    return out
+
+
 class DualHeadTemporalAttnEncoder(nn.Module):
     """
     Dual-head Temporal Attention Encoder.

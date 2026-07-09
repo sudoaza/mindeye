@@ -24,6 +24,7 @@ from mindseye.models.eeg_encoder import (
     soft_dino_contrastive_loss,
     retrieval_topk,
     retrieval_topk_full_bank,
+    embedding_distance_metrics,
 )
 from mindseye.generation.luminance import luminance_grid_loss
 
@@ -734,7 +735,8 @@ def train_epoch(model, loader, optimizer, temperature, target_std, device,
     return total_loss / max(num_batches, 1)
 
 @torch.no_grad()
-def evaluate_model(model, loader, device, bank=None, image_id_to_bank_idx=None):
+def evaluate_model(model, loader, device, bank=None, image_id_to_bank_idx=None,
+                   bank_category_index=None):
     model.eval()
     all_preds = []
     all_targets = []
@@ -820,6 +822,12 @@ def evaluate_model(model, loader, device, bank=None, image_id_to_bank_idx=None):
             "val_median_rank_full": full["median_rank"],
             "bank_size": full["bank_size"],
         })
+        # Embedding-distance / neighborhood metrics: the honest "did the prediction
+        # land near the right place in DINO space" measure, not exact-ID retrieval.
+        emb = embedding_distance_metrics(
+            all_preds, bank, positive_index, category_index=bank_category_index,
+        )
+        eval_metrics.update({f"val_{k}": v for k, v in emb.items()})
     return eval_metrics
 
 @torch.no_grad()
@@ -1009,8 +1017,9 @@ def main():
     # end for reference. "each" preserves the old per-epoch behavior.
     parser.add_argument("--full-bank-eval", choices=("none", "final", "each"), default="final",
                         help="When to rank preds against the full image bank (default: final only)")
-    parser.add_argument("--select-metric", choices=("cosine", "mrr_full", "mrr_norm"), default="cosine",
-                        help="Checkpoint/early-stop selection metric (default: val_cosine_norm)")
+    parser.add_argument("--select-metric", choices=("cosine", "cos_margin", "mrr_full", "mrr_norm"), default="cosine",
+                        help="Checkpoint/early-stop selection metric (default: val_cosine_norm). "
+                             "cos_margin = cos_true - cos_rand vs full bank (needs --full-bank-eval each)")
     
     args = parser.parse_args()
     
@@ -1159,6 +1168,16 @@ def main():
         [full_dataset.image_id_to_target[img_id].float() for img_id in bank_image_ids]
     )
     print(f"Full retrieval bank: {full_bank.shape[0]} unique images, dim {full_bank.shape[1]}")
+
+    # Coarse-category id per bank image (for neighborhood-purity metric). Built from
+    # class_id via the same WordNet lexname mapping used for the aux category head.
+    img_to_class_all = {str(r["image_id"]): str(r["class_id"]) for r in full_dataset.valid_records}
+    bank_cats = sorted({synset_category(cid) for cid in img_to_class_all.values()})
+    bank_cat_to_int = {c: i for i, c in enumerate(bank_cats)}
+    bank_category_index = torch.tensor(
+        [bank_cat_to_int[synset_category(img_to_class_all[img_id])] for img_id in bank_image_ids],
+        dtype=torch.long,
+    )
 
     # Finding M3: quantify (and optionally forbid) train/val/test image overlap.
     def _img_set(indices):
@@ -1320,6 +1339,7 @@ def main():
         val_metrics = evaluate_model(
             model, val_loader, device,
             bank=eval_bank, image_id_to_bank_idx=eval_bank_idx,
+            bank_category_index=(bank_category_index if args.full_bank_eval == "each" else None),
         )
         
         val_mrr = val_metrics["val_mrr_norm"]
@@ -1336,12 +1356,19 @@ def main():
         # true target direction, which is the honest signal indicator here.
         if args.select_metric == "cosine":
             select_metric = val_cosine
+        elif args.select_metric == "cos_margin" and "val_cos_margin" in val_metrics:
+            select_metric = val_metrics["val_cos_margin"]
         elif args.select_metric == "mrr_full" and "val_mrr_full" in val_metrics:
             select_metric = val_metrics["val_mrr_full"]
         else:
             if args.select_metric == "mrr_full":
                 print("[warn] select-metric=mrr_full but full-bank eval disabled; using val_mrr_norm")
-            select_metric = val_mrr
+                select_metric = val_mrr
+            elif args.select_metric == "cos_margin":
+                print("[warn] select-metric=cos_margin needs --full-bank-eval each; using val_cosine_norm")
+                select_metric = val_cosine
+            else:
+                select_metric = val_mrr
         
         print(f"Epoch {epoch:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | "
               f"Val Cosine (Norm): {val_cosine:.4f} | Val MRR (Norm): {val_mrr:.4f} | "
@@ -1387,7 +1414,8 @@ def main():
     # Save final metrics summary. The "best" row reflects the saved checkpoint,
     # selected on the configured selection metric.
     final_metrics = history[-1]
-    sel_col = {"cosine": "val_cosine_norm", "mrr_full": "val_mrr_full", "mrr_norm": "val_mrr_norm"}[args.select_metric]
+    sel_col = {"cosine": "val_cosine_norm", "cos_margin": "val_cos_margin",
+               "mrr_full": "val_mrr_full", "mrr_norm": "val_mrr_norm"}[args.select_metric]
     if sel_col in df_history.columns and df_history[sel_col].notna().any():
         best_epoch_idx = df_history[sel_col].idxmax()
     else:
@@ -1414,6 +1442,25 @@ def main():
     # every epoch, so the expensive 34k-image ranking doesn't dominate the grid.
     final_bank = None if args.full_bank_eval == "none" else full_bank
     final_bank_idx = None if args.full_bank_eval == "none" else image_id_to_bank_idx
+
+    # Embedding-distance summary on the best checkpoint. This is the honest gate:
+    # cos_true vs cos_rand (margin), rank percentile, and neighborhood category purity
+    # against the full bank — not per-image top-k retrieval.
+    if final_bank is not None:
+        emb_metrics = evaluate_model(
+            model, val_loader, device,
+            bank=final_bank, image_id_to_bank_idx=final_bank_idx,
+            bank_category_index=bank_category_index,
+        )
+        emb_summary = {k: v for k, v in emb_metrics.items()
+                       if k.startswith(("val_cos_", "val_rank_percentile", "val_neighbor_"))}
+        summary["embedding_distance"] = emb_summary
+        with open(run_dir / "metrics.json", "w") as f:
+            json.dump(summary, f, indent=2)
+        print("\nEmbedding-distance (best ckpt, full bank):")
+        for k, v in emb_summary.items():
+            print(f"  {k}: {v:.4f}")
+
     save_eval_metadata(
         model, val_loader, device, run_dir / "val_eval_preds.pt",
         bank=final_bank, image_id_to_bank_idx=final_bank_idx,
